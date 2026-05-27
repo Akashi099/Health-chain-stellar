@@ -743,6 +743,15 @@ impl PaymentContract {
         remove_from_status_index(&env, old_status, payment_id);
         index_by_status(&env, status, payment_id);
         update_stats_on_transition(&env, payment.amount, old_status, status);
+
+        // Emit event on every status transition so off-chain indexers can stay
+        // in sync without polling. Topics: ("payment", "status") so indexers can
+        // filter by contract + topic pair.
+        env.events().publish(
+            (symbol_short!("payment"), symbol_short!("status")),
+            (payment_id, old_status, status),
+        );
+
         Ok(())
     }
 
