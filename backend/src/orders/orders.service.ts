@@ -34,8 +34,14 @@ import { OrderEventStoreService } from './services/order-event-store.service';
 import { OrderFeeService } from './services/order-fee.service';
 import { RequestStatusService } from './services/request-status.service';
 import { FeePreviewDto } from '../fee-policy/dto/fee-policy.dto';
-import { TenantActorContext, assertTenantAccess } from '../common/tenant/tenant-scope.util';
-import { SecurityEventLoggerService, SecurityEventType } from '../user-activity/security-event-logger.service';
+import {
+  TenantActorContext,
+  assertTenantAccess,
+} from '../common/tenant/tenant-scope.util';
+import {
+  SecurityEventLoggerService,
+  SecurityEventType,
+} from '../user-activity/security-event-logger.service';
 
 @Injectable()
 export class OrdersService {
@@ -82,10 +88,14 @@ export class OrdersService {
 
     const query = this.orderRepo
       .createQueryBuilder('order')
-      .where('order.hospitalId = :hospitalId', { hospitalId: scopedHospitalId });
+      .where('order.hospitalId = :hospitalId', {
+        hospitalId: scopedHospitalId,
+      });
 
     if (params.startDate)
-      query.andWhere('order.placedAt >= :startDate', { startDate: params.startDate });
+      query.andWhere('order.placedAt >= :startDate', {
+        startDate: params.startDate,
+      });
     if (params.endDate)
       query.andWhere('order.placedAt <= :endDate', { endDate: params.endDate });
 
@@ -112,13 +122,17 @@ export class OrdersService {
     };
   }
 
-  async getOrderHistory(orderId: string, actor?: TenantActorContext): Promise<OrderEventEntity[]> {
+  async getOrderHistory(
+    orderId: string,
+    actor?: TenantActorContext,
+  ): Promise<OrderEventEntity[]> {
     await this.findOrderOrFail(orderId, actor);
     return this.eventStore.getOrderHistory(orderId);
   }
 
   async create(dto: CreateOrderDto, actorId?: string) {
-    if (!dto.bloodBankId) throw new BadRequestException('bloodBankId is required');
+    if (!dto.bloodBankId)
+      throw new BadRequestException('bloodBankId is required');
     const saved = await this.createOrderEntity(dto, actorId);
     if (
       saved.status === OrderStatus.CONFIRMED ||
@@ -200,9 +214,14 @@ export class OrdersService {
         riderId,
       })
       .catch((err) =>
-        this.logger.error(`SLA DISPATCH_ACCEPTANCE start failed: ${err.message}`),
+        this.logger.error(
+          `SLA DISPATCH_ACCEPTANCE start failed: ${err.message}`,
+        ),
       );
-    return { message: 'Rider assigned successfully', data: { orderId, riderId } };
+    return {
+      message: 'Rider assigned successfully',
+      data: { orderId, riderId },
+    };
   }
 
   async raiseDispute(
@@ -212,7 +231,10 @@ export class OrdersService {
     actor?: TenantActorContext,
   ) {
     const order = await this.findOrderOrFail(id, actor);
-    this.stateMachine.transition(order.status as OrderStatus, OrderStatus.DISPUTED);
+    this.stateMachine.transition(
+      order.status as OrderStatus,
+      OrderStatus.DISPUTED,
+    );
     order.status = OrderStatus.DISPUTED;
     order.disputeId = dto.disputeId || `DISP-${id.split('-')[0]}-${Date.now()}`;
     order.disputeReason = dto.reason;
@@ -227,7 +249,12 @@ export class OrdersService {
       await this.outboxService.publishInTransaction(
         manager,
         OutboxEventType.ORDER_DISPUTED,
-        { orderId: id, disputeId: order.disputeId, reason: dto.reason, actorId: actorId ?? null },
+        {
+          orderId: id,
+          disputeId: order.disputeId,
+          reason: dto.reason,
+          actorId: actorId ?? null,
+        },
         { aggregateId: id, aggregateType: 'Order' },
       );
       return s;
@@ -241,13 +268,16 @@ export class OrdersService {
     actorId?: string,
     actor?: TenantActorContext,
   ) {
+    if (!actorId) {
+      throw new BadRequestException('actorId is required to resolve a dispute');
+    }
     const order = await this.findOrderOrFail(id, actor);
     if (order.status !== OrderStatus.DISPUTED)
       throw new ConflictException('Order is not in DISPUTED state');
     const approvalRequest = await this.approvalService.createRequest({
       targetId: id,
       actionType: ApprovalActionType.DISPUTE_RESOLUTION,
-      requesterId: actorId!,
+      requesterId: actorId,
       requiredApprovals: 2,
       metadata: { orderId: id, resolution: dto.resolution },
       finalPayload: { ...dto, orderId: id },
@@ -283,7 +313,11 @@ export class OrdersService {
     return { message: 'Dispute resolution finalized and settled.' };
   }
 
-  async previewOrderFees(id: string, overrides: Partial<FeePreviewDto>, actor?: TenantActorContext) {
+  async previewOrderFees(
+    id: string,
+    overrides: Partial<FeePreviewDto>,
+    actor?: TenantActorContext,
+  ) {
     const order = await this.findOrderOrFail(id, actor);
     return this.orderFeeService.preview(order, overrides);
   }
@@ -342,7 +376,11 @@ export class OrdersService {
             eventType: SecurityEventType.TENANT_ACCESS_DENIED,
             userId: actor.userId,
             description: 'Cross-tenant order access denied',
-            metadata: { orderId: id, hospitalId: order.hospitalId, bloodBankId: order.bloodBankId },
+            metadata: {
+              orderId: id,
+              hospitalId: order.hospitalId,
+              bloodBankId: order.bloodBankId,
+            },
           })
           .catch(() => undefined);
         throw new ForbiddenException('Cross-tenant order access denied');
