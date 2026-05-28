@@ -447,6 +447,38 @@ impl RequestContract {
         Ok(storage::get_request_counter(&env))
     }
 
+    /// Returns a paginated slice of blood requests for a given hospital.
+    /// `page` is zero-indexed; `page_size` is capped at 50 to bound instruction usage.
+    pub fn get_requests_by_hospital(
+        env: Env,
+        hospital_id: Address,
+        page: u32,
+        page_size: u32,
+    ) -> Result<soroban_sdk::Vec<BloodRequest>, ContractError> {
+        storage::require_initialized(&env)?;
+        let page_size = page_size.min(50) as usize;
+        let counter = storage::get_request_counter(&env);
+        let start = (page as usize).saturating_mul(page_size);
+        let mut results: soroban_sdk::Vec<BloodRequest> = soroban_sdk::Vec::new(&env);
+        let mut matched: usize = 0;
+        let mut collected: usize = 0;
+        for id in 1..=counter {
+            if let Some(req) = storage::get_request(&env, id) {
+                if req.hospital_id == hospital_id {
+                    if matched >= start && collected < page_size {
+                        results.push_back(req);
+                        collected += 1;
+                    }
+                    matched += 1;
+                    if collected == page_size {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
+
     pub fn get_metadata(env: Env) -> Result<ContractMetadata, ContractError> {
         storage::require_initialized(&env)?;
         Ok(storage::get_metadata(&env))

@@ -112,7 +112,7 @@ export async function httpClient<T = unknown>(
 
   // FIX: Use Record<string, string> to allow dynamic header keys like 'Authorization'
   const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
+    ...(!(fetchConfig.body instanceof FormData) && { 'Content-Type': 'application/json' }),
     ...(fetchConfig.headers as Record<string, string>),
   };
 

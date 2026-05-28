@@ -23,6 +23,7 @@ import { PaginatedResponse } from '../common/pagination';
 
 import { CreateOrderDto } from './dto/create-order.dto';
 import { OrderQueryParamsDto } from './dto/order-query-params.dto';
+import { UpdateOrderDto } from './dto/update-order.dto';
 import { UpdateRequestStatusDto } from './dto/update-request-status.dto';
 import { OrdersService } from './orders.service';
 import { OrderStateAuditService } from './services/order-state-audit.service';
@@ -170,7 +171,7 @@ export class OrdersController {
   @Patch(':id')
   update(
     @Param('id') id: string,
-    @Body() updateOrderDto: any,
+    @Body() updateOrderDto: UpdateOrderDto,
     @Request() req: AuthenticatedRequest,
   ) {
     return this.ordersService.update(id, updateOrderDto, {

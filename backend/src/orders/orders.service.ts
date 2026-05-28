@@ -19,6 +19,7 @@ import { SlaService } from '../sla/sla.service';
 import { SlaStage } from '../sla/enums/sla-stage.enum';
 
 import { CreateOrderDto } from './dto/create-order.dto';
+import { UpdateOrderDto } from './dto/update-order.dto';
 import { OrderQueryParamsDto } from './dto/order-query-params.dto';
 import { RaiseDisputeDto } from './dto/raise-dispute.dto';
 import { ResolveDisputeDto } from './dto/resolve-dispute.dto';
@@ -143,9 +144,10 @@ export class OrdersService {
     return { message: 'Order created successfully', data: saved };
   }
 
-  async update(id: string, updateDto: any, actor?: TenantActorContext) {
+  async update(id: string, updateDto: UpdateOrderDto, actor?: TenantActorContext) {
     const order = await this.findOrderOrFail(id, actor);
-    Object.assign(order, updateDto);
+    if (updateDto.deliveryAddress !== undefined) order.deliveryAddress = updateDto.deliveryAddress;
+    if (updateDto.quantity !== undefined) order.quantity = updateDto.quantity;
     const updated = await this.orderRepo.save(order);
     return { message: 'Order updated successfully', data: updated };
   }
