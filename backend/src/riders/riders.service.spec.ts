@@ -435,4 +435,59 @@ describe('RidersService', () => {
       expect(result.data[0].id).toBe('near');
     });
   });
+
+  describe('getLeaderboard', () => {
+    it('should return ranked verified riders from database with ordering and limit', async () => {
+      const riders = [
+        makeRider({ id: 'rider-1', completedDeliveries: 100, rating: 4.8, cancelledDeliveries: 5, failedDeliveries: 0 }),
+        makeRider({ id: 'rider-2', completedDeliveries: 80, rating: 4.5, cancelledDeliveries: 10, failedDeliveries: 5 }),
+      ];
+      mockRiderRepository.find.mockResolvedValue(riders);
+
+      const result = await service.getLeaderboard(10);
+
+      expect(result.data).toHaveLength(2);
+      expect(result.data[0].rank).toBe(1);
+      expect(result.data[0].completedDeliveries).toBe(100);
+      expect(mockRiderRepository.find).toHaveBeenCalledWith({
+        where: { isVerified: true },
+        order: { completedDeliveries: 'DESC', rating: 'DESC' },
+        take: 10,
+      });
+    });
+
+    it('should calculate successRate correctly for riders', async () => {
+      const riders = [
+        makeRider({ id: 'rider-1', completedDeliveries: 95, cancelledDeliveries: 5, failedDeliveries: 0 }),
+      ];
+      mockRiderRepository.find.mockResolvedValue(riders);
+
+      const result = await service.getLeaderboard(10);
+
+      expect(result.data[0].successRate).toBe(95);
+    });
+
+    it('should handle riders with zero total deliveries', async () => {
+      const riders = [
+        makeRider({ id: 'rider-1', completedDeliveries: 0, cancelledDeliveries: 0, failedDeliveries: 0 }),
+      ];
+      mockRiderRepository.find.mockResolvedValue(riders);
+
+      const result = await service.getLeaderboard(10);
+
+      expect(result.data[0].successRate).toBe(0);
+    });
+
+    it('should use default limit of 10 when not specified', async () => {
+      mockRiderRepository.find.mockResolvedValue([]);
+
+      await service.getLeaderboard();
+
+      expect(mockRiderRepository.find).toHaveBeenCalledWith({
+        where: { isVerified: true },
+        order: { completedDeliveries: 'DESC', rating: 'DESC' },
+        take: 10,
+      });
+    });
+  });
 });

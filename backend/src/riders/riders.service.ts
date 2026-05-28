@@ -356,33 +356,26 @@ export class RidersService {
   }> {
     const riders = await this.riderRepository.find({
       where: { isVerified: true },
+      order: { completedDeliveries: 'DESC', rating: 'DESC' },
+      take: limit,
     });
 
-    const ranked = riders
-      .map((r) => {
+    return {
+      message: 'Leaderboard retrieved successfully',
+      data: riders.map((r, i) => {
         const total =
           r.completedDeliveries + r.cancelledDeliveries + r.failedDeliveries;
         const successRate =
-          total === 0
-            ? 0
-            : Math.round((r.completedDeliveries / total) * 10000) / 100;
+          total === 0 ? 0 : Math.round((r.completedDeliveries / total) * 10000) / 100;
         return {
+          rank: i + 1,
           riderId: r.id,
           completedDeliveries: r.completedDeliveries,
           successRate,
           rating: r.rating,
         };
-      })
-      .sort(
-        (a, b) =>
-          b.completedDeliveries - a.completedDeliveries ||
-          b.successRate - a.successRate ||
-          b.rating - a.rating,
-      )
-      .slice(0, limit)
-      .map((r, i) => ({ rank: i + 1, ...r }));
-
-    return { message: 'Leaderboard retrieved successfully', data: ranked };
+      }),
+    };
   }
 
   private emitStatusChangeEvent(rider: RiderEntity, previousStatus: RiderStatus) {
