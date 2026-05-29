@@ -3,7 +3,7 @@
 set -e
 
 # Configuration
-NETWORK="testnet"
+NETWORK="mainnet"
 IDENTITY="default"  # Your Stellar CLI identity
 
 echo "🚀 Deploying Lifebank contracts to ${NETWORK}..."
@@ -45,13 +45,13 @@ done
 echo "💾 Updating contracts.json with deployed IDs..."
 
 {
-  # Start with testnet object
-  jq --arg network "testnet" '.testnet = {}' contracts.json > contracts.json.tmp
+  # Start with mainnet object
+  jq --arg network "mainnet" '.mainnet = {}' contracts.json > contracts.json.tmp
 
   # Add each contract ID
   for contract in "${!CONTRACT_IDS[@]}"; do
     jq --arg contract "$contract" --arg id "${CONTRACT_IDS[$contract]}" \
-      '.testnet[$contract] = $id' contracts.json.tmp > contracts.json.tmp2
+      '.mainnet[$contract] = $id' contracts.json.tmp > contracts.json.tmp2
     mv contracts.json.tmp2 contracts.json.tmp
   done
 
