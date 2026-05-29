@@ -192,10 +192,10 @@ export class SorobanService {
    */
   async getQueueMetrics(): Promise<QueueMetrics> {
     const detailed = await this.queueMetricsService.getDetailedMetrics();
-    
-    // Calculate processing rate from successful jobs over time since reset
-    const sinceMs = Date.now() - Date.parse(detailed.since);
-    const processingRate = sinceMs > 0 ? (detailed.counters.success / (sinceMs / 1000)) : null;
+
+    // Calculate processing rate from Redis rolling counter
+    const lastMinuteCount = await this.txQueue.client.get('soroban:completed:last_minute');
+    const processingRate = lastMinuteCount ? Number(lastMinuteCount) / 60 : 0;
 
     return {
       queueDepth: detailed.live.waiting + detailed.live.active,
