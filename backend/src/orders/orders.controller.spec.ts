@@ -16,8 +16,9 @@ import { OrderStateMachine } from './state-machine/order-state-machine';
 
 describe('OrdersController', () => {
   let controller: OrdersController;
-  let service: OrdersService;
+  let service: { findAllWithFilters: jest.Mock };
   let mockGateway: Partial<OrdersGateway>;
+  const req = { user: { id: 'u1', role: 'hospital', organizationId: 'HOSP-001' } };
 
   beforeEach(async () => {
     // Create a mock gateway
@@ -28,7 +29,12 @@ describe('OrdersController', () => {
     const module: TestingModule = await Test.createTestingModule({
       controllers: [OrdersController],
       providers: [
-        OrdersService,
+        {
+          provide: OrdersService,
+          useValue: {
+            findAllWithFilters: jest.fn(),
+          },
+        },
         {
           provide: getRepositoryToken(OrderEntity),
           useValue: {
@@ -76,7 +82,7 @@ describe('OrdersController', () => {
     }).compile();
 
     controller = module.get<OrdersController>(OrdersController);
-    service = module.get<OrdersService>(OrdersService);
+    service = module.get(OrdersService);
   });
 
   it('should be defined', () => {
@@ -103,7 +109,7 @@ describe('OrdersController', () => {
 
       jest.spyOn(service, 'findAllWithFilters').mockResolvedValue(result);
 
-      expect(await controller.findAllWithFilters(params)).toBe(result);
+      expect(await controller.findAllWithFilters(params, req as any)).toBe(result);
     });
 
     it('should throw BadRequestException when startDate is after endDate', async () => {
@@ -115,7 +121,7 @@ describe('OrdersController', () => {
         pageSize: 25,
       };
 
-      await expect(controller.findAllWithFilters(params)).rejects.toThrow(
+      await expect(controller.findAllWithFilters(params, req as any)).rejects.toThrow(
         BadRequestException,
       );
     });
@@ -141,7 +147,7 @@ describe('OrdersController', () => {
 
       jest.spyOn(service, 'findAllWithFilters').mockResolvedValue(result);
 
-      expect(await controller.findAllWithFilters(params)).toBe(result);
+      expect(await controller.findAllWithFilters(params, req as any)).toBe(result);
     });
 
     it('should accept all filter parameters', async () => {
@@ -170,8 +176,11 @@ describe('OrdersController', () => {
 
       jest.spyOn(service, 'findAllWithFilters').mockResolvedValue(result);
 
-      expect(await controller.findAllWithFilters(params)).toBe(result);
-      expect(service.findAllWithFilters).toHaveBeenCalledWith(params);
+      expect(await controller.findAllWithFilters(params, req as any)).toBe(result);
+      expect(service.findAllWithFilters).toHaveBeenCalledWith(
+        params,
+        expect.objectContaining({ organizationId: 'HOSP-001' }),
+      );
     });
   });
 });

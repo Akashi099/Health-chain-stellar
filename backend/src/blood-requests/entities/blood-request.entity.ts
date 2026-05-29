@@ -1,16 +1,18 @@
 import {
-  Entity,
-  PrimaryGeneratedColumn,
   Column,
   CreateDateColumn,
-  UpdateDateColumn,
-  OneToMany,
+  Entity,
   Index,
+  JoinColumn,
+  ManyToOne,
+  OneToMany,
+  PrimaryGeneratedColumn,
+  UpdateDateColumn,
 } from 'typeorm';
 
 import { BloodComponent } from '../../blood-units/enums/blood-component.enum';
 import { BloodType } from '../../blood-units/enums/blood-type.enum';
-import { BloodRequestStatus } from '../enums/blood-request-status.enum';
+import { RequestStatus, BloodRequestStatus } from '../enums/blood-request-status.enum';
 import { EscalationTier } from '../../escalation/enums/escalation-tier.enum';
 
 import { BloodRequestItemEntity } from './blood-request-item.entity';
@@ -38,6 +40,24 @@ export interface FulfillmentProgress {
   percentage: number;
   itemsCount: number;
   itemsFulfilledCount: number;
+}
+
+export interface TriageFactorSnapshot {
+  policyVersion: string;
+  urgency: number;
+  criticality: number;
+  quantity: number;
+  time: number;
+  scarcity: number;
+  inventoryPressure: number;
+  emergencyOverride: boolean;
+  raw: {
+    requestedUnits: number;
+    availableUnits: number;
+    hoursUntilRequiredBy: number;
+    itemPriority: string;
+    urgency: RequestUrgency;
+  };
 }
 
 @Entity('blood_requests')
@@ -70,10 +90,58 @@ export class BloodRequestEntity {
 
   @Column({
     type: 'varchar',
-    length: 24,
+    length: 32,
     default: BloodRequestStatus.PENDING,
   })
-  status: BloodRequestStatus;
+  status: RequestStatus;
+
+  @Column({ name: 'matched_at', type: 'timestamptz', nullable: true })
+  matchedAt: Date | null;
+
+  @Column({ name: 'approved_at', type: 'timestamptz', nullable: true })
+  approvedAt: Date | null;
+
+  @Column({ name: 'fulfilled_at', type: 'timestamptz', nullable: true })
+  fulfilledAt: Date | null;
+
+  @Column({ name: 'cancelled_at', type: 'timestamptz', nullable: true })
+  cancelledAt: Date | null;
+
+  @Column({ name: 'rejected_at', type: 'timestamptz', nullable: true })
+  rejectedAt: Date | null;
+
+  @Column({
+    name: 'status_updated_at',
+    type: 'timestamptz',
+    default: () => 'CURRENT_TIMESTAMP',
+  })
+  statusUpdatedAt: Date;
+
+  @Column({ name: 'sla_response_due_at', type: 'timestamptz', nullable: true })
+  slaResponseDueAt: Date | null;
+
+  @Column({
+    name: 'sla_fulfillment_due_at',
+    type: 'timestamptz',
+    nullable: true,
+  })
+  slaFulfillmentDueAt: Date | null;
+
+  @Column({
+    name: 'blockchain_request_id',
+    type: 'varchar',
+    length: 128,
+    nullable: true,
+  })
+  blockchainRequestId: string | null;
+
+  @Column({
+    name: 'blockchain_network',
+    type: 'varchar',
+    length: 64,
+    nullable: true,
+  })
+  blockchainNetwork: string | null;
 
   @Column({ name: 'delivery_address', type: 'text', nullable: true })
   deliveryAddress: string | null;
@@ -90,6 +158,13 @@ export class BloodRequestEntity {
   blockchainTxHash: string | null;
 
   @Column({
+    name: 'blockchain_confirmed_at',
+    type: 'timestamptz',
+    nullable: true,
+  })
+  blockchainConfirmedAt: Date | null;
+
+  @Column({
     name: 'created_by_user_id',
     type: 'varchar',
     length: 64,
@@ -104,6 +179,20 @@ export class BloodRequestEntity {
     default: EscalationTier.NONE,
   })
   escalationTier: EscalationTier;
+
+  @Column({ name: 'triage_score', type: 'int', default: 0 })
+  triageScore: number;
+
+  @Column({
+    name: 'triage_policy_version',
+    type: 'varchar',
+    length: 32,
+    default: '2026-03-30.v1',
+  })
+  triagePolicyVersion: string;
+
+  @Column({ name: 'triage_factors', type: 'simple-json', nullable: true })
+  triageFactors: TriageFactorSnapshot | null;
 
   @OneToMany(() => BloodRequestItemEntity, (item) => item.request, {
     cascade: true,
@@ -249,7 +338,7 @@ export class BloodRequestEntity {
   /**
    * Update the request status
    */
-  updateStatus(newStatus: BloodRequestStatus): void {
+  updateStatus(newStatus: RequestStatus): void {
     this.status = newStatus;
   }
 

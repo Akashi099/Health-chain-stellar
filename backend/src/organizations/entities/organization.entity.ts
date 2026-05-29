@@ -7,8 +7,10 @@ import {
   PrimaryGeneratedColumn,
   UpdateDateColumn,
   DeleteDateColumn,
+  OneToMany,
 } from 'typeorm';
 
+import { UserEntity } from '../../users/entities/user.entity';
 import { OrganizationType } from '../enums/organization-type.enum';
 import { OrganizationVerificationStatus } from '../enums/organization-verification-status.enum';
 import { VerificationStatus } from '../enums/verification-status.enum';
@@ -26,8 +28,17 @@ export class OrganizationEntity extends BaseEntity {
   @Column({ type: 'varchar', length: 255 })
   name!: string;
 
-  @Column({ name: 'legal_name', type: 'varchar', length: 200, nullable: true })
+  @Column({ name: 'legal_name', type: 'varchar', length: 255, nullable: true })
   legalName?: string | null;
+
+  @Column({ type: 'varchar', length: 255, nullable: true })
+  email?: string | null;
+
+  @Column({ name: 'phone_number', type: 'varchar', length: 40, nullable: true })
+  phoneNumber?: string | null;
+
+  @Column({ type: 'text', nullable: true })
+  address?: string | null;
 
   @Column({
     type: 'enum',
@@ -47,10 +58,11 @@ export class OrganizationEntity extends BaseEntity {
 
   @Column({
     type: 'varchar',
-    length: 40,
+    length: 60,
     default: OrganizationVerificationStatus.PENDING_VERIFICATION,
+    nullable: true,
   })
-  status!: OrganizationVerificationStatus;
+  status?: OrganizationVerificationStatus | null;
 
   @Column({
     name: 'registration_number',
@@ -68,23 +80,26 @@ export class OrganizationEntity extends BaseEntity {
   })
   licenseNumber?: string | null;
 
-  @Column({ type: 'varchar', length: 255, nullable: true })
-  email?: string | null;
+  @Column({ name: 'license_document_path', type: 'varchar', length: 512, nullable: true })
+  licenseDocumentPath?: string | null;
 
-  @Column({ type: 'varchar', length: 32, nullable: true })
-  phone?: string | null;
+  @Column({ name: 'certificate_document_path', type: 'varchar', length: 512, nullable: true })
+  certificateDocumentPath?: string | null;
 
-  @Column({ name: 'phone_number', type: 'varchar', length: 40, nullable: true })
-  phoneNumber?: string | null;
+  @Column({ name: 'rejection_reason', type: 'text', nullable: true })
+  rejectionReason?: string | null;
+
+  @Column({ name: 'verified_at', type: 'timestamp', nullable: true })
+  verifiedAt?: Date | null;
+
+  @Column({ name: 'verified_by_user_id', type: 'uuid', nullable: true })
+  verifiedByUserId?: string | null;
 
   @Column({ type: 'varchar', length: 255, nullable: true })
   website?: string | null;
 
   @Column({ type: 'text', nullable: true })
   description?: string | null;
-
-  @Column({ type: 'text', nullable: true })
-  address?: string | null;
 
   @Column({
     name: 'address_line_1',
@@ -126,95 +141,30 @@ export class OrganizationEntity extends BaseEntity {
   @Column({ name: 'verification_documents', type: 'jsonb', nullable: true })
   verificationDocuments?: Array<Record<string, unknown>> | null;
 
-  @Column({
-    name: 'license_document_path',
-    type: 'varchar',
-    length: 512,
-    default: '',
-  })
-  licenseDocumentPath!: string;
+  @Column({ type: 'decimal', precision: 3, scale: 2, default: 0, nullable: true })
+  rating?: number | null;
 
-  @Column({
-    name: 'certificate_document_path',
-    type: 'varchar',
-    length: 512,
-    default: '',
-  })
-  certificateDocumentPath!: string;
-
-  @Column({ name: 'rejection_reason', type: 'text', nullable: true })
-  rejectionReason?: string | null;
-
-  @Column({ name: 'verified_at', type: 'timestamp', nullable: true })
-  verifiedAt?: Date | null;
-
-  @Column({ name: 'verified_by_user_id', type: 'uuid', nullable: true })
-  verifiedByUserId?: string | null;
-
-  @Column({
-    name: 'blockchain_tx_hash',
-    type: 'varchar',
-    length: 128,
-    nullable: true,
-  })
-  blockchainTxHash?: string | null;
-
-  @Column({
-    name: 'blockchain_address',
-    type: 'varchar',
-    length: 128,
-    nullable: true,
-  })
-  blockchainAddress?: string | null;
-
-  @Column({
-    name: 'verification_source',
-    type: 'varchar',
-    length: 50,
-    default: 'backend',
-  })
-  verificationSource!: string;
-
-  @Column({ name: 'synced_at', type: 'timestamp', nullable: true })
-  syncedAt?: Date | null;
-
-  @Column({
-    name: 'verification_tx_hash',
-    type: 'varchar',
-    length: 128,
-    nullable: true,
-  })
-  verificationTxHash?: string | null;
-
-  @Column({
-    name: 'sync_status',
-    type: 'varchar',
-    length: 50,
-    default: 'pending',
-  })
-  syncStatus!: string;
-
-  @Column({ name: 'sync_error_message', type: 'text', nullable: true })
-  syncErrorMessage?: string | null;
-
-  @Column({ name: 'sync_retry_count', type: 'int', default: 0 })
-  syncRetryCount!: number;
-
-  @Column({ name: 'soroban_verified_at', type: 'timestamp', nullable: true })
-  sorobanVerifiedAt?: Date | null;
-
-  @Column({ type: 'decimal', precision: 3, scale: 2, default: 0 })
-  rating!: number;
-
-  @Column({ name: 'review_count', type: 'int', default: 0 })
-  reviewCount!: number;
+  @Column({ name: 'review_count', type: 'int', default: 0, nullable: true })
+  reviewCount?: number | null;
 
   @Column({ name: 'is_active', type: 'boolean', default: true })
-  isActive!: boolean;
+  isActive: boolean;
+
+  @Column({ name: 'blockchain_tx_hash', type: 'varchar', length: 128, nullable: true })
+  blockchainTxHash?: string | null;
+
+  @Column({ name: 'blockchain_address', type: 'varchar', length: 128, nullable: true })
+  blockchainAddress?: string | null;
+
+  @OneToMany(() => UserEntity, (user) => user.organization)
+  users: UserEntity[];
 
   @CreateDateColumn({ name: 'created_at' })
   createdAt!: Date;
 
   @UpdateDateColumn({ name: 'updated_at' })
   updatedAt!: Date;
+
+  @DeleteDateColumn({ name: 'deleted_at' })
+  deletedAt?: Date | null;
 }

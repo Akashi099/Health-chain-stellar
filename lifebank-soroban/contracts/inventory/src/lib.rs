@@ -7,7 +7,7 @@ mod types;
 mod validation;
 
 use crate::error::ContractError;
-use crate::types::{BloodStatus, BloodType, BloodUnit, DataKey, Reservation, is_valid_transition};
+use crate::types::{is_valid_transition, BloodStatus, BloodType, BloodUnit, DataKey, Reservation};
 
 use soroban_sdk::{contract, contractimpl, Address, Env, Map, String, Vec};
 #[contract]
@@ -34,6 +34,68 @@ impl InventoryContract {
         // Set admin
         storage::set_admin(&env, &admin);
 
+        // Authorize admin as the first blood bank
+        storage::set_authorized_bank(&env, &admin, true);
+
+        Ok(())
+    }
+
+    /// Pause the contract. Only the admin can call this.
+    /// All state-mutating functions will return `ContractPaused` while paused.
+    pub fn pause(env: Env, admin: Address) -> Result<(), ContractError> {
+        admin.require_auth();
+        let stored_admin = storage::get_admin(&env);
+        if admin != stored_admin {
+            return Err(ContractError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Paused, &true);
+        Ok(())
+    }
+
+    /// Unpause the contract. Only the admin can call this.
+    pub fn unpause(env: Env, admin: Address) -> Result<(), ContractError> {
+        admin.require_auth();
+        let stored_admin = storage::get_admin(&env);
+        if admin != stored_admin {
+            return Err(ContractError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Paused, &false);
+        Ok(())
+    }
+
+    /// Returns whether the contract is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    /// Authorize or revoke a blood bank. Only admin can call this.
+    pub fn authorize_bank(env: Env, admin: Address, bank: Address, authorized: bool) -> Result<(), ContractError> {
+        admin.require_auth();
+        let stored_admin = storage::get_admin(&env);
+        if admin != stored_admin {
+            return Err(ContractError::Unauthorized);
+        }
+        storage::set_authorized_bank(&env, &bank, authorized);
+        Ok(())
+    }
+
+    /// Check if a bank is authorized
+    pub fn is_authorized_bank(env: Env, bank: Address) -> bool {
+        storage::is_authorized_bank(&env, &bank)
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), ContractError> {
+        if env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(ContractError::ContractPaused);
+        }
         Ok(())
     }
 
@@ -65,6 +127,7 @@ impl InventoryContract {
     pub fn register_blood(
         env: Env,
         bank_id: Address,
+        serial_number: String,
         blood_type: BloodType,
         quantity_ml: u32,
         donor_id: Option<Address>,
@@ -72,20 +135,39 @@ impl InventoryContract {
         // 1. Verify bank authentication
         bank_id.require_auth();
 
-        // 2. Check contract is initialized
+        Self::register_blood_after_auth(env, bank_id, serial_number, blood_type, quantity_ml, donor_id)
+    }
+
+    fn register_blood_after_auth(
+        env: Env,
+        bank_id: Address,
+        serial_number: String,
+        blood_type: BloodType,
+        quantity_ml: u32,
+        donor_id: Option<Address>,
+    ) -> Result<u64, ContractError> {
+        Self::require_not_paused(&env)?;
+
+        // Check contract is initialized
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(ContractError::NotInitialized);
         }
 
-        // 3. Verify bank is authorized
+        // Verify bank is authorized
         if !storage::is_authorized_bank(&env, &bank_id) {
             return Err(ContractError::NotAuthorizedBloodBank);
         }
 
-        // 4. Validate quantity
+        // Reject duplicate serial numbers — physical blood bags have unique IDs
+        let serial_key = DataKey::Serial(serial_number.clone());
+        if env.storage().persistent().has(&serial_key) {
+            return Err(ContractError::DuplicateBloodUnit);
+        }
+
+        // Validate quantity
         validation::validate_quantity(quantity_ml)?;
 
-        // 5. Generate unique blood unit ID using atomic counter increment.
+        // Generate unique blood unit ID using atomic counter increment.
         //
         // Soroban Transaction Ordering Model:
         // Within a single ledger close, transactions are ordered deterministically.
@@ -110,7 +192,7 @@ impl InventoryContract {
             return Err(ContractError::DuplicateBloodUnit);
         }
 
-        // 6. Compute timestamps from ledger time.
+        // Compute timestamps from ledger time.
         // Using ledger time for both donation and expiration guarantees that
         // expiration checks (which compare against env.ledger().timestamp())
         // are always consistent with the stored values.
@@ -130,19 +212,22 @@ impl InventoryContract {
             metadata: Map::new(&env),
         };
 
-        // 7. Validate the complete blood unit
+        // Validate the complete blood unit
         blood_unit.validate(current_time)?;
 
-        // 8. Store blood unit — only reaches here if the ID slot was empty.
+        // Store blood unit — only reaches here if the ID slot was empty.
         storage::set_blood_unit(&env, &blood_unit);
 
-        // 9. Update indexes for efficient querying
+        // Persist serial number → unit_id so duplicate registrations are rejected
+        env.storage().persistent().set(&serial_key, &blood_unit_id);
+
+        // Update indexes for efficient querying
         storage::add_to_blood_type_index(&env, &blood_unit);
         storage::add_to_bank_index(&env, &blood_unit);
         storage::add_to_status_index(&env, &blood_unit);
         storage::add_to_donor_index(&env, &blood_unit);
 
-        // 10. Emit event
+        // Emit event
         events::emit_blood_registered(
             &env,
             blood_unit_id,
@@ -152,7 +237,6 @@ impl InventoryContract {
             expiration_timestamp,
         );
 
-        // 11. Return blood unit ID
         Ok(blood_unit_id)
     }
 
@@ -180,13 +264,17 @@ impl InventoryContract {
     ) -> Result<BloodUnit, ContractError> {
         authorized_by.require_auth();
 
+        Self::require_not_paused(&env)?;
+
+        let blood_unit =
+            storage::get_blood_unit(&env, unit_id).ok_or(ContractError::NotFound)?;
+
         let admin = storage::get_admin(&env);
-        if authorized_by != admin {
+        if authorized_by != admin && authorized_by != blood_unit.bank_id {
             return Err(ContractError::Unauthorized);
         }
 
-        let mut blood_unit =
-            storage::get_blood_unit(&env, unit_id).ok_or(ContractError::NotFound)?;
+        let mut blood_unit = blood_unit;
 
         let current_time = env.ledger().timestamp();
         let old_status = blood_unit.status;
@@ -307,23 +395,23 @@ impl InventoryContract {
     ) -> Result<u64, ContractError> {
         authorized_by.require_auth();
 
+        Self::require_not_paused(&env)?;
+
         let admin = storage::get_admin(&env);
-        if authorized_by != admin {
-            return Err(ContractError::Unauthorized);
-        }
-
         let current_time = env.ledger().timestamp();
-        let mut updated_count = 0u64;
 
+        // 1. Validate all units first (atomicity)
         for i in 0..unit_ids.len() {
             let unit_id = unit_ids.get(i).ok_or(ContractError::NotFound)?;
-            let mut blood_unit =
-                storage::get_blood_unit(&env, unit_id).ok_or(ContractError::NotFound)?;
+            let blood_unit = storage::get_blood_unit(&env, unit_id).ok_or(ContractError::NotFound)?;
 
-            let old_status = blood_unit.status;
+            if authorized_by != admin && authorized_by != blood_unit.bank_id {
+                return Err(ContractError::Unauthorized);
+            }
+
             if blood_unit.is_expired(current_time) {
                 let allowed_past_shelf = matches!(
-                    (old_status, new_status),
+                    (blood_unit.status, new_status),
                     (BloodStatus::Available, BloodStatus::Expired)
                         | (BloodStatus::Reserved, BloodStatus::Expired)
                         | (BloodStatus::InTransit, BloodStatus::Expired)
@@ -335,14 +423,21 @@ impl InventoryContract {
                 }
             }
 
-            if !is_valid_transition(&old_status, &new_status) {
-                events::emit_invalid_transition(&env, unit_id, old_status, new_status);
+            if !is_valid_transition(&blood_unit.status, &new_status) {
                 return Err(ContractError::InvalidStatusTransition);
             }
+        }
+
+        // 2. All units valid, perform updates
+        let mut updated_count = 0u64;
+        for i in 0..unit_ids.len() {
+            let unit_id = unit_ids.get(i).ok_or(ContractError::NotFound)?;
+            let mut blood_unit = storage::get_blood_unit(&env, unit_id).unwrap();
+
+            let old_status = blood_unit.status;
             blood_unit.status = new_status;
             storage::set_blood_unit(&env, &blood_unit);
 
-            // Keep status index consistent for each unit.
             storage::remove_from_status_index(&env, unit_id, old_status);
             storage::add_to_status_index(&env, &blood_unit);
 
@@ -374,8 +469,60 @@ impl InventoryContract {
         storage::get_status_history(&env, unit_id)
     }
 
+    /// Return a single page of status history. O(1) storage reads.
+    pub fn get_status_history_page(
+        env: Env,
+        unit_id: u64,
+        page: u32,
+    ) -> Vec<crate::types::StatusChangeHistory> {
+        storage::get_status_history_page(&env, unit_id, page)
+    }
+
+    /// Return the last page number for a unit's history (0-based).
+    pub fn get_history_page_count(env: Env, unit_id: u64) -> u32 {
+        storage::get_history_page_count(&env, unit_id)
+    }
+
     pub fn get_status_change_count(env: Env, unit_id: u64) -> u64 {
         storage::get_blood_unit_status_change_count(&env, unit_id)
+    }
+
+    /// Register multiple blood units in a single transaction.
+    /// Returns a Vec of the new blood unit IDs in input order.
+    pub fn batch_register_blood(
+        env: Env,
+        bank_id: Address,
+        entries: Vec<(String, BloodType, u32, Option<Address>)>,
+    ) -> Result<Vec<u64>, ContractError> {
+        bank_id.require_auth();
+        Self::require_not_paused(&env)?;
+
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(ContractError::NotInitialized);
+        }
+        if !storage::is_authorized_bank(&env, &bank_id) {
+            return Err(ContractError::NotAuthorizedBloodBank);
+        }
+
+        for i in 0..entries.len() {
+            let (_, _, quantity_ml, _) = entries.get(i).unwrap();
+            validation::validate_quantity(quantity_ml)?;
+        }
+
+        let mut ids: Vec<u64> = Vec::new(&env);
+        for i in 0..entries.len() {
+            let (serial_number, blood_type, quantity_ml, donor_id) = entries.get(i).unwrap();
+            let id = Self::register_blood_after_auth(
+                env.clone(),
+                bank_id.clone(),
+                serial_number,
+                blood_type,
+                quantity_ml,
+                donor_id,
+            )?;
+            ids.push_back(id);
+        }
+        Ok(ids)
     }
 
     /// Reserve one or more blood units for a hospital requester.
@@ -401,6 +548,8 @@ impl InventoryContract {
     ) -> Result<u64, ContractError> {
         requester.require_auth();
 
+        Self::require_not_paused(&env)?;
+
         if !storage::is_authorized_bank(&env, &requester) {
             return Err(ContractError::NotAuthorizedBloodBank);
         }
@@ -411,6 +560,12 @@ impl InventoryContract {
         for i in 0..unit_ids.len() {
             let unit_id = unit_ids.get(i).ok_or(ContractError::NotFound)?;
             let unit = storage::get_blood_unit(&env, unit_id).ok_or(ContractError::NotFound)?;
+            
+            // Explicit ownership check: prove that every selected unit belongs to the blood bank performing the action.
+            if unit.bank_id != requester {
+                return Err(ContractError::NotUnitOwner);
+            }
+
             if unit.status != BloodStatus::Available {
                 return Err(ContractError::BloodUnitNotAvailable);
             }
@@ -435,8 +590,7 @@ impl InventoryContract {
         // Update all unit statuses to Reserved
         for i in 0..unit_ids.len() {
             let unit_id = unit_ids.get(i).ok_or(ContractError::NotFound)?;
-            let mut unit =
-                storage::get_blood_unit(&env, unit_id).ok_or(ContractError::NotFound)?;
+            let mut unit = storage::get_blood_unit(&env, unit_id).ok_or(ContractError::NotFound)?;
             let old_status = unit.status;
             unit.status = BloodStatus::Reserved;
             storage::set_blood_unit(&env, &unit);
@@ -454,21 +608,38 @@ impl InventoryContract {
     /// Can be called by anyone — the reservation record is the authority.
     /// If the reservation has already expired (ledger time > expiration_timestamp)
     /// the call still succeeds so callers can clean up stale reservations.
+    ///
+    /// Records a status history entry and emits a status-change event for every
+    /// unit that transitions Reserved → Available, preserving the full audit trail.
     pub fn release_reservation(env: Env, reservation_id: u64) -> Result<(), ContractError> {
+        Self::require_not_paused(&env)?;
         let reservation = storage::get_reservation(&env, reservation_id)
             .ok_or(ContractError::ReservationNotFound)?;
 
         for i in 0..reservation.unit_ids.len() {
-            let unit_id = reservation
-                .unit_ids
-                .get(i)
-                .ok_or(ContractError::NotFound)?;
+            let unit_id = reservation.unit_ids.get(i).ok_or(ContractError::NotFound)?;
             if let Some(mut unit) = storage::get_blood_unit(&env, unit_id) {
                 if unit.status == BloodStatus::Reserved {
                     unit.status = BloodStatus::Available;
                     storage::set_blood_unit(&env, &unit);
                     storage::remove_from_status_index(&env, unit_id, BloodStatus::Reserved);
                     storage::add_to_status_index(&env, &unit);
+                    storage::record_status_change(
+                        &env,
+                        unit_id,
+                        BloodStatus::Reserved,
+                        BloodStatus::Available,
+                        &reservation.requester,
+                        None,
+                    );
+                    events::emit_status_change(
+                        &env,
+                        unit_id,
+                        BloodStatus::Reserved,
+                        BloodStatus::Available,
+                        &reservation.requester,
+                        None,
+                    );
                 }
             }
         }
@@ -494,6 +665,8 @@ impl InventoryContract {
         batch: Vec<(Vec<u64>, u64, u64)>,
     ) -> Result<Vec<u64>, ContractError> {
         requester.require_auth();
+
+        Self::require_not_paused(&env)?;
 
         if !storage::is_authorized_bank(&env, &requester) {
             return Err(ContractError::NotAuthorizedBloodBank);

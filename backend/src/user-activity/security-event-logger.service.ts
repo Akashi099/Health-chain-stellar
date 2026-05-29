@@ -12,6 +12,9 @@ export enum SecurityEventType {
   AUTH_ACCOUNT_MANUALLY_UNLOCKED = 'AUTH_ACCOUNT_MANUALLY_UNLOCKED',
   AUTH_SESSION_REVOKED = 'AUTH_SESSION_REVOKED',
   AUTH_REFRESH_TOKEN_REPLAY = 'AUTH_REFRESH_TOKEN_REPLAY',
+  AUTH_SESSION_RISK_ELEVATED = 'AUTH_SESSION_RISK_ELEVATED',
+  AUTH_STEP_UP_REQUIRED = 'AUTH_STEP_UP_REQUIRED',
+  TENANT_ACCESS_DENIED = 'TENANT_ACCESS_DENIED',
 }
 
 export interface SecurityEvent {
@@ -25,6 +28,10 @@ export interface SecurityEvent {
   metadata?: Record<string, unknown>;
   description?: string;
   timestamp?: string;
+  /** Session risk context — attached when risk scoring is available */
+  riskScore?: number;
+  riskLevel?: string;
+  riskSignals?: Record<string, boolean>;
 }
 
 @Injectable()
@@ -44,6 +51,9 @@ export class SecurityEventLoggerService {
         email: event.email,
         sessionId: event.sessionId,
         reason: event.reason,
+        ...(event.riskScore !== undefined && { riskScore: event.riskScore }),
+        ...(event.riskLevel !== undefined && { riskLevel: event.riskLevel }),
+        ...(event.riskSignals !== undefined && { riskSignals: event.riskSignals }),
         ...event.metadata,
       },
       ipAddress: event.ipAddress ?? null,
@@ -80,6 +90,28 @@ export class SecurityEventLoggerService {
         return ActivityType.AUTH_SESSION_REVOKED;
       case SecurityEventType.AUTH_REFRESH_TOKEN_REPLAY:
         return ActivityType.AUTH_REFRESH_TOKEN_REPLAY;
+      case SecurityEventType.AUTH_SESSION_RISK_ELEVATED:
+      case SecurityEventType.AUTH_STEP_UP_REQUIRED:
+      case SecurityEventType.TENANT_ACCESS_DENIED:
+        return ActivityType.AUTH_SESSION_RISK_ELEVATED;
+      
+      // WebSocket events map to existing activity types
+      case SecurityEventType.WS_NO_TOKEN:
+      case SecurityEventType.WS_INVALID_TOKEN:
+      case SecurityEventType.WS_INVALID_CLAIMS:
+      case SecurityEventType.WS_AUTH_ERROR:
+        return ActivityType.AUTH_LOGIN_FAILED;
+      
+      case SecurityEventType.WS_AUTH_SUCCESS:
+        return ActivityType.AUTH_LOGIN_SUCCESS;
+      
+      case SecurityEventType.WS_PRIVILEGE_VIOLATION:
+      case SecurityEventType.WS_TENANT_ESCAPE_ATTEMPT:
+      case SecurityEventType.WS_RATE_LIMITED:
+      case SecurityEventType.WS_TOKEN_REFRESH_FAILED:
+      case SecurityEventType.WS_HEARTBEAT_TIMEOUT:
+        return ActivityType.AUTH_SESSION_RISK_ELEVATED;
+      
       default:
         return ActivityType.AUTH_LOGIN_FAILED;
     }

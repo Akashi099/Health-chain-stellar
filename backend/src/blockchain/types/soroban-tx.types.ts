@@ -7,6 +7,7 @@ export interface SorobanTxJob {
 }
 
 export interface SorobanTxResult {
+  success?: boolean;
   jobId: string;
   transactionHash?: string;
   status: 'pending' | 'completed' | 'failed' | 'dlq';
@@ -33,8 +34,8 @@ export interface QueueMetrics {
   failedJobs: number;
   /** Current depth of the dead-letter queue. */
   dlqCount: number;
-  /** Jobs processed per second (rolling, 0 if not calculated). */
-  processingRate: number;
+  /** Jobs processed per second (rolling, null if not yet available). */
+  processingRate: number | null;
   /** Cumulative counters since process start (or last reset). */
   counters: {
     queued: number;

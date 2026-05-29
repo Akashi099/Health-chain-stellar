@@ -1,5 +1,6 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Inject, forwardRef } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
+import { Response } from 'express';
 
 import { Repository, SelectQueryBuilder } from 'typeorm';
 
@@ -12,6 +13,8 @@ import {
 import { BloodRequestItemEntity } from '../entities/blood-request-item.entity';
 import { BloodRequestEntity } from '../entities/blood-request.entity';
 import { BloodRequestStatus } from '../enums/blood-request-status.enum';
+import { ReportExportService } from '../../reporting/services/report-export.service';
+import { ReportGeneratorService } from '../../reporting/services/report-generator.service';
 
 export interface RequestStatistics {
   totalRequests: number;
@@ -44,6 +47,9 @@ export class RequestQueryService {
     private readonly bloodRequestRepository: Repository<BloodRequestEntity>,
     @InjectRepository(BloodRequestItemEntity)
     private readonly bloodRequestItemRepository: Repository<BloodRequestItemEntity>,
+    @Inject(forwardRef(() => ReportExportService))
+    private readonly reportExportService: ReportExportService,
+    private readonly reportGeneratorService: ReportGeneratorService,
   ) {}
 
   async queryRequests(queryDto: QueryRequestsDto): Promise<{
@@ -55,9 +61,14 @@ export class RequestQueryService {
     const queryBuilder = this.buildQuery(queryDto);
 
     const [data, total] = await queryBuilder.getManyAndCount();
+    const sortedData = this.sortRequestsByPriority(
+      data,
+      queryDto.sortBy || SortField.TRIAGE_SCORE,
+      queryDto.sortOrder || SortOrder.DESC,
+    );
 
     return {
-      data,
+      data: sortedData,
       total,
       limit: queryDto.limit || 20,
       offset: queryDto.offset || 0,
@@ -119,15 +130,52 @@ export class RequestQueryService {
     // For now, we'll skip this as it's not in the entity
 
     // Sorting
-    const sortField = queryDto.sortBy || SortField.CREATED_AT;
+    const sortField = queryDto.sortBy || SortField.TRIAGE_SCORE;
     const sortOrder = queryDto.sortOrder || SortOrder.DESC;
-    queryBuilder.orderBy(`request.${sortField}`, sortOrder);
+    if (sortField !== SortField.TRIAGE_SCORE) {
+      queryBuilder.orderBy(`request.${sortField}`, sortOrder);
+    }
 
     // Pagination
     queryBuilder.take(queryDto.limit || 20);
     queryBuilder.skip(queryDto.offset || 0);
 
     return queryBuilder;
+  }
+
+  sortRequestsByPriority(
+    requests: BloodRequestEntity[],
+    sortField: SortField,
+    sortOrder: SortOrder,
+  ): BloodRequestEntity[] {
+    const sorted = [...requests];
+
+    sorted.sort((a, b) => {
+      if (sortField === SortField.TRIAGE_SCORE) {
+        const scoreDelta = (b.triageScore ?? 0) - (a.triageScore ?? 0);
+        if (scoreDelta !== 0) {
+          return sortOrder === SortOrder.DESC ? scoreDelta : -scoreDelta;
+        }
+
+        const requiredByDelta = a.requiredByTimestamp - b.requiredByTimestamp;
+        if (requiredByDelta !== 0) return requiredByDelta;
+
+        const createdDelta = a.createdTimestamp - b.createdTimestamp;
+        if (createdDelta !== 0) return createdDelta;
+
+        return a.requestNumber.localeCompare(b.requestNumber);
+      }
+
+      const left = (a as any)[sortField];
+      const right = (b as any)[sortField];
+      const fieldDelta =
+        typeof left === 'number' && typeof right === 'number'
+          ? left - right
+          : `${left}`.localeCompare(`${right}`);
+      return sortOrder === SortOrder.DESC ? -fieldDelta : fieldDelta;
+    });
+
+    return sorted;
   }
 
   async getRequestStatistics(
@@ -155,6 +203,9 @@ export class RequestQueryService {
     const totalRequests = requests.length;
     const pendingRequests = requests.filter(
       (r) => r.status === BloodRequestStatus.PENDING,
+    ).length;
+    const approvedRequests = requests.filter(
+      (r) => r.status === BloodRequestStatus.APPROVED,
     ).length;
     const fulfilledRequests = requests.filter(
       (r) => r.status === BloodRequestStatus.FULFILLED,
@@ -302,51 +353,58 @@ export class RequestQueryService {
     };
   }
 
+  async initiateExport(
+    queryDto: QueryRequestsDto,
+    user: any,
+    format: 'pdf' | 'csv',
+  ) {
+    // 1. Force tenant isolation
+    const isolationDto = { ...queryDto };
+    if (user.hospitalId) {
+      isolationDto.hospitalId = user.hospitalId;
+    }
+
+    // 2. Check if we should do it sync or async
+    // Let's say > 50 records is "large" for sync PDF/CSV streaming
+    const { total } = await this.queryRequests({ ...isolationDto, limit: 1 });
+    
+    if (total > 50) {
+      return this.reportExportService.initiateExport({
+        type: 'BLOOD_REQUESTS_AUDIT',
+        format,
+        parameters: isolationDto,
+        hospitalId: user.hospitalId,
+        userId: user.id,
+      });
+    }
+
+    // 3. Sync generation for small datasets
+    const { data } = await this.queryRequests({ ...isolationDto, limit: 100 });
+    
+    if (format === 'csv') {
+      return this.reportGeneratorService.generateBloodRequestsCSV(data);
+    } else {
+      const metadata = {
+        title: 'Blood Request Audit Report',
+        hospitalId: user.hospitalId,
+        generatedBy: user.id,
+      };
+      return this.reportGeneratorService.generateBloodRequestsPDF(data, metadata);
+    }
+  }
+
   async exportToCSV(queryDto: QueryRequestsDto): Promise<string> {
-    const { data } = await this.queryRequests(queryDto);
-
-    const headers = [
-      'Request Number',
-      'Hospital ID',
-      'Status',
-      'Required By',
-      'Created At',
-      'Updated At',
-      'Blood Types',
-      'Total Quantity (ml)',
-      'Notes',
-    ];
-
-    const rows = data.map((request) => {
-      const bloodTypes =
-        request.items?.map((item) => item.bloodType).join(', ') || '';
-      const totalQuantity =
-        request.items?.reduce((sum, item) => sum + item.quantityMl, 0) || 0;
-
-      return [
-        request.requestNumber,
-        request.hospitalId,
-        request.status,
-        request.requiredByTimestamp
-          ? new Date(request.requiredByTimestamp).toISOString()
-          : '',
-        request.createdAt.toISOString(),
-        request.updatedAt.toISOString(),
-        bloodTypes,
-        totalQuantity.toString(),
-        request.notes || '',
-      ]
-        .map((field) => `"${field}"`)
-        .join(',');
-    });
-
-    return [headers.join(','), ...rows].join('\n');
+    // Legacy method - just for internal use or keeping compatibility
+    const buffer = await this.reportGeneratorService.generateBloodRequestsCSV(
+      (await this.queryRequests(queryDto)).data,
+    );
+    return buffer.toString();
   }
 
   async exportToPDF(queryDto: QueryRequestsDto): Promise<Buffer> {
-    // PDF export would require a PDF library like pdfkit or puppeteer
-    // For now, return a placeholder
-    this.logger.warn('PDF export not yet implemented');
-    return Buffer.from('PDF export not yet implemented');
+     return this.reportGeneratorService.generateBloodRequestsPDF(
+      (await this.queryRequests(queryDto)).data,
+      { title: 'Blood Request Report', generatedBy: 'System' }
+    );
   }
 }

@@ -26,4 +26,11 @@ pub enum CoordinatorError {
     // Cross-contract call failures
     InventoryUpdateFailed = 830,
     PaymentUpdateFailed = 831,
+    PaymentFlagFailed = 832,
+
+    // Circuit breaker
+    ContractPaused = 840,
+
+    /// emergency_halt() has been called; all workflow mutations are blocked.
+    EmergencyHalted = 841,
 }
