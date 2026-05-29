@@ -65,3 +65,11 @@ npm run start:dev
 ```
 
 See [DOCKER_SETUP.md](./DOCKER_SETUP.md) for detailed instructions and optional development tools.
+
+## Project Structure
+
+| Directory | README |
+|-----------|--------|
+| `backend/` | [Backend README](./backend/README.md) |
+| `contracts/` | [Contracts README](./contracts/README.md) |
+| `lifebank-soroban/` | [Lifebank Soroban README](./lifebank-soroban/README.md) |
