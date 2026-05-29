@@ -61,3 +61,24 @@ echo ""
 echo "✅ Deployment complete!"
 echo ""
 echo "📝 Contract IDs saved to .contract-ids.json"
+
+# ── Regenerate TypeScript bindings (issue #846) ────────────────────────────────
+echo ""
+echo "🔗 Regenerating TypeScript client bindings..."
+
+# Export contract IDs so generate-bindings.sh can pick them up
+export COORDINATOR_CONTRACT_ID="${CONTRACT_IDS[coordinator]:-}"
+export INVENTORY_CONTRACT_ID="${CONTRACT_IDS[inventory]}"
+export PAYMENTS_CONTRACT_ID="${CONTRACT_IDS[payments]}"
+export REQUESTS_CONTRACT_ID="${CONTRACT_IDS[requests]}"
+export TEMPERATURE_CONTRACT_ID="${CONTRACT_IDS[temperature]:-}"
+export SOROBAN_NETWORK="${NETWORK}"
+
+GENERATE_SCRIPT="$(cd "$(dirname "$0")/../.." && pwd)/scripts/generate-bindings.sh"
+
+if [[ -f "${GENERATE_SCRIPT}" ]]; then
+  bash "${GENERATE_SCRIPT}"
+else
+  echo "  ⚠️  generate-bindings.sh not found at ${GENERATE_SCRIPT} — skipping."
+  echo "  Run scripts/generate-bindings.sh manually to regenerate TypeScript bindings."
+fi
