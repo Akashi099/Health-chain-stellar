@@ -3,6 +3,7 @@ import {
   NotFoundException,
   BadRequestException,
   ForbiddenException,
+  ServiceUnavailableException,
   Logger,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -401,7 +402,22 @@ export class BloodUnitsService {
         source: 'blockchain',
       };
     } catch (error) {
-      throw new NotFoundException(`Blood unit ${unitId} not found`);
+      if (error instanceof NotFoundException) {
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      const isNotFound =
+        message.toLowerCase().includes('not found') ||
+        message.toLowerCase().includes('no entry') ||
+        message.toLowerCase().includes('does not exist');
+      if (isNotFound) {
+        throw new NotFoundException(`Blood unit ${unitId} not found`);
+      }
+      this.logger.error(
+        `Blockchain error fetching trail for unit ${unitId}: ${message}`,
+        error instanceof Error ? error.stack : undefined,
+      );
+      throw new ServiceUnavailableException('Blockchain service is temporarily unavailable');
     }
   }
 

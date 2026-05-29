@@ -242,20 +242,15 @@ export class RidersService {
   }
 
   async queryAvailability(dto: AvailabilityQueryDto) {
-    const riders = await this.riderRepository.find({
-      where: { status: RiderStatus.AVAILABLE, isVerified: true },
-    });
-
-    let results = riders;
+    const qb = this.riderRepository
+      .createQueryBuilder('rider')
+      .where('rider.status = :status', { status: RiderStatus.AVAILABLE })
+      .andWhere('rider.is_verified = true');
 
     if (dto.area) {
-      results = results.filter(
-        (r) =>
-          Array.isArray(r.preferredAreas) &&
-          r.preferredAreas.some((a) =>
-            a.toLowerCase().includes(dto.area!.toLowerCase()),
-          ),
-      );
+      qb.andWhere('rider.preferred_areas::text ILIKE :area', {
+        area: `%${dto.area}%`,
+      });
     }
 
     if (
@@ -263,17 +258,20 @@ export class RidersService {
       dto.longitude !== undefined &&
       dto.radiusKm !== undefined
     ) {
-      results = results.filter((rider) => {
-        if (rider.latitude === null || rider.longitude === null) return false;
-        const latKm = Math.abs(rider.latitude - dto.latitude!) * 111;
-        const lngKm =
-          Math.abs(rider.longitude - dto.longitude!) *
-          111 *
-          Math.cos((dto.latitude! * Math.PI) / 180);
-        return Math.sqrt(latKm ** 2 + lngKm ** 2) <= dto.radiusKm!;
-      });
+      qb
+        .andWhere('rider.latitude IS NOT NULL')
+        .andWhere('rider.longitude IS NOT NULL')
+        .andWhere(
+          `(6371 * acos(LEAST(1.0,
+            cos(radians(:lat)) * cos(radians(CAST(rider.latitude AS float))) *
+            cos(radians(CAST(rider.longitude AS float)) - radians(:lng)) +
+            sin(radians(:lat)) * sin(radians(CAST(rider.latitude AS float)))
+          ))) <= :radius`,
+          { lat: dto.latitude, lng: dto.longitude, radius: dto.radiusKm },
+        );
     }
 
+    const results = await qb.getMany();
     return {
       message: 'Availability query successful',
       data: results,
