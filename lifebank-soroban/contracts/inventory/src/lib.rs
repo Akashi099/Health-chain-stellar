@@ -606,6 +606,9 @@ impl InventoryContract {
     ///
     /// # Returns
     /// Unique reservation ID
+    ///
+    /// # Errors
+    /// - `BloodUnitExpired`: One or more units have expired (issue #845 fix)
     pub fn reserve_blood(
         env: Env,
         requester: Address,
@@ -640,6 +643,7 @@ impl InventoryContract {
             if unit.status != BloodStatus::Available {
                 return Err(ContractError::BloodUnitNotAvailable);
             }
+            // Issue #845 fix: Reject expired blood units at reservation time
             if unit.is_expired(current_time) {
                 return Err(ContractError::BloodUnitExpired);
             }
@@ -767,3 +771,5 @@ impl InventoryContract {
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test_expiry_fix;
