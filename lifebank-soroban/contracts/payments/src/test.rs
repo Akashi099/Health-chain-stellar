@@ -533,6 +533,30 @@ fn test_create_pledge_rejects_zero_interval() {
     assert!(r.is_err());
 }
 
+#[test]
+fn test_create_pledge_rejects_zero_amount() {
+    let (env, cid) = setup();
+    let client = PaymentContractClient::new(&env, &cid);
+    let donor = Address::generate(&env);
+    let pool = soroban_sdk::String::from_str(&env, "pool");
+    let cause = soroban_sdk::String::from_str(&env, "c");
+    let region = soroban_sdk::String::from_str(&env, "r");
+    let result = client.try_create_pledge(&donor, &0i128, &86_400u64, &pool, &cause, &region, &false);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)), "Zero amount pledge must be rejected");
+}
+
+#[test]
+fn test_create_pledge_rejects_negative_amount() {
+    let (env, cid) = setup();
+    let client = PaymentContractClient::new(&env, &cid);
+    let donor = Address::generate(&env);
+    let pool = soroban_sdk::String::from_str(&env, "pool");
+    let cause = soroban_sdk::String::from_str(&env, "c");
+    let region = soroban_sdk::String::from_str(&env, "r");
+    let result = client.try_create_pledge(&donor, &-500i128, &86_400u64, &pool, &cause, &region, &false);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)), "Negative amount pledge must be rejected");
+}
+
 // ── Circuit breaker tests ─────────────────────────────────────────────────────
 
 #[test]
