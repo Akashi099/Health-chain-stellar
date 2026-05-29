@@ -1,4 +1,18 @@
-use soroban_sdk::{contracttype, Address, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, String, Symbol, Vec};
+
+pub const DEFAULT_DISPUTE_TIMEOUT_SECS: u64 = 72 * 60 * 60;
+pub const HIGH_VALUE_THRESHOLD: i128 = 10_000;
+
+/// **Dispute evidence (beyond `Symbol` limits).**
+///
+/// Soroban `Symbol` values are capped (~32 characters) and cannot carry full IPFS CIDs,
+/// long URLs, or rich text. Disputes therefore store:
+/// - [`Dispute::reason`]: human-readable explanation as Soroban [`String`].
+/// - [`Dispute::evidence_digest`]: a fixed-size fingerprint (typically 32 bytes, e.g. SHA-256)
+///   over the canonical evidence payload agreed off-chain.
+/// - [`Dispute::evidence_ref_chunks`]: optional ordered segments. If a single `String` is not
+///   enough for a CID/URL, split off-chain, submit each piece in order, and reassemble off-chain
+///   for display. Verifiers must check the reconstructed reference against `evidence_digest`.
 
 /// Represents the current state of a payment in its lifecycle
 #[contracttype]
@@ -46,14 +60,32 @@ pub struct Dispute {
     pub raised_by: Address,
     /// Current status of the dispute
     pub status: DisputeStatus,
-    /// Reason for the dispute (short description)
-    pub reason: Symbol,
-    /// Hash or ID for external evidence (IPFS CID, etc)
-    pub evidence_hash: Symbol,
+    /// Reason for the dispute (Soroban [`String`], not `Symbol`)
+    pub reason: String,
+    /// 32-byte (or shorter, left-padded) digest of canonical evidence; primary on-chain anchor
+    pub evidence_digest: Bytes,
+    /// Optional URI/CID fragments; concatenate off-chain in order (see module docs)
+    pub evidence_ref_chunks: Vec<String>,
     /// Timestamp when dispute was raised
     pub raised_at: u64,
     /// Timestamp when dispute was resolved
     pub resolved_at: Option<u64>,
+}
+
+/// Additional dispute metadata that can evolve independently of the dispute record.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisputeMetadata {
+    pub dispute_id: u64,
+    pub dispute_deadline: u64,
+}
+
+/// Aggregated refund stats for dispute timeout processing.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaymentStats {
+    pub count_auto_refunded: u64,
+    pub total_auto_refunded: i128,
 }
 
 /// Conditions that must be met before escrow funds can be released
@@ -80,10 +112,12 @@ pub struct Payment {
     pub payer: Address,
     /// Address receiving the payment
     pub payee: Address,
-    /// Payment amount in smallest unit
+    /// Payment amount in smallest unit (net after fees)
     pub amount: i128,
     /// Asset contract address
     pub asset: Address,
+    /// Fee structure applied (for audit)
+    pub fee_structure: FeeStructure,
     /// Current payment status
     pub status: PaymentStatus,
     /// Timestamp when escrow was released (if applicable)
@@ -102,16 +136,37 @@ pub struct EscrowAccount {
     pub release_conditions: ReleaseConditions,
 }
 
+/// M-of-N multisig release configuration for high-value escrow.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MultiSigConfig {
+    pub signers: Vec<Address>,
+    pub threshold: u32,
+}
+
+/// Votes accumulated for a payment release proposal.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingApproval {
+    pub payment_id: u64,
+    pub approvals: Vec<Address>,
+    pub executed: bool,
+}
+
 /// Fee breakdown for a transaction
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FeeStructure {
+    /// Policy ID for audit
+    pub policy_id: Symbol,
     /// Platform service fee
     pub service_fee: i128,
     /// Network transaction fee
     pub network_fee: i128,
     /// Optional performance-based bonus
     pub performance_bonus: i128,
+    /// Fixed fee
+    pub fixed_fee: i128,
 }
 
 /// Additional metadata for transaction tracking
@@ -132,6 +187,15 @@ pub struct TransactionMetadata {
     pub tags: Vec<Symbol>,
     /// Reference identifier (not a full URL - use hash or ID)
     pub reference_url: Symbol,
+}
+
+impl PaymentStats {
+    pub fn new() -> Self {
+        Self {
+            count_auto_refunded: 0,
+            total_auto_refunded: 0,
+        }
+    }
 }
 
 impl Payment {
@@ -227,15 +291,73 @@ impl EscrowAccount {
     }
 }
 
+impl MultiSigConfig {
+    pub fn validate(&self) -> Result<(), PaymentError> {
+        if self.signers.is_empty() || self.threshold == 0 {
+            return Err(PaymentError::InvalidMultiSigConfig);
+        }
+
+        if self.threshold > self.signers.len() {
+            return Err(PaymentError::InvalidMultiSigConfig);
+        }
+
+        for i in 0..self.signers.len() {
+            let signer = self.signers.get(i).unwrap();
+            for j in (i + 1)..self.signers.len() {
+                if signer == self.signers.get(j).unwrap() {
+                    return Err(PaymentError::InvalidMultiSigConfig);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn is_signer(&self, approver: &Address) -> bool {
+        self.signers.contains(approver.clone())
+    }
+}
+
+impl PendingApproval {
+    pub fn new(env: &soroban_sdk::Env, payment_id: u64) -> Self {
+        Self {
+            payment_id,
+            approvals: Vec::new(env),
+            executed: false,
+        }
+    }
+
+    pub fn has_voted(&self, approver: &Address) -> bool {
+        self.approvals.contains(approver.clone())
+    }
+
+    pub fn register_vote(&mut self, approver: Address) -> Result<(), PaymentError> {
+        if self.has_voted(&approver) {
+            return Err(PaymentError::DuplicateApproval);
+        }
+
+        self.approvals.push_back(approver);
+        Ok(())
+    }
+
+    pub fn has_reached_threshold(&self, threshold: u32) -> bool {
+        self.approvals.len() >= threshold
+    }
+}
+
 impl FeeStructure {
     /// Calculates total fees
     pub fn total(&self) -> i128 {
-        self.service_fee + self.network_fee + self.performance_bonus
+        self.service_fee + self.network_fee + self.performance_bonus + self.fixed_fee
     }
 
     /// Validates fee structure
     pub fn validate(&self) -> Result<(), PaymentError> {
-        if self.service_fee < 0 || self.network_fee < 0 || self.performance_bonus < 0 {
+        if self.service_fee < 0
+            || self.network_fee < 0
+            || self.performance_bonus < 0
+            || self.fixed_fee < 0
+        {
             return Err(PaymentError::InvalidFee);
         }
         Ok(())
@@ -262,4 +384,6 @@ pub enum PaymentError {
     FeesExceedAmount,
     InvalidTransition,
     EscrowNotReleasable,
+    InvalidMultiSigConfig,
+    DuplicateApproval,
 }

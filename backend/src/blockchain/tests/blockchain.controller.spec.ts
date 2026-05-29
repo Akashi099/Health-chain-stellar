@@ -6,25 +6,43 @@ import { createHmac } from 'crypto';
 import { Test, TestingModule } from '@nestjs/testing';
 
 import { Request } from 'express';
+import { ConfigService } from '@nestjs/config';
 
 import { BlockchainController } from '../controllers/blockchain.controller';
 import { AdminGuard } from '../guards/admin.guard';
+import { BlockchainHealthService } from '../services/blockchain-health.service';
+import { FailedSorobanTxService } from '../services/failed-soroban-tx.service';
+import { QueueMetricsService } from '../services/queue-metrics.service';
 import { SorobanService } from '../services/soroban.service';
-import { SorobanTxJob } from '../types/soroban-tx.types';
+import { QueueMetrics, SorobanTxJob } from '../types/soroban-tx.types';
+
+const BASE_METRICS: QueueMetrics = {
+  queueDepth: 5,
+  failedJobs: 2,
+  dlqCount: 1,
+  processingRate: 0,
+  counters: {
+    queued: 10,
+    processing: 1,
+    success: 7,
+    failure: 2,
+    retries: 3,
+    dlq: 1,
+  },
+  timings: { avgMs: 120, minMs: 80, maxMs: 300, samples: 7 },
+};
 
 describe('BlockchainController', () => {
   let controller: BlockchainController;
   let mockSorobanService: jest.Mocked<SorobanService>;
+  let mockQueueMetricsService: {
+    getDetailedMetrics: jest.Mock;
+  };
 
   beforeEach(async () => {
     mockSorobanService = {
       submitTransaction: jest.fn().mockResolvedValue('job-123'),
-      getQueueMetrics: jest.fn().mockResolvedValue({
-        queueDepth: 5,
-        failedJobs: 2,
-        dlqCount: 1,
-        processingRate: 0,
-      }),
+      getQueueMetrics: jest.fn().mockResolvedValue(BASE_METRICS),
       getJobStatus: jest.fn().mockResolvedValue({
         jobId: 'job-123',
         transactionHash: 'tx_abc123',
@@ -38,12 +56,42 @@ describe('BlockchainController', () => {
       checkAndSetCallbackIdempotency: jest.fn().mockResolvedValue(true),
     } as unknown as jest.Mocked<SorobanService>;
 
+    mockQueueMetricsService = {
+      getDetailedMetrics: jest.fn().mockResolvedValue({
+        counters: {
+          queued: 10,
+          processing: 1,
+          success: 7,
+          failure: 2,
+          retries: 3,
+          dlq: 1,
+        },
+        timings: { avgMs: 120, minMs: 80, maxMs: 300, samples: 7 },
+        live: { waiting: 3, active: 1, failed: 2, delayed: 0, dlqDepth: 1 },
+        since: '2026-01-01T00:00:00.000Z',
+      }),
+    };
+
     const module: TestingModule = await Test.createTestingModule({
       controllers: [BlockchainController],
       providers: [
+        { provide: SorobanService, useValue: mockSorobanService },
         {
-          provide: SorobanService,
-          useValue: mockSorobanService,
+          provide: ConfigService,
+          useValue: {
+            get: jest.fn((key: string) =>
+              key === 'BLOCKCHAIN_CALLBACK_SECRET' ? 'test-secret' : undefined,
+            ),
+          },
+        },
+        { provide: QueueMetricsService, useValue: mockQueueMetricsService },
+        {
+          provide: FailedSorobanTxService,
+          useValue: { findUnresolved: jest.fn().mockResolvedValue([]) },
+        },
+        {
+          provide: BlockchainHealthService,
+          useValue: { check: jest.fn().mockResolvedValue({ status: 'ok' }) },
         },
       ],
     })
@@ -84,7 +132,7 @@ describe('BlockchainController', () => {
     it('should return queue metrics', async () => {
       const metrics = await controller.getQueueStatus();
 
-      expect(metrics).toEqual({
+      expect(metrics).toMatchObject({
         queueDepth: 5,
         failedJobs: 2,
         dlqCount: 1,
@@ -93,13 +141,14 @@ describe('BlockchainController', () => {
       expect(mockSorobanService.getQueueMetrics).toHaveBeenCalled();
     });
 
-    it('should include all required metrics', async () => {
+    it('should include all required metrics fields', async () => {
       const metrics = await controller.getQueueStatus();
 
       expect(metrics).toHaveProperty('queueDepth');
       expect(metrics).toHaveProperty('failedJobs');
       expect(metrics).toHaveProperty('dlqCount');
-      expect(metrics).toHaveProperty('processingRate');
+      expect(metrics).toHaveProperty('counters');
+      expect(metrics).toHaveProperty('timings');
     });
   });
 

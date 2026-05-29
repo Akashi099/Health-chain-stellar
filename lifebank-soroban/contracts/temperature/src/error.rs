@@ -11,4 +11,9 @@ pub enum ContractError {
     AlreadyInitialized = 604,
     ChangeNotReady = 605,
     NoPendingChange = 606,
+    ContractPaused = 605,
+    /// Coordinator contract address not configured
+    CoordinatorNotSet = 606,
+    /// Cross-contract call to coordinator failed
+    CoordinatorCallFailed = 607,
 }

@@ -1,4 +1,12 @@
-import { IsISO8601, IsIn, IsNotEmpty, IsOptional, IsString } from 'class-validator';
+import {
+  IsISO8601,
+  IsInt,
+  IsIn,
+  IsNotEmpty,
+  IsOptional,
+  IsString,
+  Min,
+} from 'class-validator';
 
 export class BlockchainCallbackDto {
   @IsString()
@@ -23,4 +31,13 @@ export class BlockchainCallbackDto {
   @IsOptional()
   @IsString()
   details?: string;
+
+  /**
+   * Number of block confirmations reported by the blockchain provider.
+   * When omitted, defaults to 1 (the callback itself counts as one confirmation).
+   */
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  confirmations?: number;
 }

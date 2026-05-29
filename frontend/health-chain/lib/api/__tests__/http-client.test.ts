@@ -212,4 +212,67 @@ describe('HTTP Client', () => {
       await expect(api.get('/test')).rejects.toThrow('Network error');
     });
   });
+
+  describe('Retry with jitter (thundering herd prevention)', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('should retry on 503 and succeed within cap (3 attempts)', async () => {
+      // First two calls return 503, third succeeds
+      (global.fetch as any)
+        .mockResolvedValueOnce({ ok: false, status: 503, statusText: 'Service Unavailable', json: async () => ({}) })
+        .mockResolvedValueOnce({ ok: false, status: 503, statusText: 'Service Unavailable', json: async () => ({}) })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ data: 'ok' }),
+          headers: new Headers({ 'content-type': 'application/json' }),
+        });
+
+      const promise = api.get('/flaky');
+      // Advance timers to skip jitter delays
+      await vi.runAllTimersAsync();
+      const result = await promise;
+
+      expect(global.fetch).toHaveBeenCalledTimes(3);
+      expect(result).toEqual({ data: 'ok' });
+    });
+
+    it('should stop retrying after RETRY_MAX_ATTEMPTS (3) and throw', async () => {
+      // All 4 calls (1 original + 3 retries) return 503
+      (global.fetch as any).mockResolvedValue({
+        ok: false,
+        status: 503,
+        statusText: 'Service Unavailable',
+        json: async () => ({ message: 'unavailable' }),
+      });
+
+      const promise = api.get('/always-down');
+      await vi.runAllTimersAsync();
+
+      await expect(promise).rejects.toThrow('unavailable');
+      expect(global.fetch).toHaveBeenCalledTimes(4); // 1 + 3 retries
+    });
+
+    it('should retry on 429 Too Many Requests', async () => {
+      (global.fetch as any)
+        .mockResolvedValueOnce({ ok: false, status: 429, statusText: 'Too Many Requests', json: async () => ({}) })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ data: 'ok' }),
+          headers: new Headers({ 'content-type': 'application/json' }),
+        });
+
+      const promise = api.get('/rate-limited');
+      await vi.runAllTimersAsync();
+      const result = await promise;
+
+      expect(global.fetch).toHaveBeenCalledTimes(2);
+      expect(result).toEqual({ data: 'ok' });
+    });
+  });
 });

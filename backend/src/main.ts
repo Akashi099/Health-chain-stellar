@@ -1,11 +1,16 @@
 import { ValidationPipe, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
+import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 
 import { AppModule } from './app.module';
+import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { AppErrorFilter } from './common/filters/irrecoverable-error.filter';
-import { ThrottlerExceptionFilter } from './throttler/throttler-exception.filter';
+import { ValidationExceptionFilter } from './common/filters/validation-exception.filter';
+import { CorrelationIdMiddleware } from './common/middleware/correlation-id.middleware';
+import { DatabaseSyncGuard } from './config/database-sync.guard';
 import { validateEnv } from './config/validate-env';
+import { ThrottlerExceptionFilter } from './throttler/throttler-exception.filter';
 
 async function bootstrap() {
   // Validate env before NestJS initialises any module.
@@ -16,15 +21,30 @@ async function bootstrap() {
     process.exit(1);
   }
 
+  // Fail fast if synchronize is enabled outside local environments.
+  const nodeEnv = process.env.NODE_ENV ?? 'development';
+  const synchronize = nodeEnv === 'development' || nodeEnv === 'test';
+  DatabaseSyncGuard.validateSynchronizeConfig(nodeEnv, synchronize);
+
   const app = await NestFactory.create(AppModule);
   const configService = app.get(ConfigService);
   const logger = new Logger('Bootstrap');
+  const isProduction =
+    configService.get<string>('NODE_ENV', 'development') === 'production';
+
+  const correlationIdMiddleware = new CorrelationIdMiddleware();
+  app.use((req, res, next) => correlationIdMiddleware.use(req, res, next));
 
   if (configService.get<string>('TRUST_PROXY', 'false') === 'true') {
     app.getHttpAdapter().getInstance().set('trust proxy', 1);
   }
 
-  app.useGlobalFilters(new ThrottlerExceptionFilter(), new AppErrorFilter());
+  app.useGlobalFilters(
+    new ValidationExceptionFilter(isProduction),
+    new ThrottlerExceptionFilter(isProduction),
+    new AppErrorFilter(isProduction),
+    new AllExceptionsFilter(isProduction),
+  );
 
   // Global validation pipe
   app.useGlobalPipes(
@@ -51,11 +71,28 @@ async function bootstrap() {
   const apiPrefix = configService.get<string>('API_PREFIX', 'api/v1');
   app.setGlobalPrefix(apiPrefix);
 
+  // Swagger/OpenAPI configuration
+  const swaggerConfig = new DocumentBuilder()
+    .setTitle('Health-chain-stellar API')
+    .setDescription(
+      'HealthDonor Protocol - Transparent health donations on Stellar Soroban',
+    )
+    .setVersion('1.0.0')
+    .addBearerAuth()
+    .addTag('Authentication', 'User authentication and session management')
+    .build();
+
+  const document = SwaggerModule.createDocument(app, swaggerConfig);
+  SwaggerModule.setup('docs', app, document);
+
   const port = configService.get<number>('PORT', 3000);
   await app.listen(port);
 
   logger.log(
     `Application is running on: http://localhost:${port}/${apiPrefix}`,
+  );
+  logger.log(
+    `Swagger documentation available at: http://localhost:${port}/docs`,
   );
   logger.log(
     `Environment: ${configService.get<string>('NODE_ENV', 'development')}`,

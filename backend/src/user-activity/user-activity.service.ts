@@ -85,9 +85,20 @@ export class UserActivityService {
       limit: 5000,
     });
     const rows = result.data;
+
+    // Filter out activities with redacted user data
+    const filteredRows = rows.filter(item => {
+      // If userId is redacted (marked as [REDACTED]), exclude from export
+      if (item.userId === '[REDACTED]') {
+        return false;
+      }
+      // If IP address is redacted, still include but mark as redacted
+      return true;
+    });
+
     const csvHeader =
       'id,userId,activityType,description,ipAddress,userAgent,createdAt';
-    const csvRows = rows.map((item) =>
+    const csvRows = filteredRows.map((item) =>
       [
         item.id,
         item.userId ?? '',

@@ -23,9 +23,12 @@ describe('ThrottlerExceptionFilter', () => {
     expect(status).toHaveBeenCalledWith(HttpStatus.TOO_MANY_REQUESTS);
     expect(json).toHaveBeenCalledWith(
       expect.objectContaining({
-        statusCode: HttpStatus.TOO_MANY_REQUESTS,
-        error: 'Too Many Requests',
-        message: expect.any(String),
+        success: false,
+        error: expect.objectContaining({
+          statusCode: HttpStatus.TOO_MANY_REQUESTS,
+          error: 'Too Many Requests',
+          message: expect.any(String),
+        }),
       }),
     );
   });

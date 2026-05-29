@@ -1,4 +1,5 @@
 import { Injectable, Inject, Optional } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 
 import type { RedisClientType } from 'redis';
 
@@ -8,7 +9,10 @@ export class IdempotencyService {
   private readonly IDEMPOTENCY_PREFIX = 'idempotency:';
   private readonly IDEMPOTENCY_TTL = 86400 * 7; // 7 days
 
-  constructor(@Optional() @Inject('REDIS_CLIENT') redis?: RedisClientType) {
+  constructor(
+    private configService: ConfigService,
+    @Optional() @Inject('REDIS_CLIENT') redis?: RedisClientType,
+  ) {
     if (redis) {
       this.redis = redis;
     } else {
@@ -16,8 +20,8 @@ export class IdempotencyService {
       const { createClient } = require('redis');
       this.redis = createClient({
         socket: {
-          host: process.env.REDIS_HOST || 'localhost',
-          port: parseInt(process.env.REDIS_PORT || '6379'),
+          host: this.configService.get<string>('REDIS_HOST') || 'localhost',
+          port: this.configService.get<number>('REDIS_PORT') || 6379,
         },
       });
     }
@@ -36,6 +40,11 @@ export class IdempotencyService {
     const fullKey = `${this.IDEMPOTENCY_PREFIX}${key}`;
     const exists = await this.redis.exists(fullKey);
     return exists === 1;
+  }
+
+  async clearIdempotencyKey(key: string): Promise<void> {
+    const fullKey = `${this.IDEMPOTENCY_PREFIX}${key}`;
+    await this.redis.del(fullKey);
   }
 
   async onModuleDestroy() {

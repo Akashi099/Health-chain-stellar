@@ -15,6 +15,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "analytics-contract"
+version = "0.0.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -251,6 +258,17 @@ name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
+
+[[package]]
+name = "coordinator-contract"
+version = "0.0.0"
+dependencies = [
+ "delivery-contract",
+ "inventory-contract",
+ "payment-contract",
+ "request-contract",
+ "soroban-sdk",
+]
 
 [[package]]
 name = "core-foundation-sys"
@@ -787,6 +805,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e04e2fd2b8188ea827b32ef11de88377086d690286ab35747ef7f9bf3ccb590"
 
 [[package]]
+name = "integration-tests"
+version = "0.0.0"
+dependencies = [
+ "coordinator-contract",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "inventory-contract"
 version = "0.0.0"
 dependencies = [
@@ -866,6 +892,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.114",
+]
+
+[[package]]
+name = "matching-contract"
+version = "0.0.0"
+dependencies = [
+ "inventory-contract",
+ "request-contract",
+ "soroban-sdk",
 ]
 
 [[package]]

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc -l /home/ljtwp/Desktop/drips/Health-chain-stellar/backend/src/**/*.ts)",
+      "Bash(npx jest:*)",
+      "Bash(node_modules/.bin/jest --testPathPattern=blood-status.service.spec.ts --no-coverage)",
+      "Bash(npx --no-install tsc --noEmit)"
+    ]
+  }
+}

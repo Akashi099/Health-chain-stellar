@@ -1,3 +1,4 @@
+import { Transform, Type } from 'class-transformer';
 import {
   IsString,
   IsNumber,
@@ -11,7 +12,6 @@ import {
   Matches,
   IsInt,
 } from 'class-validator';
-import { Transform, Type } from 'class-transformer';
 
 /**
  * Canonical schema for all environment variables.
@@ -82,6 +82,18 @@ export class EnvironmentVariables {
 
   @IsOptional()
   @IsString()
+  JWT_SECRET_KID: string = 'key-1';
+
+  @IsOptional()
+  @IsString()
+  JWT_PREVIOUS_SECRET: string = '';
+
+  @IsOptional()
+  @IsString()
+  JWT_PREVIOUS_SECRET_KID: string = 'key-0';
+
+  @IsOptional()
+  @IsString()
   JWT_EXPIRES_IN: string = '1h';
 
   @IsString()
@@ -135,6 +147,14 @@ export class EnvironmentVariables {
   })
   SOROBAN_NETWORK: string = 'testnet';
 
+  @IsString()
+  @IsNotEmpty({ message: 'BLOCKCHAIN_CALLBACK_SECRET is required' })
+  BLOCKCHAIN_CALLBACK_SECRET: string;
+
+  @IsString()
+  @IsNotEmpty({ message: 'ADMIN_KEY is required' })
+  ADMIN_KEY: string;
+
   // ─── Africa's Talking (SMS) ───────────────────────────────────────────────
 
   @IsString()
@@ -176,7 +196,24 @@ export class EnvironmentVariables {
   @IsString()
   SMTP_FROM: string = 'noreply@example.com';
 
+  // ─── Account Lockout ─────────────────────────────────────────────────────
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(3)
+  @Max(10)
+  MAX_FAILED_LOGIN_ATTEMPTS: number = 5;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(5)
+  @Max(60)
+  ACCOUNT_LOCK_MINUTES: number = 15;
+
   // ─── Rate Limiting ────────────────────────────────────────────────────────
+
 
   @IsOptional()
   @Type(() => Number)
@@ -191,9 +228,28 @@ export class EnvironmentVariables {
   THROTTLE_LIMIT: number = 100;
 
   @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(1)
+  THROTTLE_AUTH_TTL: number = 60;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(1)
+  THROTTLE_AUTH_LIMIT: number = 10;
+
+  @IsOptional()
   @Transform(({ value }) => value === 'true' || value === true)
   @IsBoolean()
   THROTTLER_USE_REDIS: boolean = true;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(10)
+  PASSWORD_HISTORY_LENGTH: number = 3;
 
   // ─── Inventory Forecasting ────────────────────────────────────────────────
 
@@ -212,4 +268,59 @@ export class EnvironmentVariables {
   @IsInt()
   @Min(1)
   INVENTORY_FORECAST_HISTORY_DAYS: number = 30;
+
+  // ─── Data Retention ───────────────────────────────────────────────────────
+
+  @IsOptional()
+  @IsString()
+  RETENTION_JOB_CRON: string = '0 2 * * *';
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  RETENTION_SESSION_TTL_DAYS: number = 30;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  RETENTION_ACTIVITY_LOG_DAYS: number = 90;
+
+  // ─── Email Verification ───────────────────────────────────────────────────
+
+  @IsOptional()
+  @Transform(({ value }) => value === 'true' || value === true)
+  @IsBoolean()
+  REQUIRE_EMAIL_VERIFICATION: boolean = false;
+
+  // ─── Concurrent Session Limits ────────────────────────────────────────────
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  MAX_CONCURRENT_SESSIONS: number = 5;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  MAX_CONCURRENT_SESSIONS_DONOR: number = 3;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  MAX_CONCURRENT_SESSIONS_HOSPITAL: number = 5;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  MAX_CONCURRENT_SESSIONS_ADMIN: number = 2;
+
+  @IsOptional()
+  @IsString()
+  STORAGE_PATH: string = './uploads';
 }

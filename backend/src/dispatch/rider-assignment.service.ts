@@ -1,60 +1,96 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Inject } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { EventEmitter2, OnEvent } from '@nestjs/event-emitter';
+import Redis from 'ioredis';
 
 import { OrderConfirmedEvent, OrderRiderAssignedEvent } from '../events';
 import { MapsService } from '../maps/maps.service';
+import { PolicyCenterService } from '../policy-center/policy-center.service';
 import { RiderRecord, RidersService } from '../riders/riders.service';
+import { REDIS_CLIENT } from '../redis/redis.constants';
+
+const DEDUP_TTL_SECONDS = 3600;
+const DEDUP_KEY_PREFIX = 'rider-assignment:dedup:';
 
 @Injectable()
 export class RiderAssignmentService {
   private readonly logger = new Logger(RiderAssignmentService.name);
-  private readonly processedEvents = new Set<string>();
   private readonly assignmentLogs: AssignmentLog[] = [];
   private readonly activeAssignments = new Map<string, ActiveAssignmentState>();
-  private readonly acceptanceTimeoutMs: number;
-  private readonly weights: AssignmentWeights;
+  private readonly defaultAcceptanceTimeoutMs: number;
+  private readonly defaultWeights: AssignmentWeights;
 
   constructor(
     private readonly ridersService: RidersService,
     private readonly mapsService: MapsService,
     private readonly eventEmitter: EventEmitter2,
     private readonly configService: ConfigService,
+    private readonly policyCenterService: PolicyCenterService,
+    @Inject(REDIS_CLIENT) private readonly redis: Redis,
   ) {
-    this.acceptanceTimeoutMs = this.configService.get<number>(
+    this.defaultAcceptanceTimeoutMs = this.configService.get<number>(
       'ASSIGNMENT_ACCEPTANCE_TIMEOUT_MS',
       180000,
     );
-    this.weights = this.resolveWeights();
+    this.defaultWeights = this.resolveWeights();
   }
 
   @OnEvent('order.confirmed')
   async handleOrderConfirmed(event: OrderConfirmedEvent) {
-    const eventKey = this.getEventKey(
-      'order.confirmed',
-      event.orderId,
-      event.timestamp,
-    );
-
-    if (this.isEventProcessed(eventKey)) {
-      this.logger.warn(`Duplicate event detected: ${eventKey}`);
+    const key = `${DEDUP_KEY_PREFIX}order.confirmed:${event.orderId}:${event.timestamp.getTime()}`;
+    if (!(await this.acquireDedup(key))) {
+      this.logger.warn(`Duplicate event skipped: ${key}`);
       return;
     }
 
-    this.logger.log(
-      `Handling order confirmed for rider assignment: ${event.orderId}`,
-    );
+    this.logger.log(`Handling order confirmed for rider assignment: ${event.orderId}`);
     await this.startAutomatedAssignment(event);
-    this.markEventProcessed(eventKey);
 
-    return {
-      message: 'Rider assignment initiated',
-      data: { orderId: event.orderId },
-    };
+    return { message: 'Rider assignment initiated', data: { orderId: event.orderId } };
   }
 
-  async getAssignmentLogs(orderId?: string) {
-    const data = orderId
+  /**
+   * Reassign a delivery/order to a new backup rider after a cold-chain breach.
+   */
+  async reassign(orderId: string): Promise<void> {
+    this.logger.log(`Reassigning rider for order/delivery ${orderId} after cold-chain breach`);
+    const availableResponse = await this.ridersService.getAvailableRiders();
+    const riders = availableResponse.data ?? [];
+
+    if (riders.length === 0) {
+      this.logger.warn(`No available riders for reassignment of ${orderId}`);
+      this.appendAssignmentLog({
+        orderId,
+        selectedRiderId: null,
+        status: 'exhausted',
+        attemptNumber: 0,
+        candidates: [],
+        weights: this.defaultWeights,
+        reason: 'no_available_riders',
+      });
+      return;
+    }
+
+    const policyConfig = await this.getRuntimeAssignmentConfig();
+    const scored = await this.scoreRiders(riders, orderId, policyConfig.weights);
+    const ranked = scored.sort((a, b) => b.score.totalScore - a.score.totalScore);
+    const best = ranked[0];
+
+    this.appendAssignmentLog({
+      orderId,
+      selectedRiderId: best.rider.id,
+      status: 'pending',
+      attemptNumber: 1,
+      candidates: ranked.map((r) => r.score),
+      weights: policyConfig.weights,
+      reason: 'initial_assignment',
+    });
+
+    this.eventEmitter.emit('order.rider.assigned', new OrderRiderAssignedEvent(orderId, best.rider.id));
+    this.logger.log(`Backup rider ${best.rider.id} assigned to ${orderId}`);
+  }
+
+  async getAssignmentLogs(orderId?: string) {    const data = orderId
       ? this.assignmentLogs.filter((log) => log.orderId === orderId)
       : this.assignmentLogs;
 
@@ -98,6 +134,7 @@ export class RiderAssignmentService {
         status: 'accepted',
         attemptNumber: assignment.currentIndex + 1,
         candidates: assignment.candidates.map((item) => item.score),
+        weights: assignment.weights,
         reason: 'rider_accepted',
       });
       this.activeAssignments.delete(orderId);
@@ -118,6 +155,7 @@ export class RiderAssignmentService {
       status: 'rejected',
       attemptNumber: assignment.currentIndex + 1,
       candidates: assignment.candidates.map((item) => item.score),
+      weights: assignment.weights,
       reason: 'rider_rejected',
     });
 
@@ -183,25 +221,14 @@ export class RiderAssignmentService {
     };
   }
 
-  private getEventKey(
-    eventName: string,
-    orderId: string,
-    timestamp: Date,
-  ): string {
-    return `${eventName}:${orderId}:${timestamp.getTime()}`;
-  }
-
-  private isEventProcessed(eventKey: string): boolean {
-    return this.processedEvents.has(eventKey);
-  }
-
-  private markEventProcessed(eventKey: string): void {
-    this.processedEvents.add(eventKey);
-    const cleanupTimer = setTimeout(
-      () => this.processedEvents.delete(eventKey),
-      3600000,
-    );
-    cleanupTimer.unref?.();
+  private async acquireDedup(key: string): Promise<boolean> {
+    try {
+      const result = await this.redis.set(key, '1', 'EX', DEDUP_TTL_SECONDS, 'NX');
+      return result === 'OK';
+    } catch (err) {
+      this.logger.error(`Dedup store error for key ${key}: ${(err as Error).message}`);
+      return true; // allow processing on Redis failure
+    }
   }
 
   private async startAutomatedAssignment(
@@ -217,13 +244,15 @@ export class RiderAssignmentService {
         status: 'exhausted',
         attemptNumber: 0,
         candidates: [],
+        weights: this.defaultWeights,
         reason: 'no_available_riders',
       });
       return;
     }
 
     const pickupPoint = event.deliveryAddress;
-    const scored = await this.scoreRiders(riders, pickupPoint);
+    const policyConfig = await this.getRuntimeAssignmentConfig();
+    const scored = await this.scoreRiders(riders, pickupPoint, policyConfig.weights);
     const ranked = scored.sort(
       (a, b) => b.score.totalScore - a.score.totalScore,
     );
@@ -232,7 +261,8 @@ export class RiderAssignmentService {
       orderId: event.orderId,
       candidates: ranked,
       currentIndex: 0,
-      timeoutMs: this.acceptanceTimeoutMs,
+      timeoutMs: policyConfig.acceptanceTimeoutMs,
+      weights: policyConfig.weights,
       timer: null,
     };
     this.activeAssignments.set(event.orderId, state);
@@ -243,6 +273,7 @@ export class RiderAssignmentService {
   private async scoreRiders(
     riders: RiderRecord[],
     pickupPoint: string,
+    weights: AssignmentWeights,
   ): Promise<Array<{ rider: RiderRecord; score: AssignmentCandidateScore }>> {
     const raw = await Promise.all(
       riders.map(async (rider) => {
@@ -292,9 +323,9 @@ export class RiderAssignmentService {
       );
 
       const totalScore =
-        distanceScore * this.weights.distance +
-        workloadScore * this.weights.workload +
-        ratingScore * this.weights.rating;
+        distanceScore * weights.distance +
+        workloadScore * weights.workload +
+        ratingScore * weights.rating;
 
       return {
         rider: item.rider,
@@ -346,6 +377,7 @@ export class RiderAssignmentService {
         status: 'exhausted',
         attemptNumber: assignment.currentIndex,
         candidates: assignment.candidates.map((item) => item.score),
+        weights: assignment.weights,
         reason: 'all_candidates_exhausted',
       });
       this.activeAssignments.delete(assignment.orderId);
@@ -358,6 +390,7 @@ export class RiderAssignmentService {
       status: 'pending',
       attemptNumber: assignment.currentIndex + 1,
       candidates: assignment.candidates.map((item) => item.score),
+      weights: assignment.weights,
       reason,
     });
 
@@ -389,6 +422,7 @@ export class RiderAssignmentService {
       status: reason === 'timeout' ? 'timeout' : 'escalated',
       attemptNumber: assignment.currentIndex + 1,
       candidates: assignment.candidates.map((item) => item.score),
+      weights: assignment.weights,
       reason,
     });
 
@@ -400,6 +434,7 @@ export class RiderAssignmentService {
         status: 'exhausted',
         attemptNumber: assignment.currentIndex,
         candidates: assignment.candidates.map((item) => item.score),
+        weights: assignment.weights,
         reason: 'all_candidates_exhausted',
       });
       this.activeAssignments.delete(orderId);
@@ -417,14 +452,47 @@ export class RiderAssignmentService {
   }
 
   private appendAssignmentLog(
-    log: Omit<AssignmentLog, 'id' | 'createdAt' | 'weights'>,
+    log: Omit<AssignmentLog, 'id' | 'createdAt'>,
   ): void {
     this.assignmentLogs.push({
       id: `assignment-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
       createdAt: new Date(),
-      weights: this.weights,
       ...log,
     });
+  }
+
+  private async getRuntimeAssignmentConfig(): Promise<{
+    acceptanceTimeoutMs: number;
+    weights: AssignmentWeights;
+  }> {
+    try {
+      const policy = await this.policyCenterService.getActivePolicySnapshot();
+      const totalWeight =
+        policy.rules.dispatch.distanceWeight +
+        policy.rules.dispatch.workloadWeight +
+        policy.rules.dispatch.ratingWeight;
+
+      if (totalWeight <= 0) {
+        return {
+          acceptanceTimeoutMs: this.defaultAcceptanceTimeoutMs,
+          weights: this.defaultWeights,
+        };
+      }
+
+      return {
+        acceptanceTimeoutMs: policy.rules.dispatch.acceptanceTimeoutMs,
+        weights: {
+          distance: policy.rules.dispatch.distanceWeight / totalWeight,
+          workload: policy.rules.dispatch.workloadWeight / totalWeight,
+          rating: policy.rules.dispatch.ratingWeight / totalWeight,
+        },
+      };
+    } catch {
+      return {
+        acceptanceTimeoutMs: this.defaultAcceptanceTimeoutMs,
+        weights: this.defaultWeights,
+      };
+    }
   }
 }
 
@@ -479,5 +547,6 @@ interface ActiveAssignmentState {
   candidates: Array<{ rider: RiderRecord; score: AssignmentCandidateScore }>;
   currentIndex: number;
   timeoutMs: number;
+  weights: AssignmentWeights;
   timer: NodeJS.Timeout | null;
 }

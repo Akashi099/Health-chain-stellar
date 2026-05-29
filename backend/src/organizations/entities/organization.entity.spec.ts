@@ -88,13 +88,19 @@ describe('OrganizationEntity', () => {
     );
   });
 
-  it('creates relation to users', () => {
-    const relation = metadata.relations.find(
-      (entry) =>
-        entry.target === OrganizationEntity && entry.propertyName === 'users',
+  it('defines rating aggregation fields', () => {
+    const ratingColumn = metadata.columns.find(
+      (column) =>
+        column.target === OrganizationEntity &&
+        column.propertyName === 'rating',
+    );
+    const reviewCountColumn = metadata.columns.find(
+      (column) =>
+        column.target === OrganizationEntity &&
+        column.propertyName === 'reviewCount',
     );
 
-    expect(relation).toBeDefined();
-    expect(relation?.relationType).toBe('one-to-many');
+    expect(ratingColumn).toBeDefined();
+    expect(reviewCountColumn).toBeDefined();
   });
 });

@@ -7,6 +7,7 @@ export interface SorobanTxJob {
 }
 
 export interface SorobanTxResult {
+  success?: boolean;
   jobId: string;
   transactionHash?: string;
   status: 'pending' | 'completed' | 'failed' | 'dlq';
@@ -16,9 +17,39 @@ export interface SorobanTxResult {
   completedAt?: Date;
 }
 
+/** Finality status emitted after confirmation-depth check. */
+export type TxFinalityStatus = 'confirmed' | 'final';
+
+export interface ConfirmationState {
+  transactionHash: string;
+  confirmations: number;
+  finalityThreshold: number;
+  status: TxFinalityStatus;
+}
+
 export interface QueueMetrics {
+  /** Current number of jobs waiting + active in the main queue. */
   queueDepth: number;
+  /** Number of jobs in the failed state in the main queue. */
   failedJobs: number;
+  /** Current depth of the dead-letter queue. */
   dlqCount: number;
-  processingRate: number;
+  /** Jobs processed per second (rolling, null if not yet available). */
+  processingRate: number | null;
+  /** Cumulative counters since process start (or last reset). */
+  counters: {
+    queued: number;
+    processing: number;
+    success: number;
+    failure: number;
+    retries: number;
+    dlq: number;
+  };
+  /** Processing duration statistics for successful jobs. */
+  timings: {
+    avgMs: number;
+    minMs: number;
+    maxMs: number;
+    samples: number;
+  };
 }

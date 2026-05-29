@@ -7,6 +7,21 @@ import { useAuthStore } from '../stores/auth.store';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
+const RETRY_MAX_ATTEMPTS = 3;
+const RETRY_BASE_DELAY_MS = 500;
+const RETRY_MAX_DELAY_MS = 10_000;
+
+/** Full-jitter exponential backoff delay */
+function retryDelay(attempt: number): number {
+  const exponential = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+  const capped = Math.min(RETRY_MAX_DELAY_MS, exponential);
+  return Math.floor(Math.random() * capped);
+}
+
+function isTransientError(status: number): boolean {
+  return status === 429 || (status >= 500 && status <= 599);
+}
+
 interface RequestConfig extends RequestInit {
   skipAuth?: boolean;
   _retry?: boolean;
@@ -85,18 +100,19 @@ async function refreshAccessToken(): Promise<string | null> {
 }
 
 /**
- * Main HTTP client with automatic token refresh
+ * Main HTTP client with automatic token refresh and jitter-based retry
  */
 export async function httpClient<T = unknown>(
   endpoint: string,
-  config: RequestConfig = {}
+  config: RequestConfig = {},
+  _attempt = 0,
 ): Promise<T> {
   const { skipAuth = false, _retry = false, ...fetchConfig } = config;
   const url = endpoint.startsWith('http') ? endpoint : `${API_BASE_URL}${endpoint}`;
 
   // FIX: Use Record<string, string> to allow dynamic header keys like 'Authorization'
   const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
+    ...(!(fetchConfig.body instanceof FormData) && { 'Content-Type': 'application/json' }),
     ...(fetchConfig.headers as Record<string, string>),
   };
 
@@ -114,7 +130,7 @@ export async function httpClient<T = unknown>(
       headers,
     });
 
-    // Handle 401 Unauthorized
+    // Handle 401 Unauthorized — token refresh, not a transient retry
     if (response.status === 401 && !skipAuth && !_retry) {
       if (isRefreshing) {
         return new Promise((resolve, reject) => {
@@ -141,6 +157,13 @@ export async function httpClient<T = unknown>(
       }
     }
 
+    // Retry transient errors (5xx, 429) with jitter-based backoff
+    if (isTransientError(response.status) && _attempt < RETRY_MAX_ATTEMPTS) {
+      const delay = retryDelay(_attempt);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      return httpClient<T>(endpoint, config, _attempt + 1);
+    }
+
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
       throw new Error(errorData.message || `HTTP ${response.status}: ${response.statusText}`);
@@ -153,6 +176,12 @@ export async function httpClient<T = unknown>(
 
     return response.text() as T;
   } catch (error) {
+    // Retry network-level failures (fetch throws) with jitter-based backoff
+    if (_attempt < RETRY_MAX_ATTEMPTS && !(error instanceof Error && error.message.startsWith('HTTP'))) {
+      const delay = retryDelay(_attempt);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      return httpClient<T>(endpoint, config, _attempt + 1);
+    }
     throw error;
   }
 }

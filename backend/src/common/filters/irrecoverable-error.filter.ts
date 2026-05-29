@@ -6,9 +6,14 @@ import {
   Logger,
 } from '@nestjs/common';
 
-import type { Response } from 'express';
-
 import { IrrecoverableError, RecoverableError } from '../errors/app-errors';
+import {
+  buildStandardErrorResponse,
+  getReasonPhrase,
+} from '../errors/standard-error-response';
+import { translateError } from '../errors/error-translations';
+
+import type { Request, Response } from 'express';
 
 /**
  * Global filter that intercepts AppError subclasses and returns
@@ -21,36 +26,66 @@ import { IrrecoverableError, RecoverableError } from '../errors/app-errors';
 export class AppErrorFilter implements ExceptionFilter {
   private readonly logger = new Logger(AppErrorFilter.name);
 
+  constructor(private readonly isProduction = false) {}
+
   catch(exception: IrrecoverableError | RecoverableError, host: ArgumentsHost) {
     const ctx = host.switchToHttp();
+    const request = ctx.getRequest<Request>();
     const response = ctx.getResponse<Response>();
 
     if (exception instanceof IrrecoverableError) {
       this.logger.error(
-        `[IrrecoverableError] domain=${exception.domain} message=${exception.message}`,
-        { context: exception.context, stack: exception.stack },
+        `[${request.correlationId ?? 'unknown'}] [IrrecoverableError] domain=${exception.domain} message=${exception.message}`,
+        exception.stack,
       );
 
-      response.status(HttpStatus.UNPROCESSABLE_ENTITY).json({
-        statusCode: HttpStatus.UNPROCESSABLE_ENTITY,
-        error: 'Irrecoverable Failure',
-        message: exception.message,
-        domain: exception.domain,
-        // Surface the failure record ID if it was attached by the caller
-        failureRecordId: (exception.context['failureRecordId'] as string) ?? null,
-      });
+      response.status(HttpStatus.UNPROCESSABLE_ENTITY).json(
+        buildStandardErrorResponse({
+          statusCode: HttpStatus.UNPROCESSABLE_ENTITY,
+          code: 'IRRECOVERABLE_FAILURE',
+          error: getReasonPhrase(HttpStatus.UNPROCESSABLE_ENTITY),
+          message: exception.message,
+          translatedMessage: translateError(
+            undefined,
+            request.headers['accept-language'],
+            exception.message,
+          ),
+          domain: exception.domain,
+          details: {
+            ...exception.context,
+            failureRecordId:
+              (exception.context['failureRecordId'] as string) ?? null,
+          },
+          request,
+          stack: exception.stack,
+          includeStack: !this.isProduction,
+        }),
+      );
     } else {
       this.logger.warn(
-        `[RecoverableError] message=${exception.message}`,
-        { context: exception.context },
+        `[${request.correlationId ?? 'unknown'}] [RecoverableError] message=${exception.message}`,
       );
 
-      response.status(HttpStatus.SERVICE_UNAVAILABLE).json({
-        statusCode: HttpStatus.SERVICE_UNAVAILABLE,
-        error: 'Transient Failure',
-        message: exception.message,
-        retryable: true,
-      });
+      response.status(HttpStatus.SERVICE_UNAVAILABLE).json(
+        buildStandardErrorResponse({
+          statusCode: HttpStatus.SERVICE_UNAVAILABLE,
+          code: 'TRANSIENT_FAILURE',
+          error: getReasonPhrase(HttpStatus.SERVICE_UNAVAILABLE),
+          message: exception.message,
+          translatedMessage: translateError(
+            undefined,
+            request.headers['accept-language'],
+            exception.message,
+          ),
+          details: {
+            ...exception.context,
+            retryable: true,
+          },
+          request,
+          stack: exception.stack,
+          includeStack: !this.isProduction,
+        }),
+      );
     }
   }
 }

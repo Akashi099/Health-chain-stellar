@@ -7,6 +7,7 @@ import {
   OnGatewayDisconnect,
 } from '@nestjs/websockets';
 
+import { OnEvent } from '@nestjs/event-emitter';
 import { Server, Socket } from 'socket.io';
 
 @WebSocketGateway({
@@ -44,6 +45,34 @@ export class NotificationsGateway
     this.logger.log(`WebSocket client disconnected: ${client.id}`);
   }
 
+  /**
+   * Listen to Order status updates and notify recipient.
+   */
+  @OnEvent('order.status.updated')
+  handleOrderStatusUpdated(payload: any) {
+    this.logger.log(`WS Notification [Order]: ${payload.orderId} -> ${payload.newStatus}`);
+    this.server.emit('blood-request.status-changed', {
+       type: 'ORDER',
+       id: payload.orderId,
+       newStatus: payload.newStatus,
+       timestamp: new Date()
+    });
+  }
+
+  /**
+   * Listen to BloodRequest status updates and notify recipient.
+   */
+  @OnEvent('blood-request.status.updated')
+  handleBloodRequestStatusUpdated(payload: any) {
+    this.logger.log(`WS Notification [BloodRequest]: ${payload.requestId} -> ${payload.newStatus}`);
+    this.server.emit('blood-request.status-changed', {
+       type: 'BLOOD_REQUEST',
+       id: payload.requestId,
+       newStatus: payload.newStatus,
+       timestamp: new Date()
+    });
+  }
+
   emitToRecipient(recipientId: string, payload: any): void {
     this.server
       .to(`recipient_${recipientId}`)
@@ -51,3 +80,4 @@ export class NotificationsGateway
     this.logger.log(`Emitted notification.new to recipient_${recipientId}`);
   }
 }
+

@@ -1,4 +1,4 @@
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 
 import {
   Injectable,
@@ -17,27 +17,73 @@ import { InjectRepository } from '@nestjs/typeorm';
 import Redis from 'ioredis';
 import { Repository } from 'typeorm';
 
+import { ErrorCode } from '../common/errors/error-codes.enum';
+import { AuthSessionFallbackStore } from '../redis/auth-session-fallback.store';
+import { RedisCircuitBreaker } from '../redis/redis-circuit-breaker';
 import { REDIS_CLIENT } from '../redis/redis.constants';
+import {
+  SecurityEventLoggerService,
+  SecurityEventType,
+} from '../user-activity/security-event-logger.service';
+import { UserActivityService } from '../user-activity/user-activity.service';
 import { UserEntity } from '../users/entities/user.entity';
+import { TwoFactorAuthEntity } from '../users/entities/two-factor-auth.entity';
 
+import { JwtKeyService } from './jwt-key.service';
 import { JwtPayload } from './jwt.strategy';
-import { hashPassword, verifyPassword } from './utils/password.util';
+import { AuthSessionRepository } from './repositories/auth-session.repository';
+import { SessionRiskService, RiskLevel } from './session-risk.service';
+import { validatePasswordStrength } from './utils/password-strength.util';
+import {
+  hashPassword,
+  verifyPassword,
+  dummyVerify,
+} from './utils/password.util';
+import { MfaService } from './mfa/mfa.service';
 
-const MAX_FAILED_LOGIN_ATTEMPTS = 5;
-const ACCOUNT_LOCK_MINUTES = 15;
-const PASSWORD_HISTORY_LIMIT = 3;
+export interface SessionMetadata {
+  ipAddress?: string | null;
+  userAgent?: string | null;
+  geoHint?: string | null;
+}
 
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
+  private readonly circuitBreaker: RedisCircuitBreaker;
+  private readonly fallbackStore: AuthSessionFallbackStore;
+  private readonly maxFailedLoginAttempts: number;
+  private readonly accountLockMinutes: number;
+  private readonly passwordHistoryLength: number;
 
   constructor(
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
+    private readonly jwtKeyService: JwtKeyService,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
     @InjectRepository(UserEntity)
     private readonly userRepository: Repository<UserEntity>,
-  ) {}
+    private readonly authSessionRepository: AuthSessionRepository,
+    private readonly userActivityService: UserActivityService,
+    private readonly securityEventLogger: SecurityEventLoggerService,
+    private readonly mfaService: MfaService,
+    private readonly sessionRiskService: SessionRiskService,
+  ) {
+    this.circuitBreaker = new RedisCircuitBreaker();
+    this.fallbackStore = new AuthSessionFallbackStore();
+    this.maxFailedLoginAttempts = this.configService.get<number>(
+      'MAX_FAILED_LOGIN_ATTEMPTS',
+      5,
+    );
+    this.accountLockMinutes = this.configService.get<number>(
+      'ACCOUNT_LOCK_MINUTES',
+      15,
+    );
+    this.passwordHistoryLength = this.configService.get<number>(
+      'PASSWORD_HISTORY_LENGTH',
+      3,
+    );
+  }
 
   async validateUser(
     email: string,
@@ -55,12 +101,32 @@ export class AuthService {
     return valid ? user : null;
   }
 
-  async login(loginDto: { email: string; password: string; role?: string }) {
+  async login(
+    loginDto: { email: string; password: string; role?: string },
+    meta: SessionMetadata = {},
+  ) {
     const user = await this.userRepository.findOne({
       where: { email: loginDto.email.toLowerCase() },
     });
     if (!user || !user.passwordHash) {
-      throw new UnauthorizedException('Invalid email or password');
+      await this.securityEventLogger
+        .logEvent({
+          eventType: SecurityEventType.AUTH_LOGIN_FAILED,
+          userId: user?.id ?? null,
+          email: loginDto.email.toLowerCase(),
+          description: 'User login failed: user not found or no password',
+          metadata: { reason: 'AUTH_INVALID_CREDENTIALS' },
+          ipAddress: meta.ipAddress ?? null,
+          userAgent: meta.userAgent ?? null,
+        })
+        .catch(() => undefined);
+      await dummyVerify(loginDto.password);
+      throw new UnauthorizedException(
+        JSON.stringify({
+          code: ErrorCode.AUTH_INVALID_CREDENTIALS,
+          message: 'Invalid email or password',
+        }),
+      );
     }
 
     await this.ensureAccountIsUsable(user);
@@ -71,10 +137,32 @@ export class AuthService {
     );
     if (!passwordValid) {
       await this.recordFailedLoginAttempt(user);
-      throw new UnauthorizedException('Invalid email or password');
+      await this.securityEventLogger
+        .logEvent({
+          eventType: SecurityEventType.AUTH_LOGIN_FAILED,
+          userId: user.id,
+          email: user.email,
+          description: 'User login failed: invalid credentials',
+          metadata: { reason: 'AUTH_INVALID_CREDENTIALS' },
+          ipAddress: meta.ipAddress ?? null,
+          userAgent: meta.userAgent ?? null,
+        })
+        .catch(() => undefined);
+      throw new UnauthorizedException(
+        JSON.stringify({
+          code: ErrorCode.AUTH_INVALID_CREDENTIALS,
+          message: 'Invalid email or password',
+        }),
+      );
     }
 
     await this.resetLoginAttempts(user);
+
+    // If MFA is enabled, return a challenge instead of full tokens
+    const mfaEnabled = await this.mfaService.isMfaEnabled(user.id);
+    if (mfaEnabled) {
+      return { mfa_required: true, user_id: user.id };
+    }
 
     const sessionId = randomBytes(16).toString('hex');
     const payload: JwtPayload = {
@@ -82,16 +170,133 @@ export class AuthService {
       email: user.email,
       role: user.role ?? loginDto.role ?? 'donor',
       sid: sessionId,
+      organizationId: user.organizationId ?? null,
     };
 
     const { accessToken, refreshToken, refreshExpiresInSeconds } =
-      await this.issueTokens(payload);
+      this.issueTokens(payload);
     await this.createSession(user, sessionId, refreshExpiresInSeconds);
     await this.enforceConcurrentSessionLimit(user.id);
+
+    // Score session risk and log if elevated
+    const risk = await this.sessionRiskService
+      .scoreSession(user.id, sessionId, {
+        ipAddress: meta.ipAddress,
+        userAgent: meta.userAgent,
+        geoHint: meta.geoHint,
+        createdAt: new Date(),
+      })
+      .catch(() => null);
+
+    await this.securityEventLogger
+      .logEvent({
+        eventType: SecurityEventType.AUTH_LOGIN_SUCCESS,
+        userId: user.id,
+        email: user.email,
+        sessionId,
+        description: 'User login succeeded',
+        metadata: { role: payload.role },
+        ipAddress: meta.ipAddress ?? null,
+        userAgent: meta.userAgent ?? null,
+        ...(risk && {
+          riskScore: risk.score,
+          riskLevel: risk.level,
+          riskSignals: risk.signals as unknown as Record<string, boolean>,
+        }),
+      })
+      .catch(() => undefined);
+
+    if (risk && risk.requiresStepUp) {
+      await this.securityEventLogger
+        .logEvent({
+          eventType: SecurityEventType.AUTH_STEP_UP_REQUIRED,
+          userId: user.id,
+          email: user.email,
+          sessionId,
+          description: `Step-up auth required: risk score ${risk.score} (${risk.level})`,
+          riskScore: risk.score,
+          riskLevel: risk.level,
+          riskSignals: risk.signals as unknown as Record<string, boolean>,
+          ipAddress: meta.ipAddress ?? null,
+          userAgent: meta.userAgent ?? null,
+        })
+        .catch(() => undefined);
+    }
 
     return {
       access_token: accessToken,
       refresh_token: refreshToken,
+      ...(risk?.requiresStepUp && {
+        step_up_required: true,
+        risk_level: risk.level,
+      }),
+    };
+  }
+
+  /**
+   * Exchange a valid MFA token (issued by MfaService) for a full access + refresh token pair.
+   */
+  async exchangeMfaToken(mfaToken: string, meta: SessionMetadata = {}) {
+    const userId = this.mfaService.verifyMfaToken(mfaToken);
+
+    const user = await this.userRepository.findOne({ where: { id: userId } });
+    if (!user) {
+      throw new UnauthorizedException(
+        JSON.stringify({
+          code: ErrorCode.AUTH_INVALID_CREDENTIALS,
+          message: 'User not found',
+        }),
+      );
+    }
+
+    const sessionId = randomBytes(16).toString('hex');
+    const payload: JwtPayload = {
+      sub: user.id,
+      email: user.email,
+      role: user.role,
+      sid: sessionId,
+      organizationId: user.organizationId ?? null,
+    };
+
+    const { accessToken, refreshToken, refreshExpiresInSeconds } =
+      this.issueTokens(payload);
+    await this.createSession(user, sessionId, refreshExpiresInSeconds, meta);
+    await this.enforceConcurrentSessionLimit(user.id);
+
+    const risk = await this.sessionRiskService
+      .scoreSession(user.id, sessionId, {
+        ipAddress: meta.ipAddress,
+        userAgent: meta.userAgent,
+        geoHint: meta.geoHint,
+        createdAt: new Date(),
+      })
+      .catch(() => null);
+
+    await this.securityEventLogger
+      .logEvent({
+        eventType: SecurityEventType.AUTH_LOGIN_SUCCESS,
+        userId: user.id,
+        email: user.email,
+        sessionId,
+        description: 'User login succeeded via MFA',
+        metadata: { role: payload.role, mfa: true },
+        ipAddress: meta.ipAddress ?? null,
+        userAgent: meta.userAgent ?? null,
+        ...(risk && {
+          riskScore: risk.score,
+          riskLevel: risk.level,
+          riskSignals: risk.signals as unknown as Record<string, boolean>,
+        }),
+      })
+      .catch(() => undefined);
+
+    return {
+      access_token: accessToken,
+      refresh_token: refreshToken,
+      ...(risk?.requiresStepUp && {
+        step_up_required: true,
+        risk_level: risk.level,
+      }),
     };
   }
 
@@ -101,13 +306,32 @@ export class AuthService {
     role?: string;
     name?: string;
   }) {
+    const strengthCheck = validatePasswordStrength(registerDto.password);
+    if (!strengthCheck.valid) {
+      throw new BadRequestException(
+        JSON.stringify({
+          code: ErrorCode.AUTH_WEAK_PASSWORD,
+          message: strengthCheck.message,
+        }),
+      );
+    }
+
     const email = registerDto.email.toLowerCase();
     const existing = await this.userRepository.findOne({ where: { email } });
     if (existing) {
-      throw new ConflictException('Email already registered');
+      throw new ConflictException(
+        JSON.stringify({
+          code: ErrorCode.AUTH_EMAIL_ALREADY_REGISTERED,
+          message: 'Email already registered',
+        }),
+      );
     }
 
     const passwordHash = await hashPassword(registerDto.password);
+    const requireVerification = this.configService.get<boolean>(
+      'REQUIRE_EMAIL_VERIFICATION',
+      false,
+    );
     const user = this.userRepository.create({
       email,
       name: registerDto.name,
@@ -116,6 +340,7 @@ export class AuthService {
       passwordHistory: [],
       failedLoginAttempts: 0,
       lockedUntil: null,
+      emailVerified: !requireVerification,
     });
     const savedUser = await this.userRepository.save(user);
 
@@ -132,42 +357,70 @@ export class AuthService {
 
   async refreshToken(refreshToken: string) {
     try {
-      const payload = this.jwtService.verify<JwtPayload>(refreshToken, {
-        secret: this.configService.get<string>(
-          'JWT_REFRESH_SECRET',
-          'refresh-secret',
-        ),
-      });
+      const payload = this.jwtService.verify<JwtPayload & { jti?: string }>(
+        refreshToken,
+        {
+          secret: this.configService.get<string>(
+            'JWT_REFRESH_SECRET',
+            'refresh-secret',
+          ),
+        },
+      );
 
-      const tokenKey = `auth:refresh-consumed:${refreshToken}`;
+      if (!payload.sid) {
+        throw new UnauthorizedException(
+          JSON.stringify({
+            code: ErrorCode.AUTH_INVALID_REFRESH_TOKEN,
+            message: 'Invalid refresh token',
+          }),
+        );
+      }
+
+      // Hash the raw token so the raw value is never stored as a Redis key.
+      const tokenHash = createHash('sha256').update(refreshToken).digest('hex');
+      const tokenKey = `auth:refresh-consumed:${tokenHash}`;
       const expiresAt = payload.exp
         ? payload.exp - Math.floor(Date.now() / 1000)
         : this.getRefreshTokenExpirySeconds();
       const ttl = Math.max(expiresAt, 0);
 
-      // set(key, value, 'EX', ttl, 'NX') returns 'OK' if set, null if exists
-      const consumed = await this.redis.set(
-        tokenKey,
-        '1',
-        'EX',
-        ttl || 604800,
-        'NX',
+      const consumed = await this.circuitBreaker.execute(
+        async () => {
+          const result = await this.redis.set(
+            tokenKey,
+            '1',
+            'EX',
+            ttl || 604800,
+            'NX',
+          );
+          return result;
+        },
+        async () => {
+          return (await this.fallbackStore.markTokenConsumed(tokenKey))
+            ? 'OK'
+            : null;
+        },
       );
 
       if (!consumed) {
-        this.logger.warn(
-          `Replay attack detected for user ${payload.email}. Token already consumed.`,
+        await this.revokeSessionFamily(payload.sub, payload.sid, payload.email);
+        throw new UnauthorizedException(
+          JSON.stringify({
+            code: ErrorCode.AUTH_REFRESH_TOKEN_REUSE,
+            message:
+              'Token reuse detected. All sessions have been revoked for your security.',
+          }),
         );
-        throw new UnauthorizedException('INVALID_REFRESH_TOKEN');
-      }
-
-      if (!payload.sid) {
-        throw new UnauthorizedException('INVALID_REFRESH_TOKEN');
       }
 
       const existingSession = await this.getSessionById(payload.sid);
       if (!existingSession || existingSession.revokedAt) {
-        throw new UnauthorizedException('SESSION_REVOKED');
+        throw new UnauthorizedException(
+          JSON.stringify({
+            code: ErrorCode.AUTH_SESSION_REVOKED,
+            message: 'Session has been revoked',
+          }),
+        );
       }
 
       this.logger.log(
@@ -179,13 +432,14 @@ export class AuthService {
         email: payload.email,
         role: payload.role,
         sid: payload.sid,
+        organizationId: payload.organizationId ?? null,
       };
 
       const {
         accessToken: newAccessToken,
         refreshToken: newRefreshToken,
         refreshExpiresInSeconds,
-      } = await this.issueTokens(newPayload);
+      } = this.issueTokens(newPayload);
       await this.touchSession(
         payload.sub,
         payload.sid,
@@ -196,24 +450,37 @@ export class AuthService {
         access_token: newAccessToken,
         refresh_token: newRefreshToken,
       };
-    } catch (error) {
+    } catch (error: unknown) {
       if (error instanceof UnauthorizedException) {
         throw error;
       }
-      this.logger.error(`Refresh token failed: ${error.message}`);
-      throw new UnauthorizedException('Invalid or expired refresh token');
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+      let errorMessage: string = 'Unknown error';
+      if (error instanceof Error) {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+        errorMessage = error.message ?? 'Unknown error';
+      }
+      this.logger.error(`Refresh token failed: ${errorMessage}`);
+      throw new UnauthorizedException(
+        JSON.stringify({
+          code: ErrorCode.AUTH_INVALID_REFRESH_TOKEN,
+          message: 'Invalid or expired refresh token',
+        }),
+      );
     }
   }
 
-  private async issueTokens(payload: JwtPayload): Promise<{
+  private issueTokens(payload: JwtPayload): {
     accessToken: string;
     refreshToken: string;
     refreshExpiresInSeconds: number;
-  }> {
+  } {
     const accessToken = this.jwtService.sign(
       payload as unknown as Record<string, unknown>,
+      { secret, keyid: kid },
     );
-    const refreshToken = await this.generateRefreshToken(payload);
+    const refreshToken = this.generateRefreshToken(payload);
     return {
       accessToken,
       refreshToken,
@@ -221,23 +488,20 @@ export class AuthService {
     };
   }
 
-  private async generateRefreshToken(payload: JwtPayload): Promise<string> {
+  private generateRefreshToken(payload: JwtPayload): string {
     const jti = randomBytes(16).toString('hex');
     const refreshExpiresIn =
       this.configService.get<string>('JWT_REFRESH_EXPIRES_IN') ?? '7d';
 
-    const refreshToken = this.jwtService.sign(
+    return this.jwtService.sign(
       { ...payload, jti } as unknown as Record<string, unknown>,
       {
         secret:
           this.configService.get<string>('JWT_REFRESH_SECRET') ??
           'refresh-secret',
-
-        expiresIn: refreshExpiresIn as any,
+        expiresIn: refreshExpiresIn,
       },
     );
-
-    return refreshToken;
   }
 
   async logout(userId: string, sessionId?: string) {
@@ -264,16 +528,151 @@ export class AuthService {
     const sessions = await Promise.all(
       sessionIds.map((sid) => this.getSessionById(sid)),
     );
-    return sessions.filter((session) => session && !session.revokedAt);
+    const active = sessions.filter((session) => session && !session.revokedAt);
+
+    // Attach risk scores to each session
+    return Promise.all(
+      active.map(async (session) => {
+        if (!session) return session;
+        const risk = await this.sessionRiskService
+          .scoreSession(userId, session.sessionId ?? '', {
+            ipAddress: session.ipAddress,
+            userAgent: session.userAgent,
+            geoHint: session.geoHint,
+          })
+          .catch(() => null);
+        return {
+          ...session,
+          riskScore: risk?.score ?? null,
+          riskLevel: risk?.level ?? null,
+          riskSignals: risk?.signals ?? null,
+        };
+      }),
+    );
+  }
+
+  /**
+   * Revoke a session if its risk score meets or exceeds the given threshold.
+   * Returns the risk result regardless of whether revocation occurred.
+   */
+  async revokeIfRisky(
+    userId: string,
+    sessionId: string,
+    minRiskLevel: RiskLevel = RiskLevel.HIGH,
+  ) {
+    const session = await this.getSessionById(sessionId);
+    if (!session || session.revokedAt) {
+      return { revoked: false, reason: 'session_not_found_or_already_revoked' };
+    }
+
+    const risk = await this.sessionRiskService.scoreSession(userId, sessionId, {
+      ipAddress: session.ipAddress,
+      userAgent: session.userAgent,
+      geoHint: session.geoHint,
+    });
+
+    const levelOrder = [
+      RiskLevel.LOW,
+      RiskLevel.MEDIUM,
+      RiskLevel.HIGH,
+      RiskLevel.CRITICAL,
+    ];
+    const shouldRevoke =
+      levelOrder.indexOf(risk.level) >= levelOrder.indexOf(minRiskLevel);
+
+    if (shouldRevoke) {
+      await this.revokeSession(userId, sessionId);
+      await this.securityEventLogger
+        .logEvent({
+          eventType: SecurityEventType.AUTH_SESSION_RISK_ELEVATED,
+          userId,
+          sessionId,
+          description: `Session auto-revoked due to risk level ${risk.level} (score ${risk.score})`,
+          riskScore: risk.score,
+          riskLevel: risk.level,
+          riskSignals: risk.signals as unknown as Record<string, boolean>,
+        })
+        .catch(() => undefined);
+    }
+
+    return { revoked: shouldRevoke, risk };
+  }
+
+  /**
+   * Revokes all Redis session state and DB record for a session family.
+   * Called when a refresh token replay is detected — the entire session is
+   * considered compromised regardless of which token in the family was reused.
+   */
+  private async revokeSessionFamily(
+    userId: string,
+    sessionId: string,
+    email: string,
+  ): Promise<void> {
+    const auditReason = JSON.stringify({
+      event: 'REFRESH_TOKEN_REUSE',
+      detectedAt: new Date().toISOString(),
+      email,
+    });
+
+    this.logger.warn(
+      `Token family compromise detected for user ${email} (session ${sessionId}). Revoking session.`,
+    );
+
+    await this.securityEventLogger
+      .logEvent({
+        eventType: SecurityEventType.AUTH_REFRESH_TOKEN_REPLAY,
+        userId,
+        email,
+        sessionId,
+        description: 'Refresh token replay detected, revoking session family',
+        metadata: { reason: 'REFRESH_TOKEN_REUSE' },
+      })
+      .catch(() => undefined);
+
+    // Revoke in Redis
+    await this.circuitBreaker.execute(
+      async () => {
+        await this.redis.hset(
+          this.sessionKey(sessionId),
+          'revokedAt',
+          new Date().toISOString(),
+          'revocationReason',
+          auditReason,
+        );
+        await this.redis.zrem(this.userSessionsKey(userId), sessionId);
+      },
+      async () => {
+        await this.fallbackStore.revokeSession(sessionId);
+      },
+    );
+
+    // Persist audit log entry to DB
+    try {
+      await this.authSessionRepository.revokeSession(sessionId, auditReason);
+    } catch (err: unknown) {
+      this.logger.warn(
+        `Failed to persist family revocation audit log: ${(err as Error).message}`,
+      );
+    }
   }
 
   async revokeSession(userId: string, sessionId: string) {
     const session = await this.getSessionById(sessionId);
     if (!session) {
-      throw new NotFoundException('Session not found');
+      throw new NotFoundException(
+        JSON.stringify({
+          code: ErrorCode.AUTH_SESSION_NOT_FOUND,
+          message: 'Session not found',
+        }),
+      );
     }
     if (session.userId !== userId) {
-      throw new ForbiddenException('Cannot revoke a session that is not yours');
+      throw new ForbiddenException(
+        JSON.stringify({
+          code: ErrorCode.AUTH_FORBIDDEN,
+          message: 'Cannot revoke a session that is not yours',
+        }),
+      );
     }
 
     await this.redis.hset(
@@ -283,18 +682,56 @@ export class AuthService {
     );
     await this.redis.zrem(this.userSessionsKey(userId), sessionId);
 
+    await this.securityEventLogger
+      .logEvent({
+        eventType: SecurityEventType.AUTH_SESSION_REVOKED,
+        userId,
+        sessionId,
+        description: 'User session revoked',
+        metadata: { reason: 'USER_REQUESTED' },
+      })
+      .catch(() => undefined);
+
+    // Persist revocation to database
+    try {
+      await this.authSessionRepository.revokeSession(sessionId, 'User logout');
+    } catch (error: unknown) {
+      this.logger.warn(
+        `Failed to persist session revocation to database: ${(error as Error).message}`,
+      );
+    }
+
     return { message: 'Session revoked successfully' };
   }
 
   async manualUnlockByAdmin(userId: string) {
     const user = await this.userRepository.findOne({ where: { id: userId } });
     if (!user) {
-      throw new NotFoundException('User not found');
+      throw new NotFoundException(
+        JSON.stringify({
+          code: ErrorCode.USER_NOT_FOUND,
+          message: 'User not found',
+        }),
+      );
     }
 
     user.failedLoginAttempts = 0;
     user.lockedUntil = null;
     await this.userRepository.save(user);
+
+    await this.securityEventLogger
+      .logEvent({
+        eventType: SecurityEventType.AUTH_ACCOUNT_MANUALLY_UNLOCKED,
+        userId: user.id,
+        email: user.email,
+        description: `Account manually unlocked by admin for ${user.email}`,
+        metadata: { email: user.email, unlockedBy: 'admin' },
+      })
+      .catch((err: unknown) =>
+        this.logger.warn(
+          `Failed to log manual unlock event: ${(err as Error).message}`,
+        ),
+      );
 
     return { message: 'Account unlocked successfully' };
   }
@@ -306,13 +743,31 @@ export class AuthService {
   ) {
     if (oldPassword === newPassword) {
       throw new BadRequestException(
-        'New password must be different from old password',
+        JSON.stringify({
+          code: ErrorCode.AUTH_PASSWORD_SAME_AS_OLD,
+          message: 'New password must be different from old password',
+        }),
+      );
+    }
+
+    const strengthCheck = validatePasswordStrength(newPassword);
+    if (!strengthCheck.valid) {
+      throw new BadRequestException(
+        JSON.stringify({
+          code: ErrorCode.AUTH_WEAK_PASSWORD,
+          message: strengthCheck.message,
+        }),
       );
     }
 
     const user = await this.userRepository.findOne({ where: { id: userId } });
     if (!user || !user.passwordHash) {
-      throw new NotFoundException('User not found');
+      throw new NotFoundException(
+        JSON.stringify({
+          code: ErrorCode.USER_NOT_FOUND,
+          message: 'User not found',
+        }),
+      );
     }
 
     const oldPasswordValid = await verifyPassword(
@@ -320,17 +775,25 @@ export class AuthService {
       user.passwordHash,
     );
     if (!oldPasswordValid) {
-      throw new UnauthorizedException('Old password is incorrect');
+      throw new UnauthorizedException(
+        JSON.stringify({
+          code: ErrorCode.AUTH_OLD_PASSWORD_INCORRECT,
+          message: 'Old password is incorrect',
+        }),
+      );
     }
 
     const recentHashes = [
       user.passwordHash,
       ...(user.passwordHistory ?? []),
-    ].slice(0, PASSWORD_HISTORY_LIMIT);
+    ].slice(0, this.passwordHistoryLength);
     for (const hash of recentHashes) {
       if (await verifyPassword(newPassword, hash)) {
         throw new BadRequestException(
-          `Cannot reuse any of your last ${PASSWORD_HISTORY_LIMIT} passwords`,
+          JSON.stringify({
+            code: ErrorCode.AUTH_PASSWORD_REUSE,
+            message: `Cannot reuse any of your last ${this.passwordHistoryLength} passwords`,
+          }),
         );
       }
     }
@@ -339,7 +802,7 @@ export class AuthService {
     user.passwordHistory = [
       user.passwordHash,
       ...(user.passwordHistory ?? []),
-    ].slice(0, PASSWORD_HISTORY_LIMIT);
+    ].slice(0, this.passwordHistoryLength);
     user.passwordHash = newHash;
     await this.userRepository.save(user);
 
@@ -347,6 +810,19 @@ export class AuthService {
   }
 
   private async ensureAccountIsUsable(user: UserEntity) {
+    const requireVerification = this.configService.get<boolean>(
+      'REQUIRE_EMAIL_VERIFICATION',
+      false,
+    );
+    if (requireVerification && !user.emailVerified) {
+      throw new ForbiddenException(
+        JSON.stringify({
+          code: ErrorCode.AUTH_EMAIL_NOT_VERIFIED,
+          message: 'Please verify your email address before logging in',
+        }),
+      );
+    }
+
     if (!user.lockedUntil) {
       return;
     }
@@ -357,18 +833,50 @@ export class AuthService {
       user.lockedUntil = null;
       user.failedLoginAttempts = 0;
       await this.userRepository.save(user);
+      await this.securityEventLogger
+        .logEvent({
+          eventType: SecurityEventType.AUTH_ACCOUNT_AUTO_UNLOCKED,
+          userId: user.id,
+          email: user.email,
+          description: `Account auto-unlocked after lock expiry for ${user.email}`,
+          metadata: { email: user.email },
+        })
+        .catch((err: unknown) =>
+          this.logger.warn(
+            `Failed to log auto-unlock event: ${(err as Error).message}`,
+          ),
+        );
       return;
     }
-
-    throw new ForbiddenException('Account is locked. Please try again later');
   }
 
   private async recordFailedLoginAttempt(user: UserEntity) {
     user.failedLoginAttempts = (user.failedLoginAttempts ?? 0) + 1;
-    if (user.failedLoginAttempts >= MAX_FAILED_LOGIN_ATTEMPTS) {
+    if (user.failedLoginAttempts >= this.maxFailedLoginAttempts) {
       const lockedUntil = new Date();
-      lockedUntil.setMinutes(lockedUntil.getMinutes() + ACCOUNT_LOCK_MINUTES);
+      lockedUntil.setMinutes(
+        lockedUntil.getMinutes() + this.accountLockMinutes,
+      );
       user.lockedUntil = lockedUntil;
+      await this.userRepository.save(user);
+      await this.securityEventLogger
+        .logEvent({
+          eventType: SecurityEventType.AUTH_ACCOUNT_LOCKED,
+          userId: user.id,
+          email: user.email,
+          description: `Account locked after ${user.failedLoginAttempts} failed login attempts for ${user.email}`,
+          metadata: {
+            email: user.email,
+            failedAttempts: user.failedLoginAttempts,
+            lockedUntil,
+          },
+        })
+        .catch((err: unknown) =>
+          this.logger.warn(
+            `Failed to log account lock event: ${(err as Error).message}`,
+          ),
+        );
+      return;
     }
     await this.userRepository.save(user);
   }
@@ -386,94 +894,193 @@ export class AuthService {
     user: UserEntity,
     sessionId: string,
     ttlSeconds: number,
-  ): Promise<void> {
-    const now = Date.now();
-    const expiresAt = new Date(now + ttlSeconds * 1000).toISOString();
-    await this.redis.hmset(this.sessionKey(sessionId), {
+    meta: SessionMetadata = {},
+  ) {
+    const key = this.sessionKey(sessionId);
+    const sessionData: Record<string, string> = {
       userId: user.id,
       email: user.email,
-      role: user.role ?? 'donor',
-      createdAt: new Date(now).toISOString(),
-      expiresAt,
-    });
-    await this.redis.expire(this.sessionKey(sessionId), ttlSeconds);
-    await this.redis.zadd(this.userSessionsKey(user.id), now, sessionId);
+      role: user.role,
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + ttlSeconds * 1000).toISOString(),
+      ...(meta.ipAddress && { ipAddress: meta.ipAddress }),
+      ...(meta.userAgent && { userAgent: meta.userAgent }),
+      ...(meta.geoHint && { geoHint: meta.geoHint }),
+    };
+
+    await this.circuitBreaker.execute(
+      async () => {
+        await this.redis.hset(key, sessionData);
+        await this.redis.expire(key, ttlSeconds);
+        await this.redis.zadd(
+          this.userSessionsKey(user.id),
+          Date.now(),
+          sessionId,
+        );
+      },
+      async () => {
+        await this.fallbackStore.setSession(sessionId, sessionData, ttlSeconds);
+        await this.fallbackStore.addUserSession(user.id, sessionId);
+      },
+    );
+
+    // Persist to database
+    try {
+      await this.authSessionRepository.create({
+        sessionId,
+        userId: user.id,
+        email: user.email,
+        role: user.role,
+        expiresAt: new Date(Date.now() + ttlSeconds * 1000),
+        ipAddress: meta.ipAddress ?? undefined,
+        userAgent: meta.userAgent ?? undefined,
+        geoHint: meta.geoHint ?? undefined,
+      });
+    } catch (error: unknown) {
+      this.logger.warn(
+        `Failed to persist session to database: ${(error as Error).message}`,
+      );
+    }
   }
 
   private async touchSession(
     userId: string,
     sessionId: string,
     ttlSeconds: number,
-  ): Promise<void> {
+  ) {
     const key = this.sessionKey(sessionId);
-    await this.redis.hset(
-      key,
-      'expiresAt',
-      new Date(Date.now() + ttlSeconds * 1000).toISOString(),
+    await this.circuitBreaker.execute(
+      async () => {
+        await this.redis.expire(key, ttlSeconds);
+        await this.redis.zadd(
+          this.userSessionsKey(userId),
+          Date.now(),
+          sessionId,
+        );
+      },
+      async () => {
+        // Fallback store doesn't need explicit touch as it uses setTimeout for TTL
+      },
     );
-    await this.redis.expire(key, ttlSeconds);
-    await this.redis.zadd(this.userSessionsKey(userId), Date.now(), sessionId);
+
+    try {
+      await this.authSessionRepository.updateLastActivity(sessionId);
+    } catch (error: unknown) {
+      this.logger.warn(
+        `Failed to update session activity in DB: ${(error as Error).message}`,
+      );
+    }
   }
 
   private async getSessionById(
     sessionId: string,
   ): Promise<Record<string, string> | null> {
-    const session = await this.redis.hgetall(this.sessionKey(sessionId));
-    if (!session || Object.keys(session).length === 0) {
-      return null;
-    }
-    return session;
-  }
-
-  private async enforceConcurrentSessionLimit(userId: string): Promise<void> {
-    const maxSessions = this.configService.get<number>(
-      'MAX_CONCURRENT_SESSIONS',
-      3,
+    const key = this.sessionKey(sessionId);
+    return this.circuitBreaker.execute(
+      async () => {
+        const session = await this.redis.hgetall(key);
+        return Object.keys(session).length > 0 ? session : null;
+      },
+      async () => {
+        return this.fallbackStore.getSession(sessionId);
+      },
     );
-    const sessionCount = await this.redis.zcard(this.userSessionsKey(userId));
-    if (sessionCount <= maxSessions) {
-      return;
-    }
-
-    const sessionsToEvict = await this.redis.zrange(
-      this.userSessionsKey(userId),
-      0,
-      sessionCount - maxSessions - 1,
-    );
-    for (const sessionId of sessionsToEvict) {
-      await this.redis.del(this.sessionKey(sessionId));
-      await this.redis.zrem(this.userSessionsKey(userId), sessionId);
-    }
-  }
-
-  private sessionKey(sessionId: string): string {
-    return `auth:session:${sessionId}`;
   }
 
   private userSessionsKey(userId: string): string {
     return `auth:user-sessions:${userId}`;
   }
 
-  private getRefreshTokenExpirySeconds(): number {
-    const refreshExpiresIn =
-      this.configService.get<string>('JWT_REFRESH_EXPIRES_IN') ?? '7d';
-    return this.parseDurationToSeconds(refreshExpiresIn);
+  private sessionKey(sessionId: string): string {
+    return `auth:session:${sessionId}`;
   }
 
-  private parseDurationToSeconds(value: string): number {
-    const match = /^(\d+)([smhd])$/.exec(value.trim());
-    if (!match) {
-      return 7 * 24 * 60 * 60;
+  private getRefreshTokenExpirySeconds(): number {
+    const expires =
+      this.configService.get<string>('JWT_REFRESH_EXPIRES_IN') ?? '7d';
+    if (expires.endsWith('d')) {
+      return parseInt(expires) * 24 * 60 * 60;
+    }
+    if (expires.endsWith('h')) {
+      return parseInt(expires) * 60 * 60;
+    }
+    return 604800; // 7 days default
+  }
+
+  private async enforceConcurrentSessionLimit(userId: string) {
+    const maxSessions = this.configService.get<number>(
+      'MAX_CONCURRENT_SESSIONS',
+      5,
+    );
+    const sessionIds = await this.redis.zrange(
+      this.userSessionsKey(userId),
+      0,
+      -1,
+    );
+
+    if (sessionIds.length > maxSessions) {
+      const toRevoke = sessionIds.slice(0, sessionIds.length - maxSessions);
+      await Promise.all(toRevoke.map((sid) => this.revokeSession(userId, sid)));
+      this.logger.log(
+        `Enforced session limit for user ${userId}, revoked ${toRevoke.length} sessions`,
+      );
+    }
+  }
+
+  /**
+   * Admin-only functionality to revoke all sessions for a specific user.
+   */
+  async revokeAllUserSessionsByAdmin(userId: string) {
+    const user = await this.userRepository.findOne({ where: { id: userId } });
+    if (!user) {
+      throw new NotFoundException(
+        JSON.stringify({
+          code: ErrorCode.USER_NOT_FOUND,
+          message: 'User not found',
+        }),
+      );
     }
 
-    const amount = Number(match[1]);
-    const unit = match[2];
-    const multipliers: Record<string, number> = {
-      s: 1,
-      m: 60,
-      h: 60 * 60,
-      d: 24 * 60 * 60,
+    this.logger.log(`Admin revoking all sessions for user: ${userId}`);
+
+    // 1. Get all session IDs from Redis
+    const sessionIds = await this.redis.zrange(
+      this.userSessionsKey(userId),
+      0,
+      -1,
+    );
+
+    // 2. Revoke each session in Redis
+    await Promise.all(
+      sessionIds.map(async (sessionId) => {
+        await this.redis.hset(
+          this.sessionKey(sessionId),
+          'revokedAt',
+          new Date().toISOString(),
+        );
+        // We could also delete them, but setting revokedAt allows for consistent logic in getSessionById
+      }),
+    );
+
+    // 3. Clean up the user's session index in Redis
+    await this.redis.del(this.userSessionsKey(userId));
+
+    // 4. Revoke in Database
+    await this.authSessionRepository.revokeUserSessions(
+      userId,
+      'Revoked by Admin',
+    );
+
+    // 5. Fallback store (if active)
+    const fallbackSessions = await this.fallbackStore.getUserSessions(userId);
+    await Promise.all(
+      fallbackSessions.map((sid) => this.fallbackStore.revokeSession(sid)),
+    );
+
+    return {
+      message: `Successfully revoked ${sessionIds.length || fallbackSessions.length || 'all'} sessions for user ${userId}`,
+      userId,
+      revokedCount: Math.max(sessionIds.length, fallbackSessions.length),
     };
-    return amount * multipliers[unit];
   }
 }

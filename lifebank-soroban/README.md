@@ -1,22 +1,44 @@
-# Soroban Project
+# Lifebank Soroban Contracts
 
-## Project Structure
+This workspace contains the Lifebank Soroban smart contracts used by Health-chain.
 
-This repository uses the recommended structure for a Soroban project:
+## Project structure
 
-```text
-.
-├── contracts
-│   └── hello_world
-│       ├── src
-│       │   ├── lib.rs
-│       │   └── test.rs
-│       └── Cargo.toml
-├── Cargo.toml
-└── README.md
+The repository uses a Cargo workspace with contract crates located under `contracts/*`.
+
+Existing contract directories include:
+
+- `analytics`
+- `coordinator`
+- `delivery`
+- `identity`
+- `inventory`
+- `matching`
+- `payments`
+- `reputation`
+- `requests`
+- `temperature`
+
+Each contract directory contains its own `Cargo.toml` and source files, while the top-level `Cargo.toml` provides shared workspace dependency definitions.
+
+## Running tests
+
+From the repository root:
+
+```bash
+cargo test
 ```
 
-- New Soroban contracts can be put in `contracts`, each in their own directory. There is already a `hello_world` contract in there to get you started.
-- If you initialized this project with any other example contracts via `--with-example`, those contracts will be in the `contracts` directory as well.
-- Contracts should have their own `Cargo.toml` files that rely on the top-level `Cargo.toml` workspace for their dependencies.
-- Frontend libraries can be added to the top-level directory as well. If you initialized this project with a frontend template via `--frontend-template` you will have those files already included.
+## Contract development
+
+- Add new contracts under `contracts/<contract-name>`.
+- Each contract must include its own `Cargo.toml`.
+- Shared dependencies are declared in the top-level workspace `Cargo.toml`.
+
+## Environment
+
+This workspace does not require any `.env` variables by default. If your local Soroban toolchain or contract scripts need environment variables, add them to a `.env` file and keep it out of source control.
+
+## Notes
+
+This repository no longer uses the starter `hello_world` template. Use the contracts already present under `contracts/`.

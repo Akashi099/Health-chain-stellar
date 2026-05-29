@@ -145,15 +145,44 @@ impl BloodStatus {
     /// Check if this status is a terminal state.
     ///
     /// Terminal states cannot transition to any other status.
-    /// `Disposed` is the true physical end-of-life; `Expired` and `Compromised`
-    /// units may still transition to `Disposed` before being considered fully done.
+    /// `Compromised` is not terminal: units must move to `Disposed`.
     pub fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            BloodStatus::Delivered | BloodStatus::Disposed | BloodStatus::Compromised
-        )
+        matches!(self, BloodStatus::Delivered | BloodStatus::Disposed)
     }
+
+    /// All statuses in deterministic order for exhaustive matrix tests.
+    pub const ALL: [BloodStatus; 7] = [
+        BloodStatus::Available,
+        BloodStatus::Reserved,
+        BloodStatus::InTransit,
+        BloodStatus::Delivered,
+        BloodStatus::Expired,
+        BloodStatus::Compromised,
+        BloodStatus::Disposed,
+    ];
 }
+
+/// Single source of truth for legal `(from, to)` blood status transitions.
+///
+/// Every other check (`is_valid_transition`, tests) is derived from this list
+/// so the matrix cannot drift across the codebase.
+pub const ALLOWED_BLOOD_STATUS_TRANSITIONS: &[(BloodStatus, BloodStatus)] = {
+    use BloodStatus::*;
+    &[
+        (Available, Reserved),
+        (Available, Expired),
+        (Available, Compromised),
+        (Reserved, InTransit),
+        (Reserved, Available),
+        (Reserved, Expired),
+        (Reserved, Compromised),
+        (InTransit, Delivered),
+        (InTransit, Expired),
+        (InTransit, Compromised),
+        (Expired, Disposed),
+        (Compromised, Disposed),
+    ]
+};
 
 /// Blood Unit Lifecycle Transition Map
 ///
@@ -167,18 +196,8 @@ impl BloodStatus {
 ///   Compromised ──► Disposed (terminal)
 ///   Reserved can also cancel back to Available.
 ///
-/// Valid transitions:
-///   - Available   → Reserved   (unit is reserved for a request)
-///   - Available   → Expired    (unit expired before being reserved)
-///   - Reserved    → InTransit  (unit is dispatched for delivery)
-///   - Reserved    → Available  (reservation cancelled, unit returned to pool)
-///   - Reserved    → Expired    (unit expired while reserved)
-///   - InTransit   → Delivered  (unit successfully delivered)
-///   - InTransit   → Expired    (unit expired during transport)
-///   - Expired     → Disposed   (formally disposed of after expiry)
-///   - Compromised → Disposed   (formally disposed of after compromise)
-///   - Delivered   → (none)     (terminal state — no further transitions)
-///   - Disposed    → (none)     (terminal state — no further transitions)
+/// Valid transitions: see [`ALLOWED_BLOOD_STATUS_TRANSITIONS`]. Operational states
+/// may move to `Compromised` when temperature or chain-of-custody rules fail.
 ///
 /// All other transitions are invalid and will be rejected. Backwards transitions
 /// (e.g., Delivered → Available, InTransit → Reserved) are explicitly forbidden
@@ -186,20 +205,9 @@ impl BloodStatus {
 ///
 /// This is a pure function with no storage access, making it unit-testable in isolation.
 pub fn is_valid_transition(from: &BloodStatus, to: &BloodStatus) -> bool {
-    use BloodStatus::*;
-
-    matches!(
-        (from, to),
-        (Available, Reserved)
-            | (Available, Expired)
-            | (Reserved, InTransit)
-            | (Reserved, Available)
-            | (Reserved, Expired)
-            | (InTransit, Delivered)
-            | (InTransit, Expired)
-            | (Expired, Disposed)
-            | (Compromised, Disposed)
-    )
+    ALLOWED_BLOOD_STATUS_TRANSITIONS
+        .iter()
+        .any(|(a, b)| a == from && b == to)
 }
 
 impl BloodUnit {
@@ -260,18 +268,47 @@ pub enum DataKey {
 
     /// Index: Donor ID -> Vec<u64> (blood unit IDs)
     DonorIndex(Address),
+    
+    /// Authorized blood bank address
+    AuthorizedBank(Address),
 
     /// Admin address
     Admin,
 
-    /// Status change history for a blood unit
-    StatusHistory(u64), // u64 is blood_unit_id -> Vec<StatusChangeHistory>
+    /// Status change history for a blood unit — stores current page number
+    StatusHistory(u64),
+
+    /// One page of status change history: (blood_unit_id, page_number)
+    StatusHistoryPage(u64, u32),
 
     /// Counter for status change history records
     StatusHistoryCounter,
 
     /// Counter for status changes on specific blood unit
     BloodUnitStatusChangeCount(u64), // u64 is blood_unit_id
+
+    /// Reservation record by reservation ID
+    Reservation(u64),
+
+    /// Reservation counter
+    ReservationCounter,
+
+    /// Circuit breaker: contract is paused
+    Paused,
+
+    /// Deduplication index: serial number (donation bag ID) -> blood unit ID
+    Serial(String),
+}
+
+/// Reservation record for blood units locked for a specific requester
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Reservation {
+    pub unit_ids: Vec<u64>,
+    pub requester: Address,
+    pub created_timestamp: u64,
+    pub expiration_timestamp: u64,
+    pub request_id: u64,
 }
 
 #[contracttype]
@@ -317,6 +354,23 @@ pub struct StatusChangeEvent {
 
     /// Optional reason for status change (e.g., "Delivered to Hospital A")
     pub reason: Option<String>,
+}
+
+/// On-chain audit event for every blood unit status transition.
+/// Emitted as `blood_unit_status_changed` — immutable once published.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AuditEvent {
+    /// Blood unit that transitioned
+    pub unit_id: u64,
+    /// Status before the transition
+    pub previous_status: BloodStatus,
+    /// Status after the transition
+    pub new_status: BloodStatus,
+    /// Address that authorised the transition
+    pub actor: Address,
+    /// Ledger timestamp of the transition
+    pub timestamp: u64,
 }
 
 /// Historical record of a status change
@@ -411,18 +465,47 @@ mod tests {
     }
 
     #[test]
-    fn test_is_valid_transition_all_valid() {
-        use super::is_valid_transition;
-        use BloodStatus::*;
+    fn test_allowed_transitions_match_is_valid_transition() {
+        use super::{is_valid_transition, ALLOWED_BLOOD_STATUS_TRANSITIONS};
+        for (from, to) in ALLOWED_BLOOD_STATUS_TRANSITIONS {
+            assert!(
+                is_valid_transition(from, to),
+                "allowlist pair ({:?}, {:?}) must be accepted",
+                from,
+                to
+            );
+        }
+    }
 
-        // All 7 valid transitions in the blood unit lifecycle
-        assert!(is_valid_transition(&Available, &Reserved));
-        assert!(is_valid_transition(&Available, &Expired));
-        assert!(is_valid_transition(&Reserved, &InTransit));
-        assert!(is_valid_transition(&Reserved, &Available)); // cancellation
-        assert!(is_valid_transition(&Reserved, &Expired));
-        assert!(is_valid_transition(&InTransit, &Delivered));
-        assert!(is_valid_transition(&InTransit, &Expired));
+    /// Property-style: every pair of statuses is valid iff it appears in the allowlist.
+    #[test]
+    fn test_transition_matrix_exhaustive_against_allowlist() {
+        use super::{is_valid_transition, ALLOWED_BLOOD_STATUS_TRANSITIONS, BloodStatus};
+        let mut allowed_set = [false; 7 * 7];
+        let idx = |s: BloodStatus| match s {
+            BloodStatus::Available => 0,
+            BloodStatus::Reserved => 1,
+            BloodStatus::InTransit => 2,
+            BloodStatus::Delivered => 3,
+            BloodStatus::Expired => 4,
+            BloodStatus::Compromised => 5,
+            BloodStatus::Disposed => 6,
+        };
+        for (from, to) in ALLOWED_BLOOD_STATUS_TRANSITIONS {
+            allowed_set[idx(*from) * 7 + idx(*to)] = true;
+        }
+        for from in BloodStatus::ALL {
+            for to in BloodStatus::ALL {
+                let expect = allowed_set[idx(from) * 7 + idx(to)];
+                assert_eq!(
+                    is_valid_transition(&from, &to),
+                    expect,
+                    "pair ({:?}, {:?}) mismatch",
+                    from,
+                    to
+                );
+            }
+        }
     }
 
     #[test]
@@ -454,8 +537,12 @@ mod tests {
         assert!(!is_valid_transition(&Available, &Delivered));
         // 12. Available -> InTransit (skip forward)
         assert!(!is_valid_transition(&Available, &InTransit));
-        // 13. Reserved -> Delivered (skip forward)
+        // 13. Reserved -> Delivered (skip forward — must go through InTransit)
         assert!(!is_valid_transition(&Reserved, &Delivered));
+        // 14. Delivered -> Disposed
+        assert!(!is_valid_transition(&Delivered, &Disposed));
+        // 15. Compromised -> Available (illegal recovery)
+        assert!(!is_valid_transition(&Compromised, &Available));
     }
 
     #[test]
@@ -469,11 +556,15 @@ mod tests {
         assert!(!is_valid_transition(&InTransit, &InTransit));
         assert!(!is_valid_transition(&Delivered, &Delivered));
         assert!(!is_valid_transition(&Expired, &Expired));
+        assert!(!is_valid_transition(&Compromised, &Compromised));
+        assert!(!is_valid_transition(&Disposed, &Disposed));
     }
 
     #[test]
     fn test_status_terminal_states() {
         assert!(BloodStatus::Delivered.is_terminal());
+        assert!(BloodStatus::Disposed.is_terminal());
+        assert!(!BloodStatus::Compromised.is_terminal());
         assert!(!BloodStatus::Expired.is_terminal());
         assert!(!BloodStatus::Available.is_terminal());
         assert!(!BloodStatus::Reserved.is_terminal());

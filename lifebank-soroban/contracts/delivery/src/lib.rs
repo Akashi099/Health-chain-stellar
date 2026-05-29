@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, Env,
 };
 
 const DEFAULT_MIN_TEMPERATURE_C: i32 = 2;
@@ -13,6 +13,7 @@ const DEFAULT_MAX_TEMPERATURE_C: i32 = 6;
 pub enum Error {
     AlreadyInitialized = 700,
     NotInitialized = 701,
+    DeliveryNotFound = 702,
 }
 
 #[contracttype]
@@ -38,6 +39,7 @@ pub enum DataKey {
     DeliveryCounter,
     TemperatureThresholds,
     ProofRequirements,
+    ComplianceAttestation(u64),
 }
 
 #[contract]
@@ -66,7 +68,9 @@ impl DeliveryContract {
         env.storage()
             .instance()
             .set(&DataKey::RequestContract, &request_contract);
-        env.storage().instance().set(&DataKey::DeliveryCounter, &0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::DeliveryCounter, &0u64);
         env.storage()
             .instance()
             .set(&DataKey::TemperatureThresholds, &thresholds);
@@ -74,8 +78,10 @@ impl DeliveryContract {
             .instance()
             .set(&DataKey::ProofRequirements, &proof_requirements);
 
-        env.events()
-            .publish((symbol_short!("init"),), (admin, request_contract));
+        env.events().publish(
+            (symbol_short!("init"), symbol_short!("v1")),
+            (admin, request_contract),
+        );
 
         Ok(())
     }
@@ -117,6 +123,41 @@ impl DeliveryContract {
             .instance()
             .get(&DataKey::ProofRequirements)
             .ok_or(Error::NotInitialized)
+    }
+
+    /// Record a compliance attestation hash for a completed delivery.
+    /// The hash is produced off-chain by the backend after evaluating telemetry.
+    pub fn record_compliance_attestation(
+        env: Env,
+        admin: Address,
+        delivery_id: u64,
+        compliance_hash: Bytes,
+        is_compliant: bool,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        if !Self::is_initialized(env.clone()) {
+            return Err(Error::NotInitialized);
+        }
+
+        env.storage().persistent().set(
+            &DataKey::ComplianceAttestation(delivery_id),
+            &(compliance_hash.clone(), is_compliant),
+        );
+
+        env.events().publish(
+            (symbol_short!("comply"), symbol_short!("v1")),
+            (delivery_id, compliance_hash, is_compliant),
+        );
+
+        Ok(())
+    }
+
+    /// Retrieve the stored compliance attestation for a delivery.
+    pub fn get_compliance_attestation(env: Env, delivery_id: u64) -> Result<(Bytes, bool), Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ComplianceAttestation(delivery_id))
+            .ok_or(Error::DeliveryNotFound)
     }
 }
 

@@ -1,4 +1,5 @@
-import { MigrationInterface, QueryRunner, Table, TableIndex } from 'typeorm';
+import type { MigrationInterface, QueryRunner } from 'typeorm';
+import { Table, TableIndex } from 'typeorm';
 
 export class CreateUserActivityTable1708000006000 implements MigrationInterface {
   public async up(queryRunner: QueryRunner): Promise<void> {
@@ -27,6 +28,11 @@ export class CreateUserActivityTable1708000006000 implements MigrationInterface 
               'AUTH_LOGIN_FAILED',
               'AUTH_LOGOUT',
               'AUTH_PASSWORD_CHANGED',
+              'AUTH_ACCOUNT_LOCKED',
+              'AUTH_ACCOUNT_AUTO_UNLOCKED',
+              'AUTH_ACCOUNT_MANUALLY_UNLOCKED',
+              'AUTH_SESSION_REVOKED',
+              'AUTH_REFRESH_TOKEN_REPLAY',
               'PROFILE_UPDATED',
               'PERMISSION_CHANGED',
             ],

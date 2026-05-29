@@ -8,3 +8,7 @@ export * from './order-delivered.event';
 export * from './order-disputed.event';
 export * from './order-resolved.event';
 export * from './inventory-low.event';
+export * from './escalation-triggered.event';
+export * from './escalation-acknowledged.event';
+export * from './route-deviation-detected.event';
+export * from './blockchain-tx.events';

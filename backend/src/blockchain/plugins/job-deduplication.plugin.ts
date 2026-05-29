@@ -1,6 +1,7 @@
 import { createHash } from 'crypto';
 
 import { Injectable, Inject, Optional, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 
 import type { RedisClientType } from 'redis';
 
@@ -26,7 +27,10 @@ export class JobDeduplicationPlugin {
   private readonly DEDUP_WINDOW_MS = 10_000; // 10 seconds default
   private readonly DEDUP_TTL_SECONDS = Math.ceil(this.DEDUP_WINDOW_MS / 1000);
 
-  constructor(@Optional() @Inject('REDIS_CLIENT') redis?: RedisClientType) {
+  constructor(
+    private configService: ConfigService,
+    @Optional() @Inject('REDIS_CLIENT') redis?: RedisClientType,
+  ) {
     if (redis) {
       this.redis = redis;
     } else {
@@ -36,8 +40,8 @@ export class JobDeduplicationPlugin {
       // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-assignment
       this.redis = createClient({
         socket: {
-          host: process.env.REDIS_HOST || 'localhost',
-          port: parseInt(process.env.REDIS_PORT || '6379'),
+          host: this.configService.get<string>('REDIS_HOST') || 'localhost',
+          port: this.configService.get<number>('REDIS_PORT') || 6379,
         },
       });
     }

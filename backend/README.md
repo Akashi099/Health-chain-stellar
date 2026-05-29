@@ -31,6 +31,14 @@
 $ npm install
 ```
 
+## Environment
+
+Copy `.env.example` to `.env` and update the required values before running the backend.
+
+```bash
+cp .env.example .env
+```
+
 ## Compile and run the project
 
 ```bash

@@ -1,20 +1,23 @@
 import { Injectable } from '@nestjs/common';
 import { InjectDataSource } from '@nestjs/typeorm';
 
-import { DataSource, Repository } from 'typeorm';
+import { DataSource } from 'typeorm';
 
 import { UserRole } from '../auth/enums/user-role.enum';
+import { SoftDeleteRepository } from '../common/repositories/soft-delete.repository';
 
 import { UserEntity } from './entities/user.entity';
 
 @Injectable()
-export class UserRepository extends Repository<UserEntity> {
+export class UserRepository extends SoftDeleteRepository<UserEntity> {
   constructor(@InjectDataSource() dataSource: DataSource) {
     super(UserEntity, dataSource.createEntityManager());
   }
 
   findByEmail(email: string): Promise<UserEntity | null> {
-    return this.findOne({ where: { email: email.toLowerCase() } });
+    return this.findOne({
+      where: { email: email.toLowerCase(), deletedAt: null },
+    });
   }
 
   findByEmailWithDeleted(email: string): Promise<UserEntity | null> {
@@ -25,12 +28,12 @@ export class UserRepository extends Repository<UserEntity> {
   }
 
   findByOrganization(organizationId: string): Promise<UserEntity[]> {
-    return this.find({ where: { organizationId } });
+    return this.find({ where: { organizationId, deletedAt: null } });
   }
 
   findWithTwoFactorAuth(userId: string): Promise<UserEntity | null> {
     return this.findOne({
-      where: { id: userId },
+      where: { id: userId, deletedAt: null },
       relations: ['twoFactorAuth'],
     });
   }
@@ -43,7 +46,7 @@ export class UserRepository extends Repository<UserEntity> {
     limit?: number;
     offset?: number;
   }): Promise<[UserEntity[], number]> {
-    const qb = this.createQueryBuilder('user').where('user.deleted_at IS NULL');
+    const qb = this.createActiveQueryBuilder('user');
 
     if (query.search) {
       qb.andWhere(
@@ -67,13 +70,5 @@ export class UserRepository extends Repository<UserEntity> {
       .take(query.limit ?? 20)
       .skip(query.offset ?? 0)
       .getManyAndCount();
-  }
-
-  async softDeleteUser(id: string): Promise<void> {
-    await this.softDelete(id);
-  }
-
-  async restoreUser(id: string): Promise<void> {
-    await this.restore(id);
   }
 }

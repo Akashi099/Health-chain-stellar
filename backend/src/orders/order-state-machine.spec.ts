@@ -21,6 +21,7 @@ describe('OrderStateMachine', () => {
       [OrderStatus.PENDING, OrderStatus.CONFIRMED],
       [OrderStatus.PENDING, OrderStatus.CANCELLED],
       [OrderStatus.CONFIRMED, OrderStatus.DISPATCHED],
+      [OrderStatus.CONFIRMED, OrderStatus.DELIVERED],
       [OrderStatus.CONFIRMED, OrderStatus.CANCELLED],
       [OrderStatus.DISPATCHED, OrderStatus.IN_TRANSIT],
       [OrderStatus.DISPATCHED, OrderStatus.CANCELLED],
@@ -63,7 +64,6 @@ describe('OrderStateMachine', () => {
       [OrderStatus.PENDING, OrderStatus.IN_TRANSIT],
       [OrderStatus.PENDING, OrderStatus.DISPATCHED],
       [OrderStatus.CONFIRMED, OrderStatus.IN_TRANSIT],
-      [OrderStatus.CONFIRMED, OrderStatus.DELIVERED],
       [OrderStatus.DISPATCHED, OrderStatus.CONFIRMED],
       [OrderStatus.DISPATCHED, OrderStatus.DELIVERED],
       [OrderStatus.IN_TRANSIT, OrderStatus.CONFIRMED],
@@ -89,15 +89,15 @@ describe('OrderStateMachine', () => {
         const ex = err as OrderTransitionException;
         expect(ex.detail.attemptedFrom).toBe(OrderStatus.DELIVERED);
         expect(ex.detail.attemptedTo).toBe(OrderStatus.DISPATCHED);
-        expect(ex.detail.allowedTransitions).toEqual([]);
+        expect(ex.detail.allowedTransitions).toEqual([OrderStatus.DISPUTED]);
       }
     });
 
     it('lists remaining valid options when transition is rejected mid-flow', () => {
       expect.assertions(2);
       try {
-        // CONFIRMED only allows DISPATCHED | CANCELLED
-        sm.transition(OrderStatus.CONFIRMED, OrderStatus.DELIVERED);
+        // CONFIRMED only allows DISPATCHED | DELIVERED | CANCELLED
+        sm.transition(OrderStatus.CONFIRMED, OrderStatus.PENDING);
       } catch (err) {
         const ex = err as OrderTransitionException;
         expect(ex.detail.allowedTransitions).toContain(OrderStatus.DISPATCHED);
@@ -118,9 +118,10 @@ describe('OrderStateMachine', () => {
       ]);
     });
 
-    it('returns [DISPATCHED, CANCELLED] for CONFIRMED', () => {
+    it('returns [DISPATCHED, DELIVERED, CANCELLED] for CONFIRMED', () => {
       expect(sm.getAllowedTransitions(OrderStatus.CONFIRMED)).toEqual([
         OrderStatus.DISPATCHED,
+        OrderStatus.DELIVERED,
         OrderStatus.CANCELLED,
       ]);
     });

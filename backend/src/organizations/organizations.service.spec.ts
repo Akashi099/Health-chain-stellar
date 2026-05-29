@@ -1,4 +1,13 @@
 /// <reference types="jest" />
+/* eslint-disable @typescript-eslint/no-unsafe-return, @typescript-eslint/require-await */
+jest.mock(
+  '@nestjs/bull',
+  () => ({
+    InjectQueue: () => () => undefined,
+  }),
+  { virtual: true },
+);
+
 import { ConflictException, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Test, TestingModule } from '@nestjs/testing';

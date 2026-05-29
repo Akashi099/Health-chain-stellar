@@ -1,10 +1,15 @@
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
 /// <reference types="jest" />
-import { getQueueToken } from '@nestjs/bull';
+import { getQueueToken } from '@nestjs/bullmq';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { Test, TestingModule } from '@nestjs/testing';
+import { getRepositoryToken } from '@nestjs/typeorm';
 
+import { OnChainTxStateEntity } from '../entities/on-chain-tx-state.entity';
+import { ConfirmationService } from '../services/confirmation.service';
 import { JobDeduplicationPlugin } from '../plugins/job-deduplication.plugin';
 import { IdempotencyService } from '../services/idempotency.service';
+import { QueueMetricsService } from '../services/queue-metrics.service';
 import { SorobanService } from '../services/soroban.service';
 import { SorobanTxJob } from '../types/soroban-tx.types';
 
@@ -25,16 +30,28 @@ describe('SorobanService', () => {
   let mockDeduplicationPlugin: {
     checkAndSetJobDedup: jest.Mock;
   };
+  let mockConfirmationService: {
+    recordConfirmations: jest.Mock;
+    getConfirmations: jest.Mock;
+    finalityThreshold: number;
+  };
+  let mockQueueMetricsService: {
+    getDetailedMetrics: jest.Mock;
+  };
 
   beforeEach(async () => {
     mockTxQueue = {
       add: jest
         .fn()
-        .mockImplementation((_data: SorobanTxJob, opts: { jobId?: string }) =>
-          Promise.resolve({ id: opts?.jobId ?? 'job-123' }),
+        .mockImplementation(
+          (_name: string, _data: SorobanTxJob, opts: { jobId?: string } = {}) =>
+            Promise.resolve({ id: opts.jobId ?? 'job-123' }),
         ),
       count: jest.fn().mockResolvedValue(5),
       getFailedCount: jest.fn().mockResolvedValue(2),
+      getWaitingCount: jest.fn().mockResolvedValue(4),
+      getActiveCount: jest.fn().mockResolvedValue(1),
+      getDelayedCount: jest.fn().mockResolvedValue(0),
       getJob: jest.fn(),
     };
 
@@ -48,6 +65,32 @@ describe('SorobanService', () => {
 
     mockDeduplicationPlugin = {
       checkAndSetJobDedup: jest.fn().mockResolvedValue(true),
+    };
+
+    mockConfirmationService = {
+      recordConfirmations: jest.fn().mockResolvedValue({
+        transactionHash: 'tx-1',
+        confirmations: 1,
+        finalityThreshold: 1,
+        status: 'final',
+      }),
+      getConfirmations: jest.fn().mockResolvedValue(1),
+      finalityThreshold: 1,
+    };
+    mockQueueMetricsService = {
+      getDetailedMetrics: jest.fn().mockResolvedValue({
+        counters: {
+          queued: 10,
+          processing: 1,
+          success: 7,
+          failure: 2,
+          retries: 3,
+          dlq: 1,
+        },
+        timings: { avgMs: 120, minMs: 80, maxMs: 300, samples: 7 },
+        live: { waiting: 4, active: 1, failed: 2, delayed: 0, dlqDepth: 1 },
+        since: '2026-01-01T00:00:00.000Z',
+      }),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -69,6 +112,22 @@ describe('SorobanService', () => {
           provide: JobDeduplicationPlugin,
           useValue: mockDeduplicationPlugin,
         },
+        {
+          provide: ConfirmationService,
+          useValue: mockConfirmationService,
+        },
+        {
+          provide: QueueMetricsService,
+          useValue: mockQueueMetricsService,
+        },
+        {
+          provide: EventEmitter2,
+          useValue: { emit: jest.fn() },
+        },
+        {
+          provide: getRepositoryToken(OnChainTxStateEntity),
+          useValue: { findOne: jest.fn().mockResolvedValue(null), create: jest.fn((d: unknown) => d), save: jest.fn() },
+        },
       ],
     }).compile();
 
@@ -87,7 +146,11 @@ describe('SorobanService', () => {
       const jobId = await service.submitTransaction(job);
 
       expect(jobId).toBe('idempotency-key-1');
-      expect(mockTxQueue.add).toHaveBeenCalledWith(job, expect.any(Object));
+      expect(mockTxQueue.add).toHaveBeenCalledWith(
+        job.contractMethod,
+        job,
+        expect.any(Object),
+      );
     });
 
     it('should reject duplicate submissions', async () => {
@@ -106,6 +169,26 @@ describe('SorobanService', () => {
       );
     });
 
+    it('normalizes deprecated contract method aliases before enqueueing', async () => {
+      const job: SorobanTxJob = {
+        contractMethod: 'create_blood_request',
+        args: ['req-1'],
+        idempotencyKey: 'normalize-key',
+      };
+
+      await service.submitTransaction(job);
+
+      expect(mockTxQueue.add).toHaveBeenCalledWith(
+        expect.objectContaining({
+          contractMethod: 'create_request',
+          metadata: expect.objectContaining({
+            normalizedFromContractMethod: 'create_blood_request',
+          }),
+        }),
+        expect.any(Object),
+      );
+    });
+
     it('should use default maxRetries if not provided', async () => {
       const job: SorobanTxJob = {
         contractMethod: 'test',
@@ -116,6 +199,7 @@ describe('SorobanService', () => {
       await service.submitTransaction(job);
 
       expect(mockTxQueue.add).toHaveBeenCalledWith(
+        job.contractMethod,
         job,
         expect.objectContaining({
           attempts: 5, // default
@@ -134,6 +218,7 @@ describe('SorobanService', () => {
       await service.submitTransaction(job);
 
       expect(mockTxQueue.add).toHaveBeenCalledWith(
+        job.contractMethod,
         job,
         expect.objectContaining({
           attempts: 10,
@@ -151,6 +236,7 @@ describe('SorobanService', () => {
       await service.submitTransaction(job);
 
       expect(mockTxQueue.add).toHaveBeenCalledWith(
+        job.contractMethod,
         job,
         expect.objectContaining({
           backoff: {
@@ -212,20 +298,38 @@ describe('SorobanService', () => {
     it('should return accurate queue metrics', async () => {
       const metrics = await service.getQueueMetrics();
 
-      expect(metrics).toEqual({
-        queueDepth: 5,
+      expect(metrics).toMatchObject({
+        queueDepth: 5, // waiting(4) + active(1)
         failedJobs: 2,
         dlqCount: 1,
         processingRate: 0,
       });
+      expect(metrics.counters).toBeDefined();
+      expect(metrics.timings).toBeDefined();
     });
 
-    it('should call all queue methods to get metrics', async () => {
-      await service.getQueueMetrics();
+    it('should include counters and timings from QueueMetricsService', async () => {
+      const metrics = await service.getQueueMetrics();
 
-      expect(mockTxQueue.count).toHaveBeenCalled();
-      expect(mockTxQueue.getFailedCount).toHaveBeenCalled();
-      expect(mockDlq.count).toHaveBeenCalled();
+      expect(metrics.counters).toMatchObject({
+        queued: 10,
+        processing: 1,
+        success: 7,
+        failure: 2,
+        retries: 3,
+        dlq: 1,
+      });
+      expect(metrics.timings).toMatchObject({
+        avgMs: 120,
+        minMs: 80,
+        maxMs: 300,
+        samples: 7,
+      });
+    });
+
+    it('should call QueueMetricsService.getDetailedMetrics', async () => {
+      await service.getQueueMetrics();
+      expect(mockQueueMetricsService.getDetailedMetrics).toHaveBeenCalled();
     });
   });
 
@@ -365,6 +469,7 @@ describe('SorobanService', () => {
       await service.submitTransaction(job);
 
       expect(mockTxQueue.add).toHaveBeenCalledWith(
+        job.contractMethod,
         job,
         expect.objectContaining({
           backoff: {
@@ -415,6 +520,8 @@ describe('SorobanService', () => {
       expect(metrics).toHaveProperty('failedJobs');
       expect(metrics).toHaveProperty('dlqCount');
       expect(metrics).toHaveProperty('processingRate');
+      expect(metrics).toHaveProperty('counters');
+      expect(metrics).toHaveProperty('timings');
 
       expect(typeof metrics.queueDepth).toBe('number');
       expect(typeof metrics.failedJobs).toBe('number');
@@ -444,6 +551,94 @@ describe('SorobanService', () => {
           contractMethod: 'register_blood',
           status: 'confirmed',
           timestamp: new Date().toISOString(),
+        }),
+      ).resolves.toBeUndefined();
+    });
+  });
+
+  describe('processWebhookCallback – confirmation depth', () => {
+    it('calls ConfirmationService with default confirmations=1 when omitted', async () => {
+      await service.processWebhookCallback({
+        eventId: 'evt-depth-1',
+        transactionHash: 'tx-depth',
+        contractMethod: 'register_blood',
+        status: 'confirmed',
+        timestamp: new Date().toISOString(),
+      });
+
+      expect(mockConfirmationService.recordConfirmations).toHaveBeenCalledWith(
+        'tx-depth',
+        1,
+      );
+    });
+
+    it('passes incoming confirmations count to ConfirmationService', async () => {
+      await service.processWebhookCallback({
+        eventId: 'evt-depth-2',
+        transactionHash: 'tx-depth-2',
+        contractMethod: 'register_blood',
+        status: 'confirmed',
+        timestamp: new Date().toISOString(),
+        confirmations: 3,
+      });
+
+      expect(mockConfirmationService.recordConfirmations).toHaveBeenCalledWith(
+        'tx-depth-2',
+        3,
+      );
+    });
+
+    it('does NOT call ConfirmationService for non-confirmed status', async () => {
+      await service.processWebhookCallback({
+        eventId: 'evt-pending',
+        transactionHash: 'tx-pending',
+        contractMethod: 'register_blood',
+        status: 'pending',
+        timestamp: new Date().toISOString(),
+      });
+
+      expect(
+        mockConfirmationService.recordConfirmations,
+      ).not.toHaveBeenCalled();
+    });
+
+    it('status remains "confirmed" when below threshold', async () => {
+      mockConfirmationService.recordConfirmations.mockResolvedValueOnce({
+        transactionHash: 'tx-below',
+        confirmations: 1,
+        finalityThreshold: 3,
+        status: 'confirmed',
+      });
+
+      // Should resolve without throwing – downstream persistence is a TODO
+      await expect(
+        service.processWebhookCallback({
+          eventId: 'evt-below',
+          transactionHash: 'tx-below',
+          contractMethod: 'register_blood',
+          status: 'confirmed',
+          timestamp: new Date().toISOString(),
+          confirmations: 1,
+        }),
+      ).resolves.toBeUndefined();
+    });
+
+    it('status transitions to "final" when threshold is met', async () => {
+      mockConfirmationService.recordConfirmations.mockResolvedValueOnce({
+        transactionHash: 'tx-final',
+        confirmations: 3,
+        finalityThreshold: 3,
+        status: 'final',
+      });
+
+      await expect(
+        service.processWebhookCallback({
+          eventId: 'evt-final',
+          transactionHash: 'tx-final',
+          contractMethod: 'register_blood',
+          status: 'confirmed',
+          timestamp: new Date().toISOString(),
+          confirmations: 3,
         }),
       ).resolves.toBeUndefined();
     });

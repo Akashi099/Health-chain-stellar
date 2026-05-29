@@ -1,121 +1,78 @@
 import { Injectable, Logger } from '@nestjs/common';
 
 /**
- * In-memory fallback store for auth sessions when Redis is unavailable.
- * 
- * WARNING: This is a degraded mode fallback. Sessions stored here:
- * - Are not shared across multiple backend instances
- * - Will be lost on server restart
- * - Have limited capacity (LRU eviction)
- * 
- * Use only when Redis circuit breaker is open.
+ * In-memory fallback storage for auth sessions when Redis is unavailable.
+ * Provides basic session management without persistence.
+ * WARNING: Sessions are lost on service restart.
  */
 @Injectable()
 export class AuthSessionFallbackStore {
   private readonly logger = new Logger(AuthSessionFallbackStore.name);
-  private readonly store = new Map<string, { value: string; expiresAt: number }>();
-  private readonly maxSize = 10000; // Limit memory usage
+  private sessions = new Map<string, Record<string, string>>();
+  private userSessions = new Map<string, Set<string>>();
 
-  /**
-   * Set a session value with TTL.
-   *
-   * @param key - Session key
-   * @param value - Session data (JSON string)
-   * @param ttlSeconds - Time to live in seconds
-   */
-  async set(key: string, value: string, ttlSeconds: number): Promise<void> {
-    // Evict oldest entries if at capacity (LRU)
-    if (this.store.size >= this.maxSize) {
-      const oldestKey = this.store.keys().next().value;
-      this.store.delete(oldestKey);
-      this.logger.warn(
-        `Fallback store at capacity (${this.maxSize}), evicted oldest entry`,
-      );
-    }
-
-    const expiresAt = Date.now() + ttlSeconds * 1000;
-    this.store.set(key, { value, expiresAt });
-    
-    this.logger.debug(`Fallback store: set ${key} (expires in ${ttlSeconds}s)`);
-  }
-
-  /**
-   * Get a session value.
-   *
-   * @param key - Session key
-   * @returns Session data or null if not found/expired
-   */
-  async get(key: string): Promise<string | null> {
-    const entry = this.store.get(key);
-
-    if (!entry) {
+  async getSession(sessionId: string): Promise<Record<string, string> | null> {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
       return null;
     }
-
-    // Check if expired
-    if (Date.now() > entry.expiresAt) {
-      this.store.delete(key);
-      this.logger.debug(`Fallback store: ${key} expired`);
+    // Check expiration
+    if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
+      this.sessions.delete(sessionId);
       return null;
     }
-
-    return entry.value;
+    return session;
   }
 
-  /**
-   * Delete a session.
-   *
-   * @param key - Session key
-   */
-  async delete(key: string): Promise<void> {
-    this.store.delete(key);
-    this.logger.debug(`Fallback store: deleted ${key}`);
+  async setSession(
+    sessionId: string,
+    data: Record<string, string>,
+    ttlSeconds: number,
+  ): Promise<void> {
+    const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+    this.sessions.set(sessionId, { ...data, expiresAt });
+
+    // Auto-cleanup after TTL
+    setTimeout(() => {
+      this.sessions.delete(sessionId);
+    }, ttlSeconds * 1000);
+
+    this.logger.debug(`Fallback session stored: ${sessionId}`);
   }
 
-  /**
-   * Check if a key exists and is not expired.
-   *
-   * @param key - Session key
-   * @returns True if exists and not expired
-   */
-  async exists(key: string): Promise<boolean> {
-    const value = await this.get(key);
-    return value !== null;
-  }
-
-  /**
-   * Clear all expired entries (cleanup task).
-   */
-  async cleanup(): Promise<number> {
-    const now = Date.now();
-    let cleaned = 0;
-
-    for (const [key, entry] of this.store.entries()) {
-      if (now > entry.expiresAt) {
-        this.store.delete(key);
-        cleaned++;
-      }
+  async addUserSession(userId: string, sessionId: string): Promise<void> {
+    if (!this.userSessions.has(userId)) {
+      this.userSessions.set(userId, new Set());
     }
+    this.userSessions.get(userId)!.add(sessionId);
+  }
 
-    if (cleaned > 0) {
-      this.logger.log(`Fallback store: cleaned ${cleaned} expired entries`);
+  async getUserSessions(userId: string): Promise<string[]> {
+    return Array.from(this.userSessions.get(userId) ?? []);
+  }
+
+  async removeUserSession(userId: string, sessionId: string): Promise<void> {
+    this.userSessions.get(userId)?.delete(sessionId);
+  }
+
+  async revokeSession(sessionId: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (session) {
+      session.revokedAt = new Date().toISOString();
     }
-
-    return cleaned;
   }
 
-  /**
-   * Get current store size.
-   */
-  size(): number {
-    return this.store.size;
+  async deleteSession(sessionId: string): Promise<void> {
+    this.sessions.delete(sessionId);
   }
 
-  /**
-   * Clear all entries (for testing).
-   */
-  clear(): void {
-    this.store.clear();
-    this.logger.warn('Fallback store: cleared all entries');
+  async markTokenConsumed(token: string): Promise<boolean> {
+    // Simple in-memory tracking of consumed tokens
+    const key = `consumed:${token}`;
+    if (this.sessions.has(key)) {
+      return false; // Already consumed
+    }
+    this.sessions.set(key, { consumed: 'true' });
+    return true;
   }
 }

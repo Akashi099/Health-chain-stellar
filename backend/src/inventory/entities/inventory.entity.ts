@@ -4,6 +4,7 @@ import {
   Column,
   CreateDateColumn,
   UpdateDateColumn,
+  VersionColumn,
 } from 'typeorm';
 
 @Entity('inventory')
@@ -19,6 +20,9 @@ export class InventoryEntity {
 
   @Column({ type: 'int', default: 0 })
   quantity: number;
+
+  @VersionColumn()
+  version: number;
 
   @CreateDateColumn({ name: 'created_at' })
   createdAt: Date;

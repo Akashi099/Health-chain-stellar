@@ -6,13 +6,27 @@ import {
   CompensationAction,
 } from '../../common/errors/app-errors';
 import { SorobanDlqProcessor } from '../processors/soroban-dlq.processor';
+import { FailedSorobanTxService } from '../services/failed-soroban-tx.service';
+import { QueueMetricsService } from '../services/queue-metrics.service';
 
 const mockCompensationService = {
   compensate: jest.fn().mockResolvedValue({
-    applied: [CompensationAction.PERSIST_DLQ, CompensationAction.NOTIFY_ADMIN, CompensationAction.FLAG_FOR_REVIEW],
+    applied: [
+      CompensationAction.PERSIST_DLQ,
+      CompensationAction.NOTIFY_ADMIN,
+      CompensationAction.FLAG_FOR_REVIEW,
+    ],
     failed: [],
     failureRecordId: 'record-uuid',
   }),
+};
+
+const mockQueueMetricsService = {
+  incrementDlq: jest.fn(),
+};
+
+const mockFailedTxService = {
+  persistFailure: jest.fn().mockResolvedValue({ id: 'failed-1' }),
 };
 
 function makeJob(overrides: Partial<any> = {}): any {
@@ -27,7 +41,9 @@ function makeJob(overrides: Partial<any> = {}): any {
     failedReason: 'RPC timeout',
     attemptsMade: 5,
     opts: { attempts: 5 },
-    stacktrace: ['Error: RPC timeout\n  at SorobanTxProcessor.handleTransaction'],
+    stacktrace: [
+      'Error: RPC timeout\n  at SorobanTxProcessor.handleTransaction',
+    ],
     ...overrides,
   };
 }
@@ -41,10 +57,18 @@ describe('SorobanDlqProcessor', () => {
       providers: [
         SorobanDlqProcessor,
         { provide: CompensationService, useValue: mockCompensationService },
+        { provide: QueueMetricsService, useValue: mockQueueMetricsService },
+        { provide: FailedSorobanTxService, useValue: mockFailedTxService },
       ],
     }).compile();
 
     processor = module.get(SorobanDlqProcessor);
+  });
+
+  it('increments the DLQ counter via QueueMetricsService', async () => {
+    const job = makeJob();
+    await processor.handleDeadLetterJob(job);
+    expect(mockQueueMetricsService.incrementDlq).toHaveBeenCalledTimes(1);
   });
 
   it('calls compensate with a BlockchainTxIrrecoverableError', async () => {
@@ -52,7 +76,8 @@ describe('SorobanDlqProcessor', () => {
     await processor.handleDeadLetterJob(job);
 
     expect(mockCompensationService.compensate).toHaveBeenCalledTimes(1);
-    const [error, handlers, correlationId] = mockCompensationService.compensate.mock.calls[0];
+    const [error, handlers, correlationId] =
+      mockCompensationService.compensate.mock.calls[0];
 
     expect(error).toBeInstanceOf(BlockchainTxIrrecoverableError);
     expect(error.context.jobId).toBe('job-1');
@@ -91,10 +116,14 @@ describe('SorobanDlqProcessor', () => {
   });
 
   it('does not throw even when compensate rejects', async () => {
-    mockCompensationService.compensate.mockRejectedValueOnce(new Error('persist failed'));
+    mockCompensationService.compensate.mockRejectedValueOnce(
+      new Error('persist failed'),
+    );
     const job = makeJob();
     // Should not propagate — DLQ processor must be resilient
-    await expect(processor.handleDeadLetterJob(job)).rejects.toThrow('persist failed');
+    await expect(processor.handleDeadLetterJob(job)).rejects.toThrow(
+      'persist failed',
+    );
     // Note: in production you'd wrap this too, but the CompensationService itself never throws
   });
 });

@@ -1,15 +1,27 @@
 /// <reference types="jest" />
 import { Test, TestingModule } from '@nestjs/testing';
 
-import { SorobanTxProcessor } from '../processors/soroban-tx.processor';
+import {
+  computeBackoffDelay,
+  SorobanTxProcessor,
+} from '../processors/soroban-tx.processor';
+import { QueueMetricsService } from '../services/queue-metrics.service';
 import { SorobanTxJob } from '../types/soroban-tx.types';
+
+const mockQueueMetricsService = {
+  incrementRetry: jest.fn(),
+};
 
 describe('SorobanTxProcessor', () => {
   let processor: SorobanTxProcessor;
 
   beforeEach(async () => {
+    jest.clearAllMocks();
     const module: TestingModule = await Test.createTestingModule({
-      providers: [SorobanTxProcessor],
+      providers: [
+        SorobanTxProcessor,
+        { provide: QueueMetricsService, useValue: mockQueueMetricsService },
+      ],
     }).compile();
 
     processor = module.get<SorobanTxProcessor>(SorobanTxProcessor);
@@ -54,6 +66,50 @@ describe('SorobanTxProcessor', () => {
       await expect(processor.handleTransaction(mockJob as any)).rejects.toThrow(
         'RPC timeout',
       );
+    });
+
+    it('should call incrementRetry when attempts remain after failure', async () => {
+      const mockJob = {
+        id: 'job-retry',
+        data: {
+          contractMethod: 'register_blood',
+          args: [],
+          idempotencyKey: 'retry-key',
+        } as SorobanTxJob,
+        attemptsMade: 1, // attempt 2 of 5 → 3 remaining
+        opts: { attempts: 5 },
+      };
+
+      jest
+        .spyOn(processor as any, 'executeContractCall')
+        .mockRejectedValueOnce(new Error('RPC timeout'));
+
+      await expect(
+        processor.handleTransaction(mockJob as any),
+      ).rejects.toThrow();
+      expect(mockQueueMetricsService.incrementRetry).toHaveBeenCalledTimes(1);
+    });
+
+    it('should not call incrementRetry on last attempt', async () => {
+      const mockJob = {
+        id: 'job-last',
+        data: {
+          contractMethod: 'register_blood',
+          args: [],
+          idempotencyKey: 'last-key',
+        } as SorobanTxJob,
+        attemptsMade: 4, // attempt 5 of 5 → 0 remaining
+        opts: { attempts: 5 },
+      };
+
+      jest
+        .spyOn(processor as any, 'executeContractCall')
+        .mockRejectedValueOnce(new Error('final failure'));
+
+      await expect(
+        processor.handleTransaction(mockJob as any),
+      ).rejects.toThrow();
+      expect(mockQueueMetricsService.incrementRetry).not.toHaveBeenCalled();
     });
 
     it('should handle metadata in job data', async () => {
@@ -160,6 +216,34 @@ describe('SorobanTxProcessor', () => {
       await processor.handleJobFailure(jobId, error);
 
       expect(alertSpy).toHaveBeenCalledWith(jobId, error);
+    });
+  });
+
+  describe('computeBackoffDelay (thundering herd prevention)', () => {
+    it('should return a delay within the jitter window for each attempt', () => {
+      // attempt 0: window = [0, min(30000, 1000*1)] = [0, 1000)
+      // attempt 1: window = [0, min(30000, 1000*2)] = [0, 2000)
+      // attempt 4: window = [0, min(30000, 1000*16)] = [0, 16000)
+      const windows = [1000, 2000, 4000, 8000, 16000];
+      windows.forEach((max, attempt) => {
+        const delay = computeBackoffDelay(attempt);
+        expect(delay).toBeGreaterThanOrEqual(0);
+        expect(delay).toBeLessThan(max);
+      });
+    });
+
+    it('should cap delay at RETRY_MAX_DELAY_MS (30 000 ms)', () => {
+      // attempt 10: 1000 * 2^10 = 1 024 000 >> 30 000
+      for (let i = 0; i < 20; i++) {
+        expect(computeBackoffDelay(10)).toBeLessThan(30_000);
+      }
+    });
+
+    it('should produce different delays across calls (randomness)', () => {
+      const delays = Array.from({ length: 20 }, () => computeBackoffDelay(3));
+      const unique = new Set(delays);
+      // With a window of [0, 8000) the probability of all 20 being identical is negligible
+      expect(unique.size).toBeGreaterThan(1);
     });
   });
 });

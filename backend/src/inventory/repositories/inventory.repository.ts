@@ -174,51 +174,69 @@ export class InventoryRepository {
   }
 
   /**
-   * Update stock quantity atomically
-   * Replaces: UPDATE inventory SET quantity = quantity + ?, updated_at = NOW() WHERE id = ?
+   * Update stock quantity atomically with optimistic locking
    */
   async adjustStock(id: string, delta: number): Promise<void> {
-    await this.repository
+    const stock = await this.repository.findOne({ where: { id } });
+    if (!stock) return;
+    const result = await this.repository
       .createQueryBuilder()
       .update(InventoryEntity)
       .set({
         quantity: () => `quantity + ${delta}`,
+        version: () => 'version + 1',
       })
-      .where('id = :id', { id })
+      .where('id = :id AND version = :version', { id, version: stock.version })
       .execute();
+    if ((result.affected ?? 0) === 0) {
+      throw new Error(
+        `Inventory '${id}' was modified concurrently. Please retry.`,
+      );
+    }
   }
 
   /**
-   * Reserve stock for an order
-   * Replaces: UPDATE inventory SET reserved_quantity = reserved_quantity + ? WHERE id = ? AND (quantity - reserved_quantity) >= ?
+   * Reserve stock for an order with optimistic locking
    */
   async reserveStock(id: string, quantity: number): Promise<boolean> {
+    const stock = await this.repository.findOne({ where: { id } });
+    if (!stock) return false;
     const result = await this.repository
       .createQueryBuilder()
       .update(InventoryEntity)
       .set({
         quantity: () => `quantity - ${quantity}`,
+        version: () => 'version + 1',
       })
-      .where('id = :id', { id })
-      .andWhere('quantity >= :quantity', { quantity })
+      .where('id = :id AND version = :version AND quantity >= :quantity', {
+        id,
+        version: stock.version,
+        quantity,
+      })
       .execute();
-
     return (result.affected ?? 0) > 0;
   }
 
   /**
-   * Release reserved stock
-   * Replaces: UPDATE inventory SET reserved_quantity = reserved_quantity - ? WHERE id = ?
+   * Release reserved stock with optimistic locking
    */
   async releaseStock(id: string, quantity: number): Promise<void> {
-    await this.repository
+    const stock = await this.repository.findOne({ where: { id } });
+    if (!stock) return;
+    const result = await this.repository
       .createQueryBuilder()
       .update(InventoryEntity)
       .set({
         quantity: () => `quantity + ${quantity}`,
+        version: () => 'version + 1',
       })
-      .where('id = :id', { id })
+      .where('id = :id AND version = :version', { id, version: stock.version })
       .execute();
+    if ((result.affected ?? 0) === 0) {
+      throw new Error(
+        `Inventory '${id}' was modified concurrently. Please retry.`,
+      );
+    }
   }
 
   /**

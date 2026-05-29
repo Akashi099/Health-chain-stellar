@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit, Inject } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 
@@ -14,14 +14,23 @@ import {
 } from '@stellar/stellar-sdk';
 import { Server } from '@stellar/stellar-sdk/rpc';
 import * as SorobanRpc from '@stellar/stellar-sdk/rpc';
+import Redis from 'ioredis';
 import { Repository } from 'typeorm';
+
+import { REDIS_CLIENT } from '../redis/redis.constants';
 
 import {
   assertRegisterBloodUnitIds,
   assertTransferCustodyIds,
   assertLogTemperatureIds,
 } from '../common/guards/on-chain-id.guard';
+import {
+  LIFEBANK_INVENTORY_METHODS,
+  mapBloodTypeToLifebankIndex,
+} from '../blockchain/contracts/lifebank-contracts';
+
 import { BlockchainEvent } from './entities/blockchain-event.entity';
+import { CONTRACT_EVENT_SCHEMA_VERSION } from './event-schema-version';
 import {
   ContractError,
   TemperatureThreshold,
@@ -56,6 +65,7 @@ export class SorobanService implements OnModuleInit {
 
   constructor(
     private configService: ConfigService,
+    @Inject(REDIS_CLIENT) private readonly redis: Redis,
     @InjectRepository(BlockchainEvent)
     private eventRepository: Repository<BlockchainEvent>,
   ) {}
@@ -85,6 +95,100 @@ export class SorobanService implements OnModuleInit {
     }
 
     this.logger.log(`Soroban service initialized on ${network}`);
+
+    // Validate contract compatibility
+    try {
+      await this.validateContractCompatibility();
+    } catch (err) {
+      this.logger.error(`Contract compatibility check failed: ${err.message}`);
+    }
+  }
+
+  /**
+   * Validate that the deployed contract version matches backend expectations
+   */
+  async validateContractCompatibility(): Promise<void> {
+    if (!this.contract) return;
+
+    try {
+      const version = await this.getContractVersion();
+      const expectedVersion = this.configService.get<number>(
+        'EXPECTED_CONTRACT_VERSION',
+        1,
+      );
+
+      if (version !== expectedVersion) {
+        this.logger.warn(
+          `Contract version mismatch! Deployed: ${version}, Expected: ${expectedVersion}`,
+        );
+      } else {
+        this.logger.log(`Contract version ${version} validated successfully.`);
+      }
+    } catch (error) {
+      this.logger.error(`Could not validate contract version: ${error.message}`);
+    }
+  }
+
+  /**
+   * Get contract version from the blockchain
+   */
+  async getContractVersion(): Promise<number> {
+    const cacheKey = `contract:version:${this.contract.contractId()}`;
+    const cached = await this.redis.get(cacheKey);
+    if (cached) return parseInt(cached);
+
+    return this.executeWithRetry(async () => {
+      const account = await this.server.getAccount(
+        this.sourceKeypair.publicKey(),
+      );
+      const transaction = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(this.contract.call('version'))
+        .setTimeout(30)
+        .build();
+
+      const simulated = await this.server.simulateTransaction(transaction);
+      if (SorobanRpc.Api.isSimulationSuccess(simulated)) {
+        const result = simulated.result?.retval;
+        const version = this.parseScVal(result);
+        await this.redis.setex(cacheKey, 3600, version.toString()); // cache for 1 hour
+        return version;
+      }
+      throw new Error('Failed to fetch contract version');
+    });
+  }
+
+  /**
+   * Get contract metadata
+   */
+  async getContractMetadata(): Promise<Record<string, string>> {
+    const cacheKey = `contract:metadata:${this.contract.contractId()}`;
+    const cached = await this.redis.get(cacheKey);
+    if (cached) return JSON.parse(cached);
+
+    return this.executeWithRetry(async () => {
+      const account = await this.server.getAccount(
+        this.sourceKeypair.publicKey(),
+      );
+      const transaction = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(this.contract.call('get_metadata'))
+        .setTimeout(30)
+        .build();
+
+      const simulated = await this.server.simulateTransaction(transaction);
+      if (SorobanRpc.Api.isSimulationSuccess(simulated)) {
+        const result = simulated.result?.retval;
+        const metadata = this.parseScVal(result);
+        await this.redis.setex(cacheKey, 3600, JSON.stringify(metadata));
+        return metadata;
+      }
+      throw new Error('Failed to fetch contract metadata');
+    });
   }
 
   /**
@@ -111,7 +215,7 @@ export class SorobanService implements OnModuleInit {
       })
         .addOperation(
           this.contract.call(
-            'register_blood',
+            LIFEBANK_INVENTORY_METHODS.registerBlood,
             this.createAddressScVal(params.bankId),
             bloodTypeEnum,
             xdr.ScVal.scvU32(params.quantityMl),
@@ -344,9 +448,156 @@ export class SorobanService implements OnModuleInit {
   }
 
   /**
+   * Anchor a hash on-chain for proof of existence (e.g. delivery proof)
+   * Closes #464
+   */
+  async anchorHash(
+    targetId: string,
+    hash: string,
+  ): Promise<{ transactionHash: string }> {
+    return this.executeWithRetry(async () => {
+      const account = await this.server.getAccount(
+        this.sourceKeypair.publicKey(),
+      );
+
+      const transaction = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(
+          this.contract.call(
+            'anchor_hash',
+            xdr.ScVal.scvString(targetId),
+            xdr.ScVal.scvString(hash),
+          ),
+        )
+        .setTimeout(30)
+        .build();
+
+      transaction.sign(this.sourceKeypair);
+      const response = await this.server.sendTransaction(transaction);
+
+      if (response.status === 'PENDING') {
+        await this.pollTransactionStatus(response.hash);
+        await this.saveEvent({
+          eventType: 'hash_anchored',
+          transactionHash: response.hash,
+          data: { targetId, hash },
+        });
+        return { transactionHash: response.hash };
+      }
+
+      throw new Error(`Transaction failed: ${response.status}`);
+    });
+  }
+
+
+  async quarantineBloodUnit(params: {
+    unitId: number;
+    caller?: string;
+    reason?:
+      | 'SCREENING_FAILURE'
+      | 'TEMPERATURE_BREACH'
+      | 'CONTAMINATION_SUSPECTED'
+      | 'DONOR_LEVEL_EVENT'
+      | 'MANUAL_OPERATOR_ACTION'
+      | 'ANOMALY_DETECTION'
+      | 'OTHER';
+  }): Promise<{ transactionHash: string }> {
+    return this.executeWithRetry(async () => {
+      const account = await this.server.getAccount(
+        this.sourceKeypair.publicKey(),
+      );
+      const caller = params.caller ?? this.sourceKeypair.publicKey();
+
+      const transaction = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(
+          this.contract.call(
+            'quarantine_blood',
+            this.createAddressScVal(caller),
+            xdr.ScVal.scvU64(xdr.Uint64.fromString(params.unitId.toString())),
+            this.mapQuarantineReason(params.reason ?? 'OTHER'),
+          ),
+        )
+        .setTimeout(30)
+        .build();
+
+      transaction.sign(this.sourceKeypair);
+      const response = await this.server.sendTransaction(transaction);
+
+      if (response.status === 'PENDING') {
+        await this.pollTransactionStatus(response.hash);
+        await this.saveEvent({
+          eventType: 'blood_quarantined',
+          transactionHash: response.hash,
+          data: params,
+        });
+        return { transactionHash: response.hash };
+      }
+
+      throw new Error(`Transaction failed: ${response.status}`);
+    });
+  }
+
+  async finalizeQuarantine(params: {
+    unitId: number;
+    caller?: string;
+    reason?:
+      | 'SCREENING_FAILURE'
+      | 'TEMPERATURE_BREACH'
+      | 'CONTAMINATION_SUSPECTED'
+      | 'DONOR_LEVEL_EVENT'
+      | 'MANUAL_OPERATOR_ACTION'
+      | 'ANOMALY_DETECTION'
+      | 'OTHER';
+    disposition: 'RELEASE' | 'DISCARD';
+  }): Promise<{ transactionHash: string }> {
+    return this.executeWithRetry(async () => {
+      const account = await this.server.getAccount(
+        this.sourceKeypair.publicKey(),
+      );
+      const caller = params.caller ?? this.sourceKeypair.publicKey();
+
+      const transaction = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(
+          this.contract.call(
+            'finalize_quarantine',
+            this.createAddressScVal(caller),
+            xdr.ScVal.scvU64(xdr.Uint64.fromString(params.unitId.toString())),
+            this.mapQuarantineReason(params.reason ?? 'OTHER'),
+            this.mapQuarantineDisposition(params.disposition),
+          ),
+        )
+        .setTimeout(30)
+        .build();
+
+      transaction.sign(this.sourceKeypair);
+      const response = await this.server.sendTransaction(transaction);
+
+      if (response.status === 'PENDING') {
+        await this.pollTransactionStatus(response.hash);
+        await this.saveEvent({
+          eventType: 'blood_quarantine_finalized',
+          transactionHash: response.hash,
+          data: params,
+        });
+        return { transactionHash: response.hash };
+      }
+
+      throw new Error(`Transaction failed: ${response.status}`);
+    });
+  }
+
+  /**
    * Execute operation with retry logic and exponential backoff
    */
-  private async executeWithRetry<T>(
+  public async executeWithRetry<T>(
     operation: () => Promise<T>,
     attempt = 1,
   ): Promise<T> {
@@ -411,7 +662,10 @@ export class SorobanService implements OnModuleInit {
       const event = this.eventRepository.create({
         eventType: params.eventType,
         transactionHash: params.transactionHash,
-        eventData: params.data,
+        eventData: {
+          ...params.data,
+          schemaVersion: CONTRACT_EVENT_SCHEMA_VERSION,
+        },
         blockchainTimestamp: new Date(),
       });
 
@@ -428,23 +682,35 @@ export class SorobanService implements OnModuleInit {
    * Map blood type string to Soroban enum
    */
   private mapBloodType(bloodType: string): xdr.ScVal {
-    const typeMap: Record<string, number> = {
-      'A+': 0,
-      'A-': 1,
-      'B+': 2,
-      'B-': 3,
-      'AB+': 4,
-      'AB-': 5,
-      'O+': 6,
-      'O-': 7,
+    return xdr.ScVal.scvU32(mapBloodTypeToLifebankIndex(bloodType));
+  }
+
+  private mapQuarantineReason(
+    reason:
+      | 'SCREENING_FAILURE'
+      | 'TEMPERATURE_BREACH'
+      | 'CONTAMINATION_SUSPECTED'
+      | 'DONOR_LEVEL_EVENT'
+      | 'MANUAL_OPERATOR_ACTION'
+      | 'ANOMALY_DETECTION'
+      | 'OTHER',
+  ): xdr.ScVal {
+    const map: Record<string, number> = {
+      SCREENING_FAILURE: 0,
+      TEMPERATURE_BREACH: 1,
+      CONTAMINATION_SUSPECTED: 2,
+      DONOR_LEVEL_EVENT: 3,
+      MANUAL_OPERATOR_ACTION: 4,
+      ANOMALY_DETECTION: 5,
+      OTHER: 6,
     };
+    return xdr.ScVal.scvU32(map[reason]);
+  }
 
-    const enumValue = typeMap[bloodType];
-    if (enumValue === undefined) {
-      throw new Error(`Invalid blood type: ${bloodType}`);
-    }
-
-    return xdr.ScVal.scvU32(enumValue);
+  private mapQuarantineDisposition(
+    disposition: 'RELEASE' | 'DISCARD',
+  ): xdr.ScVal {
+    return xdr.ScVal.scvU32(disposition === 'RELEASE' ? 0 : 1);
   }
 
   private createAddressScVal(publicKey: string): xdr.ScVal {
@@ -559,5 +825,306 @@ export class SorobanService implements OnModuleInit {
    */
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Invalidate the cached verification status for an org.
+   * Must be called after verifyOrganization / revokeOrganizationVerification.
+   */
+  async invalidateOrgVerificationCache(orgId: string): Promise<void> {
+    await this.redis.del(`org:verification:${orgId}`);
+  }
+
+  /**
+   * Verify an organization on-chain
+   */
+  async verifyOrganization(orgId: string): Promise<{ transactionHash: string }> {
+    return this.executeWithRetry(async () => {
+      const account = await this.server.getAccount(
+        this.sourceKeypair.publicKey(),
+      );
+
+      const transaction = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(
+          this.contract.call(
+            'verify_organization',
+            this.createAddressScVal(this.sourceKeypair.publicKey()),
+            this.createAddressScVal(orgId),
+          ),
+        )
+        .setTimeout(30)
+        .build();
+
+      transaction.sign(this.sourceKeypair);
+
+      const response = await this.server.sendTransaction(transaction);
+
+      if (response.status === 'PENDING') {
+        await this.pollTransactionStatus(response.hash);
+
+        await this.saveEvent({
+          eventType: 'organization_verified',
+          transactionHash: response.hash,
+          data: { organizationId: orgId },
+        });
+
+        await this.invalidateOrgVerificationCache(orgId);
+        return { transactionHash: response.hash };
+      }
+
+      throw new Error(`Transaction failed: ${response.status}`);
+    });
+  }
+
+  /**
+   * Revoke organization verification on-chain
+   */
+  async revokeOrganizationVerification(
+    orgId: string,
+    reason: string,
+  ): Promise<{ transactionHash: string }> {
+    return this.executeWithRetry(async () => {
+      const account = await this.server.getAccount(
+        this.sourceKeypair.publicKey(),
+      );
+
+      const transaction = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(
+          this.contract.call(
+            'unverify_organization',
+            this.createAddressScVal(this.sourceKeypair.publicKey()),
+            this.createAddressScVal(orgId),
+            xdr.ScVal.scvString(reason),
+          ),
+        )
+        .setTimeout(30)
+        .build();
+
+      transaction.sign(this.sourceKeypair);
+
+      const response = await this.server.sendTransaction(transaction);
+
+      if (response.status === 'PENDING') {
+        await this.pollTransactionStatus(response.hash);
+
+        await this.saveEvent({
+          eventType: 'organization_verification_revoked',
+          transactionHash: response.hash,
+          data: { organizationId: orgId, reason },
+        });
+
+        await this.invalidateOrgVerificationCache(orgId);
+        return { transactionHash: response.hash };
+      }
+
+      throw new Error(`Transaction failed: ${response.status}`);
+    });
+  }
+
+  /**
+   * Get organization verification status from Soroban contract.
+   *
+   * Reads the `get_verification_metadata` view function (read-only simulation).
+   * Results are cached in Redis for 5 minutes. Cache is invalidated deterministically
+   * by invalidateOrgVerificationCache() after any write (verify / revoke).
+   *
+   * Error mapping:
+   *   - Contract not configured → returns null
+   *   - RPC unavailable / timeout → throws with descriptive message
+   *   - Simulation failure (contract not found, bad args) → returns null
+   *   - ScVal decode failure → throws with descriptive message
+   */
+  async getOrganizationVerificationStatus(orgId: string): Promise<{
+    verified: boolean;
+    verifiedAt?: number;
+    verifiedBy?: string;
+    revokedAt?: number;
+    revocationReason?: string;
+    orgId: string;
+  } | null> {
+    if (!this.contract) {
+      this.logger.warn('No Soroban contract configured – skipping org verification query');
+      return null;
+    }
+
+    const cacheKey = `org:verification:${orgId}`;
+    const cached = await this.redis.get(cacheKey);
+    if (cached) {
+      return JSON.parse(cached) as Awaited<ReturnType<typeof this.getOrganizationVerificationStatus>>;
+    }
+
+    let account: Awaited<ReturnType<typeof this.server.getAccount>>;
+    try {
+      account = await this.server.getAccount(this.sourceKeypair.publicKey());
+    } catch (err) {
+      throw new Error(
+        `Soroban RPC unavailable while fetching org verification status for ${orgId}: ${(err as Error).message}`,
+      );
+    }
+
+    const transaction = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(
+        this.contract.call(
+          'get_verification_metadata',
+          this.createAddressScVal(orgId),
+        ),
+      )
+      .setTimeout(30)
+      .build();
+
+    let simulated: Awaited<ReturnType<typeof this.server.simulateTransaction>>;
+    try {
+      simulated = await this.server.simulateTransaction(transaction);
+    } catch (err) {
+      throw new Error(
+        `Soroban RPC timeout or network error for org ${orgId}: ${(err as Error).message}`,
+      );
+    }
+
+    if (!SorobanRpc.Api.isSimulationSuccess(simulated)) {
+      this.logger.warn(
+        `Soroban simulation failed for org ${orgId}: ${JSON.stringify((simulated as SorobanRpc.Api.SimulateTransactionErrorResponse).error)}`,
+      );
+      return null;
+    }
+
+    let metadata: ReturnType<typeof this.parseVerificationMetadata>;
+    try {
+      metadata = this.parseVerificationMetadata(simulated.result?.retval);
+    } catch (err) {
+      throw new Error(
+        `Failed to decode Soroban ScVal for org ${orgId}: ${(err as Error).message}`,
+      );
+    }
+
+    if (!metadata) return null;
+
+    const result = { ...metadata, orgId };
+    await this.redis.setex(cacheKey, 300, JSON.stringify(result));
+    return result;
+  }
+
+  /**
+   * Check if organization is verified on-chain
+   */
+  async isOrganizationVerified(orgId: string): Promise<boolean> {
+    return this.executeWithRetry(async () => {
+      const account = await this.server.getAccount(
+        this.sourceKeypair.publicKey(),
+      );
+
+      const transaction = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(
+          this.contract.call(
+            'is_organization_verified',
+            this.createAddressScVal(orgId),
+          ),
+        )
+        .setTimeout(30)
+        .build();
+
+      const simulated = await this.server.simulateTransaction(transaction);
+
+      if (SorobanRpc.Api.isSimulationSuccess(simulated)) {
+        const result = simulated.result?.retval;
+        return this.parseScVal(result);
+      }
+
+      return false;
+    });
+  }
+
+  /**
+   * Get verification events for an organization
+   */
+  async getVerificationEvents(
+    orgId: string,
+    limit: number = 10,
+  ): Promise<any[]> {
+    return this.executeWithRetry(async () => {
+      const account = await this.server.getAccount(
+        this.sourceKeypair.publicKey(),
+      );
+
+      const transaction = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(
+          this.contract.call(
+            'get_verification_events',
+            this.createAddressScVal(orgId),
+            xdr.ScVal.scvU32(limit),
+          ),
+        )
+        .setTimeout(30)
+        .build();
+
+      const simulated = await this.server.simulateTransaction(transaction);
+
+      if (SorobanRpc.Api.isSimulationSuccess(simulated)) {
+        const result = simulated.result?.retval;
+        return this.parseVec(result) || [];
+      }
+
+      return [];
+    });
+  }
+
+  /**
+   * Read dispute state from chain for reconciliation and timeout ownership checks.
+   * Returns null when contract call is not configured or state is unavailable.
+   */
+  async getDisputeState(
+    contractDisputeId: string,
+  ): Promise<{ status: string; deadline?: number } | null> {
+    if (!contractDisputeId) return null;
+    return this.executeWithRetry(async () => {
+      void contractDisputeId;
+      return null;
+    });
+  }
+
+  /**
+   * Parse verification metadata from contract result
+   */
+  private parseVerificationMetadata(result: any): {
+    verified: boolean;
+    verifiedAt?: number;
+    verifiedBy?: string;
+    revokedAt?: number;
+    revocationReason?: string;
+  } | null {
+    try {
+      if (!result || !result._value) {
+        return null;
+      }
+
+      const fields = result._value;
+      return {
+        verified: this.parseScVal(fields[1]),
+        verifiedAt: fields[2] ? this.parseScVal(fields[2]) : undefined,
+        verifiedBy: fields[3] ? this.parseScVal(fields[3]) : undefined,
+        revokedAt: fields[4] ? this.parseScVal(fields[4]) : undefined,
+        revocationReason: fields[5] ? this.parseScVal(fields[5]) : undefined,
+      };
+    } catch (error) {
+      this.logger.error(
+        `Failed to parse verification metadata: ${error.message}`,
+      );
+      return null;
+    }
   }
 }

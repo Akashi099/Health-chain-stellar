@@ -27,3 +27,25 @@ export async function verifyPassword(
 
   return timingSafeEqual(existingBuffer, derivedKey);
 }
+
+/**
+ * Pre-computed dummy hash used to normalise timing when a user is not found.
+ * Initialised once at startup so the salt is stable across requests.
+ */
+let _dummyHash: string | null = null;
+
+async function getDummyHash(): Promise<string> {
+  if (!_dummyHash) {
+    _dummyHash = await hashPassword('dummy-timing-normalisation-value');
+  }
+  return _dummyHash;
+}
+
+/**
+ * Runs a full scrypt derivation against a dummy hash and always returns false.
+ * Call this on the "user not found" path to match the timing of a real verify.
+ */
+export async function dummyVerify(password: string): Promise<false> {
+  await verifyPassword(password, await getDummyHash());
+  return false;
+}
