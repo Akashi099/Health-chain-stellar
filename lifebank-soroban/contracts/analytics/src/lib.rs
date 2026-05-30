@@ -17,6 +17,10 @@ const DAILY_SECS: u64 = 86_400;
 const WEEKLY_SECS: u64 = 604_800;
 const MONTHLY_SECS: u64 = 2_592_000; // 30 days
 
+// TTL bounds for snapshot persistent entries (~17 days min, ~365 days max in ledgers at ~5s/ledger)
+const SNAPSHOT_TTL_MIN: u32 = 290_000;
+const SNAPSHOT_TTL_MAX: u32 = 6_307_200;
+
 // ── Storage helpers ───────────────────────────────────────────────────────────
 
 fn require_initialized(env: &Env) -> Result<AnalyticsConfig, AnalyticsError> {
@@ -69,17 +73,17 @@ fn load_snapshot(env: &Env, period_index: u64) -> MetricsSnapshot {
 }
 
 fn save_snapshot(env: &Env, snapshot: &MetricsSnapshot) {
-    env.storage()
-        .persistent()
-        .set(&DataKey::Snapshot(snapshot.period_index), snapshot);
+    let key = DataKey::Snapshot(snapshot.period_index);
+    env.storage().persistent().set(&key, snapshot);
+    env.storage().persistent().extend_ttl(&key, SNAPSHOT_TTL_MIN, SNAPSHOT_TTL_MAX);
 }
 
 fn get_counter_u64(env: &Env, key: &DataKey) -> u64 {
-    env.storage().instance().get(key).unwrap_or(0u64)
+    env.storage().persistent().get(key).unwrap_or(0u64)
 }
 
 fn get_counter_i128(env: &Env, key: &DataKey) -> i128 {
-    env.storage().instance().get(key).unwrap_or(0i128)
+    env.storage().persistent().get(key).unwrap_or(0i128)
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -125,18 +129,18 @@ impl AnalyticsContract {
 
         env.storage().instance().set(&DataKey::Config, &config);
 
-        // Initialize lifetime counters to zero.
+        // Initialize lifetime counters to zero in persistent storage.
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::TotalDonations, &0u64);
-        env.storage().instance().set(&DataKey::TotalRequests, &0u64);
+        env.storage().persistent().set(&DataKey::TotalRequests, &0u64);
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::TotalDeliveries, &0u64);
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::TotalPaymentsReleased, &0u64);
-        env.storage().instance().set(&DataKey::TotalVolume, &0i128);
+        env.storage().persistent().set(&DataKey::TotalVolume, &0i128);
 
         env.events().publish(
             (
@@ -185,7 +189,7 @@ impl AnalyticsContract {
 
         let total = get_counter_u64(&env, &DataKey::TotalDonations) + 1;
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::TotalDonations, &total);
         Ok(())
     }
@@ -201,7 +205,7 @@ impl AnalyticsContract {
 
         let total = get_counter_u64(&env, &DataKey::TotalRequests) + 1;
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::TotalRequests, &total);
         Ok(())
     }
@@ -217,7 +221,7 @@ impl AnalyticsContract {
 
         let total = get_counter_u64(&env, &DataKey::TotalDeliveries) + 1;
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::TotalDeliveries, &total);
         Ok(())
     }
@@ -234,12 +238,12 @@ impl AnalyticsContract {
 
         let total_payments = get_counter_u64(&env, &DataKey::TotalPaymentsReleased) + 1;
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::TotalPaymentsReleased, &total_payments);
 
         let total_volume = get_counter_i128(&env, &DataKey::TotalVolume) + amount;
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::TotalVolume, &total_volume);
         Ok(())
     }

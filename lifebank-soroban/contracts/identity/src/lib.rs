@@ -171,6 +171,8 @@ pub enum DataKey {
     // Fine-grained permission scopes (Issue #374)
     AddressScopes(Address),
     Paused,
+    // Address of the requests contract used to verify interactions before rating
+    RequestsContract,
 }
 
 // ---------------------------------------------------------------------------
@@ -184,13 +186,14 @@ pub struct IdentityContract;
 impl IdentityContract {
     /// Initialize the contract with an admin
     pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
         if Self::is_initialized(env.clone()) {
             return Err(Error::AlreadyInitialized);
         }
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::OrgCounter, &0u32);
-        Self::grant_role(env.clone(), admin.clone(), Role::Admin);
+        Self::grant_role_internal(&env, admin.clone(), Role::Admin);
 
         env.events()
             .publish((symbol_short!("init"), symbol_short!("v1")), admin);
@@ -259,6 +262,14 @@ impl IdentityContract {
             .ok_or(Error::Unauthorized)
     }
 
+    /// Admin-only: configure the requests contract address used by verify_interaction.
+    pub fn set_requests_contract(env: Env, admin: Address, requests_contract: Address) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_role(&env, &admin, Role::Admin)?;
+        env.storage().instance().set(&DataKey::RequestsContract, &requests_contract);
+        Ok(())
+    }
+
     pub fn get_org_counter(env: Env) -> Result<u32, Error> {
         if !Self::is_initialized(env.clone()) {
             return Err(Error::Unauthorized);
@@ -320,7 +331,7 @@ impl IdentityContract {
             OrgType::BloodBank => Role::BloodBank,
             OrgType::Hospital => Role::Hospital,
         };
-        Self::grant_role(env.clone(), org_id.clone(), role);
+        Self::grant_role_internal(&env, org_id.clone(), role);
 
         // Add to type index
         let type_key = DataKey::OrgTypeList(org_type.clone());
@@ -346,21 +357,25 @@ impl IdentityContract {
         Ok(org_id)
     }
 
-    /// Internal helper to grant a role to an address.
-    ///
-    /// Stores all roles for an address in a single `DataKey::AddressRoles` entry
-    /// (a sorted, deduplicated `Vec<RoleGrant>`), reducing per-address storage
-    /// overhead from N entries to 1.
-    pub fn grant_role(env: Env, address: Address, role: Role) {
+    /// Admin-only public entrypoint for granting a role to an address.
+    pub fn grant_role(env: Env, admin: Address, address: Address, role: Role) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_role(&env, &admin, Role::Admin)?;
+        Self::grant_role_internal(&env, address, role);
+        Ok(())
+    }
+
+    /// Internal helper to grant a role to an address (no auth check).
+    fn grant_role_internal(env: &Env, address: Address, role: Role) {
         let key = DataKey::AddressRoles(address.clone());
         let mut roles: Vec<RoleGrant> = env
             .storage()
             .persistent()
             .get(&key)
-            .unwrap_or(Vec::new(&env));
+            .unwrap_or(Vec::new(env));
 
         // Deduplicate: remove existing grant for this role before inserting.
-        let mut new_roles: Vec<RoleGrant> = Vec::new(&env);
+        let mut new_roles: Vec<RoleGrant> = Vec::new(env);
         for i in 0..roles.len() {
             let g = roles.get(i).unwrap();
             if g.role != role {
@@ -376,7 +391,7 @@ impl IdentityContract {
 
         // Insert in sorted order to keep the vec deterministically ordered.
         let mut inserted = false;
-        let mut sorted: Vec<RoleGrant> = Vec::new(&env);
+        let mut sorted: Vec<RoleGrant> = Vec::new(env);
         for i in 0..new_roles.len() {
             let g = new_roles.get(i).unwrap();
             if !inserted && grant.role < g.role {
@@ -684,13 +699,21 @@ impl IdentityContract {
     }
 
     /// Verify that `rater` had a completed interaction with `org_id` on `request_id`.
-    /// Stub — always succeeds; wire to request contract in production.
+    /// Requires a requests contract to be configured via set_requests_contract(); fails closed otherwise.
     fn verify_interaction(
-        _env: Env,
+        env: Env,
         _rater: Address,
         _org_id: Address,
         _request_id: u64,
     ) -> Result<(), Error> {
+        // Fail closed: rating is disabled until the requests contract address is configured.
+        let _requests_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::RequestsContract)
+            .ok_or(Error::Unauthorized)?;
+        // Full cross-contract verification (hospital_id == rater, status == Fulfilled)
+        // requires wiring RequestsClient once the requests contract WASM is available.
         Ok(())
     }
 
