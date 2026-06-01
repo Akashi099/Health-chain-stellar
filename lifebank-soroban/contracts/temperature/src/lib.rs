@@ -223,7 +223,6 @@ impl TemperatureContract {
         oracle: Address,
         unit_id: u64,
         temperature_celsius_x100: i32,
-        timestamp: u64,
     ) -> Result<(), ContractError> {
         oracle.require_auth();
         Self::require_not_paused(&env)?;
@@ -257,6 +256,7 @@ impl TemperatureContract {
             temperature_celsius_x100 < threshold.min_celsius_x100
                 || temperature_celsius_x100 > threshold.max_celsius_x100;
 
+        let timestamp = env.ledger().timestamp();
         let reading = TemperatureReading {
             temperature_celsius_x100,
             timestamp,
@@ -728,8 +728,7 @@ mod tests {
         // Log exactly 21 readings (one more than page size of 20)
         for i in 0..21u64 {
             let temp = 400 + (i % 3) as i32; // Vary between 400-402 (all within range)
-            let timestamp = 1000 + i;
-            client.log_reading(&oracle, &unit_id, &temp, &timestamp);
+            client.log_reading(&oracle, &unit_id, &temp);
         }
 
         // Get violations
@@ -751,12 +750,11 @@ mod tests {
         // First 20 readings: all within range
         for i in 0..20u64 {
             let temp = 400 + (i % 3) as i32; // Within 200-600 range
-            let timestamp = 1000 + i;
-            client.log_reading(&oracle, &unit_id, &temp, &timestamp);
+            client.log_reading(&oracle, &unit_id, &temp);
         }
 
         // 21st reading: a violation (too cold)
-        client.log_reading(&oracle, &unit_id, &100, &1020);
+        client.log_reading(&oracle, &unit_id, &100);
 
         // Get violations
         let violations = client.get_violations(&unit_id, &0u32, &100u32);
@@ -784,8 +782,7 @@ mod tests {
             } else {
                 400 // Within range
             };
-            let timestamp = 1000 + i;
-            client.log_reading(&oracle, &unit_id, &temp, &timestamp);
+            client.log_reading(&oracle, &unit_id, &temp);
         }
 
         // Get violations
@@ -825,8 +822,7 @@ mod tests {
         // Log exactly 21 readings
         for i in 0..21u64 {
             let temp = 400 + (i % 3) as i32;
-            let timestamp = 1000 + i;
-            client.log_reading(&oracle, &unit_id, &temp, &timestamp);
+            client.log_reading(&oracle, &unit_id, &temp);
         }
 
         // Get all readings
@@ -860,8 +856,7 @@ mod tests {
         // Log exactly 21 readings (21st will be in second page with padding)
         for i in 0..21u64 {
             let temp = 400;
-            let timestamp = 1000 + i;
-            client.log_reading(&oracle, &unit_id, &temp, &timestamp);
+            client.log_reading(&oracle, &unit_id, &temp);
         }
 
         // Verify the second page still exists but has no padding pollution
@@ -888,7 +883,7 @@ mod tests {
         // Average should be 450°C
         for i in 0..10u64 {
             let temp = if i < 5 { 400 } else { 500 };
-            client.log_reading(&oracle, &unit_id, &temp, &(1000 + i));
+            client.log_reading(&oracle, &unit_id, &temp);
         }
 
         let summary = client.get_temperature_summary(&unit_id);
@@ -907,10 +902,10 @@ mod tests {
         client.set_threshold(&admin, &unit_id, &200, &600);
 
         // Log readings with some violations
-        client.log_reading(&oracle, &unit_id, &100, &1000); // violation (too cold)
-        client.log_reading(&oracle, &unit_id, &400, &1001); // ok
-        client.log_reading(&oracle, &unit_id, &700, &1002); // violation (too hot)
-        client.log_reading(&oracle, &unit_id, &500, &1003); // ok
+        client.log_reading(&oracle, &unit_id, &100); // violation (too cold)
+        client.log_reading(&oracle, &unit_id, &400); // ok
+        client.log_reading(&oracle, &unit_id, &700); // violation (too hot)
+        client.log_reading(&oracle, &unit_id, &500); // ok
 
         let summary = client.get_temperature_summary(&unit_id);
         assert_eq!(summary.count, 4);
@@ -933,7 +928,7 @@ mod tests {
         let num_readings = 100u64;
 
         for i in 0..num_readings {
-            client.log_reading(&oracle, &unit_id, &test_temp, &(1000 + i));
+            client.log_reading(&oracle, &unit_id, &test_temp);
         }
 
         let summary = client.get_temperature_summary(&unit_id);
@@ -964,9 +959,9 @@ mod tests {
         client.set_threshold(&admin, &unit_id, &-5000, &5000);
 
         // Test with extreme temperature values
-        client.log_reading(&oracle, &unit_id, &-4000, &1000);
-        client.log_reading(&oracle, &unit_id, &4000, &1001);
-        client.log_reading(&oracle, &unit_id, &0, &1002);
+        client.log_reading(&oracle, &unit_id, &-4000);
+        client.log_reading(&oracle, &unit_id, &4000);
+        client.log_reading(&oracle, &unit_id, &0);
 
         let summary = client.get_temperature_summary(&unit_id);
         assert_eq!(summary.count, 3);
@@ -986,7 +981,7 @@ mod tests {
         // This will span 5 pages
         for i in 0..100u64 {
             let temp = 300 + (i % 10) as i32; // Vary between 300-309
-            client.log_reading(&oracle, &unit_id, &temp, &(1000 + i));
+            client.log_reading(&oracle, &unit_id, &temp);
         }
 
         let summary = client.get_temperature_summary(&unit_id);
@@ -1025,22 +1020,22 @@ mod tests {
         client.set_threshold(&admin, &unit_id, &200, &600);
 
         // Log 2 violations
-        client.log_reading(&oracle, &unit_id, &100, &1000); // violation 1
-        client.log_reading(&oracle, &unit_id, &100, &1001); // violation 2
+        client.log_reading(&oracle, &unit_id, &100); // violation 1
+        client.log_reading(&oracle, &unit_id, &100); // violation 2
 
         // Check streak is 2
         assert_eq!(client.get_consecutive_violation_streak(&unit_id), 2);
         assert!(!client.is_compromised(&unit_id));
 
         // Log 1 normal reading (resets streak)
-        client.log_reading(&oracle, &unit_id, &400, &1002); // normal
+        client.log_reading(&oracle, &unit_id, &400); // normal
 
         // Check streak was reset to 0
         assert_eq!(client.get_consecutive_violation_streak(&unit_id), 0);
 
         // Log 2 more violations
-        client.log_reading(&oracle, &unit_id, &100, &1003); // violation 1
-        client.log_reading(&oracle, &unit_id, &100, &1004); // violation 2
+        client.log_reading(&oracle, &unit_id, &100); // violation 1
+        client.log_reading(&oracle, &unit_id, &100); // violation 2
 
         // Streak should be 2, not 4 (it was reset)
         assert_eq!(client.get_consecutive_violation_streak(&unit_id), 2);
@@ -1056,15 +1051,15 @@ mod tests {
         client.set_threshold(&admin, &unit_id, &200, &600);
 
         // Log exactly 3 consecutive violations
-        client.log_reading(&oracle, &unit_id, &100, &1000); // violation 1
+        client.log_reading(&oracle, &unit_id, &100); // violation 1
         assert_eq!(client.get_consecutive_violation_streak(&unit_id), 1);
         assert!(!client.is_compromised(&unit_id));
 
-        client.log_reading(&oracle, &unit_id, &100, &1001); // violation 2
+        client.log_reading(&oracle, &unit_id, &100); // violation 2
         assert_eq!(client.get_consecutive_violation_streak(&unit_id), 2);
         assert!(!client.is_compromised(&unit_id));
 
-        client.log_reading(&oracle, &unit_id, &100, &1002); // violation 3
+        client.log_reading(&oracle, &unit_id, &100); // violation 3
         assert_eq!(client.get_consecutive_violation_streak(&unit_id), 3);
         assert!(client.is_compromised(&unit_id), "Unit should be compromised after 3 consecutive violations");
     }
@@ -1079,17 +1074,17 @@ mod tests {
         client.set_threshold(&admin, &unit_id, &200, &600);
 
         // Log 2 consecutive violations
-        client.log_reading(&oracle, &unit_id, &100, &1000);
-        client.log_reading(&oracle, &unit_id, &100, &1001);
+        client.log_reading(&oracle, &unit_id, &100);
+        client.log_reading(&oracle, &unit_id, &100);
         assert_eq!(client.get_consecutive_violation_streak(&unit_id), 2);
 
         // Log 1 normal reading
-        client.log_reading(&oracle, &unit_id, &400, &1002);
+        client.log_reading(&oracle, &unit_id, &400);
         assert_eq!(client.get_consecutive_violation_streak(&unit_id), 0);
 
         // Log 2 more consecutive violations
-        client.log_reading(&oracle, &unit_id, &100, &1003);
-        client.log_reading(&oracle, &unit_id, &100, &1004);
+        client.log_reading(&oracle, &unit_id, &100);
+        client.log_reading(&oracle, &unit_id, &100);
         assert_eq!(client.get_consecutive_violation_streak(&unit_id), 2);
 
         // Should NOT be compromised
@@ -1106,9 +1101,9 @@ mod tests {
         client.set_threshold(&admin, &unit_id, &200, &600);
 
         // Trigger compromised status with 3 violations
-        client.log_reading(&oracle, &unit_id, &100, &1000);
-        client.log_reading(&oracle, &unit_id, &100, &1001);
-        client.log_reading(&oracle, &unit_id, &100, &1002);
+        client.log_reading(&oracle, &unit_id, &100);
+        client.log_reading(&oracle, &unit_id, &100);
+        client.log_reading(&oracle, &unit_id, &100);
         assert!(client.is_compromised(&unit_id));
         assert_eq!(client.get_consecutive_violation_streak(&unit_id), 3);
 
@@ -1118,8 +1113,8 @@ mod tests {
         assert_eq!(client.get_consecutive_violation_streak(&unit_id), 0, "Streak should be reset to 0");
 
         // Log 2 new violations
-        client.log_reading(&oracle, &unit_id, &100, &1003);
-        client.log_reading(&oracle, &unit_id, &100, &1004);
+        client.log_reading(&oracle, &unit_id, &100);
+        client.log_reading(&oracle, &unit_id, &100);
         assert_eq!(client.get_consecutive_violation_streak(&unit_id), 2);
 
         // Should NOT be compromised again yet (only 2 violations)
@@ -1136,7 +1131,7 @@ mod tests {
         client.set_threshold(&admin, &unit_id, &200, &600);
 
         // Log single violation
-        client.log_reading(&oracle, &unit_id, &100, &1000);
+        client.log_reading(&oracle, &unit_id, &100);
 
         // Check streak is 1
         assert_eq!(client.get_consecutive_violation_streak(&unit_id), 1, "Streak should be 1 after single violation");
@@ -1159,20 +1154,20 @@ mod tests {
         client.set_threshold(&admin, &unit_id, &200, &600);
 
         // Custodian A logs violations (e.g., during initial storage)
-        client.log_reading(&oracle, &unit_id, &100, &1000); // violation 1
-        client.log_reading(&oracle, &unit_id, &100, &1001); // violation 2
+        client.log_reading(&oracle, &unit_id, &100); // violation 1
+        client.log_reading(&oracle, &unit_id, &100); // violation 2
         assert_eq!(client.get_consecutive_violation_streak(&unit_id), 2);
 
         // Simulate custody transfer (conceptually - same unit, different handler)
         // Custodian B logs a violation (e.g., during transport)
-        client.log_reading(&oracle, &unit_id, &700, &1002); // violation 3 (too hot)
+        client.log_reading(&oracle, &unit_id, &700); // violation 3 (too hot)
         
         // Streak should be continuous across the conceptual custody change
         assert_eq!(client.get_consecutive_violation_streak(&unit_id), 3);
         assert!(client.is_compromised(&unit_id), "Unit should be compromised - violations span custody transfer");
 
         // Custodian B logs a normal reading
-        client.log_reading(&oracle, &unit_id, &400, &1003); // normal
+        client.log_reading(&oracle, &unit_id, &400); // normal
         
         // Streak should reset even after custody transfer
         assert_eq!(client.get_consecutive_violation_streak(&unit_id), 0);
@@ -1193,7 +1188,7 @@ mod tests {
 
         // Log 100 consecutive violations
         for i in 0..100u64 {
-            client.log_reading(&oracle, &unit_id, &100, &(1000 + i));
+            client.log_reading(&oracle, &unit_id, &100));
             
             // Check that compromised was triggered on the 3rd violation
             if i == 2 {
@@ -1219,7 +1214,7 @@ mod tests {
         client.pause(&admin);
         assert!(client.is_paused());
 
-        let result = client.try_log_reading(&oracle, &unit_id, &400, &1000u64);
+        let result = client.try_log_reading(&oracle, &unit_id, &400);
         assert!(result.is_err());
     }
 
@@ -1228,7 +1223,7 @@ mod tests {
         let (_env, admin, oracle, client) = create_test_contract();
         let unit_id = 2u64;
         client.set_threshold(&admin, &unit_id, &200, &600);
-        client.log_reading(&oracle, &unit_id, &400, &1000u64);
+        client.log_reading(&oracle, &unit_id, &400);
 
         client.pause(&admin);
 
@@ -1247,7 +1242,7 @@ mod tests {
         client.unpause(&admin);
         assert!(!client.is_paused());
 
-        client.log_reading(&oracle, &unit_id, &400, &2000u64);
+        client.log_reading(&oracle, &unit_id, &400);
         let readings = client.get_readings(&unit_id);
         assert!(!readings.is_empty());
     }
@@ -1270,7 +1265,7 @@ mod tests {
         client.set_threshold(&admin, &unit_id, &200, &600);
 
         let stranger = Address::generate(&env);
-        let result = client.try_log_reading(&stranger, &unit_id, &400, &1000u64);
+        let result = client.try_log_reading(&stranger, &unit_id, &400);
         assert!(result.is_err(), "Non-whitelisted address should not be able to log readings");
     }
 
@@ -1282,7 +1277,7 @@ mod tests {
         client.set_threshold(&admin, &unit_id, &200, &600);
 
         // Admin is not in the oracle whitelist but should still be able to log
-        client.log_reading(&admin, &unit_id, &400, &1000u64);
+        client.log_reading(&admin, &unit_id, &400);
         let readings = client.get_readings(&unit_id);
         assert_eq!(readings.len(), 1);
     }
@@ -1299,13 +1294,13 @@ mod tests {
         client.add_oracle(&admin, &sensor);
 
         // Confirm it can log
-        client.log_reading(&sensor, &unit_id, &400, &1000u64);
+        client.log_reading(&sensor, &unit_id, &400);
 
         // Remove the oracle
         client.remove_oracle(&admin, &sensor);
 
         // Now it should be rejected
-        let result = client.try_log_reading(&sensor, &unit_id, &400, &2000u64);
+        let result = client.try_log_reading(&sensor, &unit_id, &400);
         assert!(result.is_err(), "Removed oracle should not be able to log readings");
     }
 
@@ -1342,17 +1337,17 @@ mod tests {
         client.add_oracle(&admin, &sensor_b);
 
         // Both can log
-        client.log_reading(&sensor_a, &unit_id, &400, &1000u64);
-        client.log_reading(&sensor_b, &unit_id, &410, &1001u64);
+        client.log_reading(&sensor_a, &unit_id, &400);
+        client.log_reading(&sensor_b, &unit_id, &410);
 
         // Remove only sensor_a
         client.remove_oracle(&admin, &sensor_a);
 
         // sensor_b still works, sensor_a does not
-        let result_a = client.try_log_reading(&sensor_a, &unit_id, &400, &2000u64);
+        let result_a = client.try_log_reading(&sensor_a, &unit_id, &400);
         assert!(result_a.is_err(), "Removed sensor_a should be rejected");
 
-        client.log_reading(&sensor_b, &unit_id, &420, &2001u64);
+        client.log_reading(&sensor_b, &unit_id, &420);
         let readings = client.get_readings(&unit_id);
         assert_eq!(readings.len(), 3, "Should have 3 readings total");
     }

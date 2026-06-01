@@ -51,6 +51,8 @@ pub struct ExcursionSummary {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Admin,
+    /// Pending admin address set by propose_admin(); cleared on accept_admin().
+    PendingAdmin,
     RequestContract,
     InventoryContract,
     PaymentContract,

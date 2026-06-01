@@ -775,6 +775,40 @@ impl CoordinatorContract {
         Ok(())
     }
 
+    /// Step 1 of two-step admin transfer: propose a new admin.
+    /// The current admin must authorize. The new admin is stored as PendingAdmin
+    /// until they call accept_admin().
+    pub fn propose_admin(env: Env, current_admin: Address, new_admin: Address) -> Result<(), CoordinatorError> {
+        current_admin.require_auth();
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(CoordinatorError::Unauthorized)?;
+        if current_admin != stored {
+            return Err(CoordinatorError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
+        Ok(())
+    }
+
+    /// Step 2 of two-step admin transfer: the pending admin accepts ownership.
+    /// Clears PendingAdmin and promotes new_admin to Admin.
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), CoordinatorError> {
+        new_admin.require_auth();
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(CoordinatorError::Unauthorized)?;
+        if new_admin != pending {
+            panic!("not pending admin");
+        }
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        Ok(())
+    }
+
     pub fn is_initialized(env: Env) -> bool {
         env.storage().instance().has(&DataKey::Admin)
     }
