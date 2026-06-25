@@ -14,6 +14,7 @@ import { OrganizationEntity } from '../organizations/entities/organization.entit
 
 import { BloodRequestsController } from './blood-requests.controller';
 import { BloodRequestsService } from './blood-requests.service';
+import { OrderSplittingController } from './controllers/order-splitting.controller';
 import { RequestQueryController } from './controllers/request-query.controller';
 import { BloodRequestItemEntity } from './entities/blood-request-item.entity';
 import { BloodRequestReservationEntity } from './entities/blood-request-reservation.entity';
@@ -66,7 +67,11 @@ import { TriageScoringService } from './services/triage-scoring.service';
     MapsModule,
     EscalationModule,
   ],
-  controllers: [BloodRequestsController, RequestQueryController],
+  controllers: [
+    BloodRequestsController,
+    RequestQueryController,
+    OrderSplittingController,
+  ],
   providers: [
     BloodRequestsService,
     BloodRequestChainService,
@@ -76,6 +81,7 @@ import { TriageScoringService } from './services/triage-scoring.service';
     RequestQueryService,
     BloodBankAvailabilityService,
     BloodRequestReservationService,
+    OrderSplittingService,
     TriageScoringService,
     SagaCoordinatorService,
   ],
