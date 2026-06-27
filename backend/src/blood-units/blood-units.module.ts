@@ -12,6 +12,8 @@ import { DonorEligibilityModule } from '../donor-eligibility/donor-eligibility.m
 import { PolicyCenterModule } from '../policy-center/policy-center.module';
 import { ApprovalModule } from '../approvals/approval.module';
 import { FileMetadataModule } from '../file-metadata/file-metadata.module';
+import { AuthModule } from '../auth/auth.module';
+
 
 import { BloodInventoryQueryService } from './blood-inventory-query.service';
 import { BloodStatusService } from './blood-status.service';
@@ -54,6 +56,7 @@ import { BloodUnitBatchService } from './batch/blood-unit-batch.service';
     NotificationsModule,
     DonorEligibilityModule,
     PolicyCenterModule,
+    AuthModule,
     RegistryModule,
   ],
   controllers: [BloodUnitsController, DispositionController, QuarantineController],
