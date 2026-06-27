@@ -11,6 +11,8 @@ import { NotificationsModule } from '../notifications/notifications.module';
 import { OrderEntity } from '../orders/entities/order.entity';
 import { UsersModule } from '../users/users.module';
 import { InventoryStockRepository } from './repositories/inventory-stock.repository';
+import { OrganizationEntity } from '../organizations/entities/organization.entity';
+
 
 import { InventoryAlertController } from './controllers/inventory-alert.controller';
 import { ExpirationForecastingController } from './controllers/expiration-forecasting.controller';
@@ -22,6 +24,7 @@ import { InventoryEntity } from './entities/inventory.entity';
 import { InventoryStockEntity } from './entities/inventory-stock.entity';
 import { ReservationAuditEntity } from './entities/reservation-audit.entity';
 import { RestockingCampaignEntity } from './entities/restocking-campaign.entity';
+import { ExpirationForecastingService } from './expiration-forecasting.service';
 import { InventoryAnalyticsService } from './inventory-analytics.service';
 import { InventoryEventListener } from './inventory-event.listener';
 import { InventoryForecastingService } from './inventory-forecasting.service';
@@ -45,6 +48,7 @@ import { RestockingCampaignService } from './services/restocking-campaign.servic
       AlertPreferenceEntity,
       RestockingCampaignEntity,
       ReservationAuditEntity,
+      OrganizationEntity,
       BloodUnit,
     ]),
     BullModule.registerQueue({ name: 'donor-outreach' }),
@@ -66,6 +70,7 @@ import { RestockingCampaignService } from './services/restocking-campaign.servic
     InventoryForecastingService,
     InventoryAnalyticsService,
     InventoryEventListener,
+    ExpirationForecastingService,
     DonorOutreachProcessor,
     InventoryAlertService,
     RestockingCampaignService,
