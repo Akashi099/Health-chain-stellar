@@ -165,6 +165,8 @@ pub enum Error {
     /// would leave req_idx_key deleted while a live payment still exists,
     /// letting a duplicate payment slip past the DuplicatePayment guard.
     InvalidStatusTransition = 523,
+    /// The supplied token address is not on the admin-managed allowlist.
+    TokenNotAllowed = 525,
 }
 
 // ── Storage keys ───────────────────────────────────────────────────────────────
@@ -185,6 +187,8 @@ const DEFAULT_DISPUTE_TIMEOUT_SECS: u64 = 7 * 24 * 3600;
 const MAX_DISPUTE_TIMEOUT_SECS: u64 = 365 * 24 * 3600;
 /// Instance storage key for the dispute timeout override.
 const DISPUTE_TIMEOUT: soroban_sdk::Symbol = symbol_short!("DISP_TO");
+/// Instance storage key for the admin-managed set of allowed token addresses.
+const ALLOWED_TOKENS: soroban_sdk::Symbol = symbol_short!("ALWD_TOK");
 
 /// Persistent storage TTL constants (in ledgers; one ledger ≈ 5 s).
 /// Entries are bumped to PERSISTENT_BUMP_TO whenever their remaining TTL
@@ -870,7 +874,18 @@ impl PaymentContract {
         if hospital == payee {
             return Err(Error::SamePayerPayee);
         }
+        // Both the payer (hospital) and the payee must authorize this escrow.
+        // Requiring payee consent prevents a payer from unilaterally locking a
+        // worthless or attacker-controlled token as the settlement asset.
         hospital.require_auth();
+        payee.require_auth();
+
+        // Reject tokens that are not on the admin-managed allowlist.
+        // This prevents a payer from choosing an arbitrary or malicious token
+        // as the settlement asset that the payee will later receive.
+        if !Self::is_allowed_token(env.clone(), token.clone()) {
+            return Err(Error::TokenNotAllowed);
+        }
 
         // Reject if a payment for this request already exists.
         if env.storage().persistent().has(&req_idx_key(request_id)) {
@@ -881,11 +896,6 @@ impl PaymentContract {
         if let Some(rc) = env.storage().instance().get::<_, Address>(&REQ_CONTRACT) {
             validate_request_payable(&env, &rc, request_id)?;
         }
-
-        let token_client = token::Client::new(&env, &token);
-        // Transfer before persisting the escrow payment. If the transfer fails,
-        // the transaction aborts and no payment record is written.
-        token_client.transfer(&hospital, env.current_contract_address(), &amount);
 
         let id = get_counter(&env) + 1;
         set_counter(&env, id);
@@ -906,6 +916,11 @@ impl PaymentContract {
             token: Some(token.clone()),
         };
 
+        // ── Checks-Effects-Interactions ────────────────────────────────────────
+        // Write all state (payment record, indexes, stats) BEFORE the external
+        // token transfer.  If the transfer re-enters this contract and attempts
+        // to create a second escrow for the same request_id, the DuplicatePayment
+        // guard above will already see req_idx_key and reject the call.
         store_payment(&env, &payment);
         index_by_payer(&env, &hospital, id);
         index_by_payee(&env, &payee, id);
@@ -913,6 +928,11 @@ impl PaymentContract {
         index_by_request(&env, request_id, id);
         timeline_append(&env, request_id, id);
         update_stats_on_transition(&env, amount, PaymentStatus::Pending, PaymentStatus::Locked)?;
+
+        // External call last — any failure here will revert the entire transaction,
+        // including the state writes above, so no inconsistency can persist.
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&hospital, &env.current_contract_address(), &amount);
 
         PaymentEscrowed { payment_id: id }.publish(&env);
 
@@ -1574,6 +1594,70 @@ impl PaymentContract {
             .set(&DISPUTE_TIMEOUT, &timeout_secs);
         extend_instance_ttl(&env);
         Ok(())
+    }
+
+    // ── Token allowlist ────────────────────────────────────────────────────────
+
+    /// Add a token address to the escrow allowlist. Admin only.
+    /// Only allowlisted tokens may be used as the settlement asset in
+    /// `create_escrow`, preventing a payer from escrowing a worthless or
+    /// attacker-controlled token.
+    pub fn add_allowed_token(env: Env, admin: Address, token: Address) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let mut list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&ALLOWED_TOKENS)
+            .unwrap_or(Vec::new(&env));
+        // Idempotent: skip if already present.
+        for i in 0..list.len() {
+            if list.get(i).unwrap() == token {
+                return Ok(());
+            }
+        }
+        list.push_back(token);
+        env.storage().instance().set(&ALLOWED_TOKENS, &list);
+        extend_instance_ttl(&env);
+        Ok(())
+    }
+
+    /// Remove a token address from the escrow allowlist. Admin only.
+    /// Existing locked escrows that already used this token are unaffected;
+    /// only future `create_escrow` calls are rejected.
+    pub fn remove_allowed_token(env: Env, admin: Address, token: Address) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&ALLOWED_TOKENS)
+            .unwrap_or(Vec::new(&env));
+        let mut new_list: Vec<Address> = Vec::new(&env);
+        for i in 0..list.len() {
+            let t = list.get(i).unwrap();
+            if t != token {
+                new_list.push_back(t);
+            }
+        }
+        env.storage().instance().set(&ALLOWED_TOKENS, &new_list);
+        extend_instance_ttl(&env);
+        Ok(())
+    }
+
+    /// Returns true if the given token address is on the escrow allowlist.
+    pub fn is_allowed_token(env: Env, token: Address) -> bool {
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&ALLOWED_TOKENS)
+            .unwrap_or(Vec::new(&env));
+        for i in 0..list.len() {
+            if list.get(i).unwrap() == token {
+                return true;
+            }
+        }
+        false
     }
 
     /// Refund all Disputed+escrowed payments whose dispute has exceeded the
