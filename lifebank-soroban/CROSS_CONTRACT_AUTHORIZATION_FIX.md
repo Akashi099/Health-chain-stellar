@@ -39,9 +39,11 @@ Requests contract tries: release_reservation(requests_admin_addr)
 
 ---
 
-## Solution: Cross-Contract Authorization Pattern
+## Required Solution: Cross-Contract Authorization Pattern
 
-Instead of passing an external address that needs to sign again, we establish **the requesting contract itself as a trusted intermediary**.
+Instead of trusting an arbitrary address supplied by the caller, inventory must store **the deployed requests contract address as an admin-configured trusted address**. The cross-contract entry point must require both that the supplied address matches the stored address and that the supplied contract address authenticates the call.
+
+**Current status:** The shipped implementation only calls `authorized_contract.require_auth()` and does not compare the address with a stored trusted address. Until #1472 is fixed, `release_reservation_by_contract` is vulnerable because an attacker can supply an address they control and release another account's reservation.
 
 ### The Fix
 
@@ -50,15 +52,18 @@ Instead of passing an external address that needs to sign again, we establish **
 ```rust
 fn release_reservation_by_contract(
     env: &Env,
-    authorized_contract: &Address,
+    authorized_contract: Address,
     reservation_id: u64,
 ) -> Result<(), ContractError> {
     Self::require_not_paused(&env)?;
 
-    // Verify that the current contract IS the one we expect (requests contract).
-    if &env.current_contract_address() != authorized_contract {
+    // The requests contract address is set by the inventory admin during setup.
+    let trusted_requests_contract = storage::get_requests_contract(&env)
+        .ok_or(ContractError::Unauthorized)?;
+    if authorized_contract != trusted_requests_contract {
         return Err(ContractError::Unauthorized);
     }
+    authorized_contract.require_auth();
 
     let reservation = storage::get_reservation(&env, reservation_id)
         .ok_or(ContractError::ReservationNotFound)?;
@@ -68,11 +73,11 @@ fn release_reservation_by_contract(
 }
 ```
 
-**Key insight:** Instead of calling `require_auth()` on an external address, we verify the **calling contract's address**:
-- `env.current_contract_address()` returns the address of the contract executing this function
-- When requests contract calls this function, `env.current_contract_address()` = requests contract address
-- We verify this matches the `authorized_contract` parameter
-- No external signature needed — contract-to-contract calls are authenticated by Soroban's execution layer
+**Key insight:** The safe pattern is to verify a **stored, trusted requests-contract address** and then authenticate that contract:
+- The inventory admin sets the trusted requests-contract address during initialization or configuration
+- Inventory verifies `authorized_contract == stored_requests_contract`
+- Inventory then calls `authorized_contract.require_auth()`
+- Both checks are required; an arbitrary caller-supplied address must never be trusted by itself
 
 #### 2. **Updated Requests Contract Call**
 
@@ -81,9 +86,8 @@ fn release_reservation_if_present(env: &Env, request: &mut BloodRequest) -> bool
     if let Some(res_id) = request.reservation_id {
         let inventory_addr = storage::get_inventory_contract(env);
         let inv_client = InventoryContractClient::new(env, &inventory_addr);
-        let requests_contract = env.current_contract_address();
-        // Pass the requests contract address itself
-        inv_client.release_reservation_by_contract(&requests_contract, &res_id);
+        let trusted_requests_contract = configured_requests_contract(env);
+        inv_client.release_reservation_by_contract(&trusted_requests_contract, &res_id);
         request.reservation_id = None;
         true
     } else {
@@ -98,10 +102,10 @@ let admin = storage::get_admin(env);  // Wrong: external address, not signed
 inv_client.release_reservation(&admin, &res_id);
 ```
 
-**After (fixed):**
+**After #1472 (required):**
 ```rust
-let requests_contract = env.current_contract_address();  // Correct: calling contract
-inv_client.release_reservation_by_contract(&requests_contract, &res_id);
+let trusted_requests_contract = configured_requests_contract(env);
+inv_client.release_reservation_by_contract(&trusted_requests_contract, &res_id);
 ```
 
 ---
@@ -118,10 +122,10 @@ inv_client.release_reservation_by_contract(&requests_contract, &res_id);
    - Verifies caller is hospital or admin (via require_auth())
    - Calls: InventoryContract::release_reservation_by_contract(requests_contract_addr)
    
-4. InventoryContract verifies the caller:
-   - env.current_contract_address() == requests_contract_addr ✅ (caller IS the requests contract)
-   - No external signature needed
-   - Proceeds with reservation release
+4. InventoryContract verifies the trusted contract:
+    - authorized_contract == stored_requests_contract ✅
+    - authorized_contract.require_auth() ✅
+    - Proceeds with reservation release
    
 5. Result: ✅ Cancellation succeeds without requiring admin co-signature
 ```
@@ -135,7 +139,7 @@ This fix implements three critical security principles for cross-contract author
 ### 1. **Trust Chain Preservation**
 - The requests contract already validated the caller's authorization (hospital or admin)
 - Requests contract passes this decision to inventory as a trusted intermediary
-- Inventory doesn't need to re-validate — the requesting contract has already done so
+- Inventory verifies the caller is the admin-configured requests contract before trusting that decision
 
 ### 2. **Layered Authorization**
 - **Layer 1:** External actor (hospital) authenticates via `require_auth()`
@@ -170,7 +174,7 @@ This allows:
 - Manual cleanup where a reserver directly releases their own reservation
 - Backward compatibility with any existing integrations
 
-**New function** `release_reservation_by_contract()` is **private** (internal to inventory contract) and used only by the updated requests contract via the generated client.
+**New function** `release_reservation_by_contract()` is a public contract entry point used by the requests contract via the generated client. It must remain protected by the stored-address comparison and `require_auth()` checks described above.
 
 ---
 
@@ -228,10 +232,10 @@ Soroban's `#[contractclient]` macro auto-generates the calling code based on thi
 
 **Threat 1: Unauthorized Contract Calls Reservation Release**
 - **Attack:** Malicious contract calls `release_reservation_by_contract(malicious_addr, res_id)`
-- **Defense:** We verify `env.current_contract_address() == authorized_contract`
-  - Soroban ensures `env.current_contract_address()` cannot be spoofed
-  - The calling contract's address is cryptographically determined by its bytecode hash
-  - If the caller is not the requests contract address stored at initialization, the check fails
+- **Defense:** We verify `authorized_contract == stored_requests_contract` and then call `authorized_contract.require_auth()`
+    - The stored address is set by the inventory admin during setup
+    - The equality check rejects arbitrary addresses
+    - The auth check requires the trusted contract to authenticate the invocation
 
 **Threat 2: Requests Contract Modified to Release Wrong Reservations**
 - **Attack:** Malicious modification of requests contract to release any reservation
@@ -264,12 +268,12 @@ This fix addresses **authorization** for reservation release only. Other securit
 ```rust
 #[test]
 fn test_release_reservation_by_contract_succeeds_from_requests_contract() {
-    // Mock setup: requests contract calls inventory
+    // Mock setup: inventory stores requests_addr as its trusted contract.
     let env = Env::default();
-    let requests_addr = env.current_contract_address();
+    let requests_addr = Address::random(&env);
     
     // Inventory::release_reservation_by_contract should succeed
-    // when authorized_contract == env.current_contract_address()
+    // when authorized_contract == the stored trusted requests address
 }
 
 #[test]
@@ -278,7 +282,7 @@ fn test_release_reservation_by_contract_fails_from_unauthorized_contract() {
     let env = Env::default();
     let attacker_addr = Address::random(&env);
     
-    // Should fail: attacker_addr != env.current_contract_address()
+    // Should fail: attacker_addr != the stored trusted requests address
     assert_eq!(result, Unauthorized);
 }
 
@@ -310,25 +314,23 @@ fn test_update_request_status_rejected_with_reservation_succeeds() {
 
 ## Deployment Notes
 
-### No Contract Redeployment Required
+### Deployment After #1472 Is Fixed
 
-- Inventory contract: New private function added, public interface unchanged
-- Requests contract: Updated to call new private function (no public API changes)
-- Backward compatibility: Existing code that calls `release_reservation` still works
+- Inventory contract: Store the trusted requests contract address and enforce both checks
+- Requests contract: Call the protected entry point with its configured address
+- Existing `release_reservation` callers remain on the external `require_auth()` path
 
 ### Configuration
 
-No new configuration or environment variables are needed. The fix uses:
-- `env.current_contract_address()` — built-in Soroban function
-- Existing contract address stored at initialization time
+The inventory admin must configure the deployed requests contract address during initialization or through an admin-only setter. The entry point then compares the supplied address with that stored value and calls `require_auth()` on it.
 
 ### Migration Path (if applicable)
 
 If existing requests instances need to be updated:
-1. Deploy new inventory contract code
-2. Deploy new requests contract code
-3. Both use the new cross-contract pattern automatically on next invocation
-4. Old `release_reservation(admin, res_id)` calls still work but no longer used internally
+1. Deploy the inventory code containing the stored-address check
+2. Configure the deployed requests contract address as trusted
+3. Deploy or update the requests contract call site
+4. Verify unauthorized addresses are rejected before enabling cancellation flows
 
 ---
 
@@ -336,9 +338,8 @@ If existing requests instances need to be updated:
 
 ### Soroban Documentation
 
-- `env.current_contract_address()`: Returns the address of the currently executing contract
 - `#[contractclient]` macro: Auto-generates typed clients for cross-contract calls
-- Cross-contract calls: Authenticated by Soroban's execution layer, not requiring additional signatures
+- Address authorization: Must combine a trusted-address comparison with `require_auth()`
 
 ### Related Issues
 
