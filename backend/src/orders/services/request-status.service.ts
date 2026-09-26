@@ -39,6 +39,17 @@ const STATUS_TO_EVENT_TYPE: Record<OrderStatus, OrderEventType> = {
   [OrderStatus.CANCELLED]: OrderEventType.ORDER_CANCELLED,
 };
 
+/**
+ * Maps a target status to the action it implies, so that a raw `status`
+ * update is subject to the same role policy as the equivalent `action`.
+ * Statuses without a role-restricted action (e.g. DISPATCHED, IN_TRANSIT)
+ * return undefined and are not role-gated here.
+ */
+const STATUS_TO_IMPLIED_ACTION: Partial<Record<OrderStatus, RequestStatusAction>> = {
+  [OrderStatus.CONFIRMED]: RequestStatusAction.APPROVE,
+  [OrderStatus.DELIVERED]: RequestStatusAction.FULFILL,
+};
+
 @Injectable()
 export class RequestStatusService {
   private readonly logger = new Logger(RequestStatusService.name);
@@ -67,7 +78,9 @@ export class RequestStatusService {
     const previousStatus = order.status;
 
     if (actorRole) {
-      this.enforceActionRole(dto.action, actorRole);
+      const impliedAction =
+        dto.action ?? STATUS_TO_IMPLIED_ACTION[nextStatus];
+      this.enforceActionRole(impliedAction, actorRole);
     }
     this.stateMachine.transition(previousStatus, nextStatus);
 
@@ -278,6 +291,9 @@ export class RequestStatusService {
           ),
         );
         break;
+
+      default:
+        break;
     }
   }
 
@@ -307,8 +323,8 @@ export class RequestStatusService {
       );
     } catch (error) {
       this.logger.warn(
-        `Failed to sync order ${order.id} status change with blockchain: ${
-          error instanceof Error ? error.message : String(error)
+        `Failed to sync order ${order.id} status with blockchain: ${
+          (error as Error).message
         }`,
       );
     }
@@ -336,7 +352,7 @@ export class RequestStatusService {
     } catch (error) {
       this.logger.warn(
         `Failed to dispatch notification for order ${order.id}: ${
-          error instanceof Error ? error.message : String(error)
+          (error as Error).message
         }`,
       );
     }
