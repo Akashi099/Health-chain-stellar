@@ -285,11 +285,11 @@ fn load_workflow(env: &Env, request_id: u64) -> Option<WorkflowRecord> {
 
 fn save_workflow(env: &Env, wf: &WorkflowRecord) {
     const WORKFLOW_TTL_LEDGERS: u32 = 535_680; // ~30 days at 5s/ledger
-    // Terminal records get a short archival TTL instead of the long
-    // auto-renewing one so settled/rolled-back workflows eventually expire.
     const TERMINAL_TTL_LEDGERS: u32 = 17_280; // ~1 day at 5s/ledger
+
     let key = DataKey::Workflow(wf.request_id);
     env.storage().persistent().set(&key, wf);
+
     let ttl = if is_terminal(wf.status) {
         TERMINAL_TTL_LEDGERS
     } else {
@@ -306,7 +306,7 @@ pub struct CoordinatorContract;
 #[contractimpl]
 impl CoordinatorContract {
     /// One-time initialization. Stores the admin and the addresses of the
-    /// request, inventory, and payment contracts the coordinator drives.
+    /// request, inventory, and payment contracts this coordinator drives.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -317,6 +317,7 @@ impl CoordinatorContract {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(CoordinatorError::AlreadyInitialized);
         }
+
         admin.require_auth();
 
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -331,261 +332,292 @@ impl CoordinatorContract {
             .set(&DataKey::PaymentContract, &payment_contract);
         env.storage()
             .instance()
+            .set(&DataKey::EmergencyHalt, &false);
+        env.storage()
+            .instance()
             .set(&DataKey::Version, &CONTRACT_VERSION);
 
         CoordInitialized { admin }.publish(&env);
         Ok(())
     }
 
-    /// Emergency halt: admin-only circuit breaker. Marks the coordinator halted
-    /// so no further workflow steps can proceed.
-    pub fn emergency_halt(env: Env, admin: Address) -> Result<(), CoordinatorError> {
+    /// Emergency halt: blocks all state-mutating workflow operations.
+    pub fn emergency_halt(env: Env) -> Result<(), CoordinatorError> {
+        let admin = get_admin(&env)?;
         admin.require_auth();
-        let stored_admin = get_admin(&env)?;
-        if admin != stored_admin {
-            return Err(CoordinatorError::Unauthorized);
-        }
-        env.storage().instance().set(&DataKey::Halted, &true);
+        env.storage().instance().set(&DataKey::EmergencyHalt, &true);
         CoordEmergencyHalt { admin }.publish(&env);
         Ok(())
     }
 
-    /// Step 1: reserve inventory units for a pending request.
+    /// Clears the emergency halt, re-enabling workflow operations.
+    pub fn resume(env: Env) -> Result<(), CoordinatorError> {
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::EmergencyHalt, &false);
+        Ok(())
+    }
+
+    fn require_not_halted(env: &Env) -> Result<(), CoordinatorError> {
+        let halted: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::EmergencyHalt)
+            .unwrap_or(false);
+        if halted {
+            return Err(CoordinatorError::EmergencyHalted);
+        }
+        Ok(())
+    }
+
+    /// Step 1: reserve inventory units for an approved request.
+    ///
+    /// The request must be `Pending`. Units are reserved in the inventory
+    /// contract and a workflow record is created in `Allocated` state.
     pub fn allocate_units(
         env: Env,
         request_id: u64,
         unit_ids: Vec<u64>,
-        caller: Address,
     ) -> Result<(), CoordinatorError> {
-        caller.require_auth();
         Self::require_not_halted(&env)?;
 
-        if load_workflow(&env, request_id).is_some() {
-            return Err(CoordinatorError::WorkflowAlreadyExists);
-        }
-
-        let request_contract = get_contract_address(&env, &DataKey::RequestContract)?;
-        let request_client = RequestContractClient::new(&env, &request_contract);
-        let request = request_client.get_request(&request_id);
-        if request.status != RequestStatus::Pending {
-            return Err(CoordinatorError::InvalidRequestStatus);
-        }
-
-        let inventory_contract = get_contract_address(&env, &DataKey::InventoryContract)?;
-        let inventory_client = InventoryContractClient::new(&env, &inventory_contract);
         let admin = get_admin(&env)?;
-        for unit_id in unit_ids.iter() {
-            inventory_client.update_status(
-                &unit_id,
-                &BloodStatus::Reserved,
-                &admin,
-                &None,
-            );
+        admin.require_auth();
+
+        if unit_ids.is_empty() {
+            return Err(CoordinatorError::NoUnitsProvided);
         }
 
-        let workflow = WorkflowRecord {
+        // A request_id may only be allocated once while its workflow is live.
+        // Once the prior workflow is terminal (Settled/RolledBack) the id may
+        // be reused for a brand-new workflow.
+        if let Some(existing) = load_workflow(&env, request_id) {
+            if !is_terminal(existing.status) {
+                return Err(CoordinatorError::WorkflowAlreadyExists);
+            }
+        }
+
+        let req_addr: Address = get_contract_address(&env, &DataKey::RequestContract)?;
+        let req_client = RequestContractClient::new(&env, &req_addr);
+        let request = req_client.get_request(&request_id);
+
+        if request.status != RequestStatus::Pending {
+            return Err(CoordinatorError::RequestNotPending);
+        }
+
+        let inv_addr: Address = get_contract_address(&env, &DataKey::InventoryContract)?;
+        let inv_client = InventoryContractClient::new(&env, &inv_addr);
+        let inv_admin = inv_client.get_admin();
+
+        for i in 0..unit_ids.len() {
+            let uid = unit_ids.get(i).unwrap();
+            inv_client
+                .try_update_status(&uid, &BloodStatus::Reserved, &inv_admin, &None)
+                .map_err(|_| CoordinatorError::InventoryUpdateFailed)?
+                .map_err(|_| CoordinatorError::InventoryUpdateFailed)?;
+        }
+
+        let wf = WorkflowRecord {
             request_id,
             status: WorkflowStatus::Allocated,
             unit_ids: unit_ids.clone(),
-            allocated_at: env.ledger().timestamp(),
             payment_id: 0,
+            allocated_at: env.ledger().timestamp(),
+            delivered_at: 0,
         };
-        save_workflow(&env, &workflow);
+        save_workflow(&env, &wf);
 
         CoordAllocated {
             request_id,
             unit_ids,
-            unit_count: workflow.unit_ids.len(),
+            unit_count: wf.unit_ids.len(),
         }
         .publish(&env);
+
         Ok(())
     }
 
-    /// Step 2: mark the allocated units as delivered.
+    /// Step 2: mark all reserved units as delivered.
+    ///
+    /// The workflow must be `Allocated`.
     pub fn confirm_delivery(
         env: Env,
         request_id: u64,
         location: String,
-        caller: Address,
     ) -> Result<(), CoordinatorError> {
-        caller.require_auth();
         Self::require_not_halted(&env)?;
 
-        let mut workflow =
-            load_workflow(&env, request_id).ok_or(CoordinatorError::WorkflowNotFound)?;
-        if workflow.status != WorkflowStatus::Allocated {
-            return Err(CoordinatorError::InvalidWorkflowStatus);
-        }
-
-        let inventory_contract = get_contract_address(&env, &DataKey::InventoryContract)?;
-        let inventory_client = InventoryContractClient::new(&env, &inventory_contract);
         let admin = get_admin(&env)?;
-        for unit_id in workflow.unit_ids.iter() {
-            inventory_client.mark_delivered(&unit_id, &admin, &location);
+        admin.require_auth();
+
+        let mut wf = load_workflow(&env, request_id).ok_or(CoordinatorError::WorkflowNotFound)?;
+
+        if wf.status != WorkflowStatus::Allocated {
+            return Err(CoordinatorError::InvalidWorkflowState);
         }
 
-        workflow.status = WorkflowStatus::Delivered;
-        save_workflow(&env, &workflow);
+        let inv_addr: Address = get_contract_address(&env, &DataKey::InventoryContract)?;
+        let inv_client = InventoryContractClient::new(&env, &inv_addr);
+        let inv_admin = inv_client.get_admin();
+
+        for i in 0..wf.unit_ids.len() {
+            let uid = wf.unit_ids.get(i).unwrap();
+            inv_client
+                .try_mark_delivered(&uid, &inv_admin, &location)
+                .map_err(|_| CoordinatorError::InventoryUpdateFailed)?
+                .map_err(|_| CoordinatorError::InventoryUpdateFailed)?;
+        }
+
+        wf.status = WorkflowStatus::Delivered;
+        wf.delivered_at = env.ledger().timestamp();
+        save_workflow(&env, &wf);
 
         CoordDelivered {
             request_id,
             location,
         }
         .publish(&env);
+
         Ok(())
     }
 
-    /// Step 3: release the escrowed payment for a delivered workflow.
+    /// Step 3: release escrowed payment for a delivered workflow.
+    ///
+    /// The workflow must be `Delivered`.
     pub fn settle_payment(
         env: Env,
         request_id: u64,
         payment_id: u64,
-        caller: Address,
     ) -> Result<(), CoordinatorError> {
-        caller.require_auth();
         Self::require_not_halted(&env)?;
 
-        let mut workflow =
-            load_workflow(&env, request_id).ok_or(CoordinatorError::WorkflowNotFound)?;
-        if workflow.status != WorkflowStatus::Delivered {
-            return Err(CoordinatorError::InvalidWorkflowStatus);
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+
+        let mut wf = load_workflow(&env, request_id).ok_or(CoordinatorError::WorkflowNotFound)?;
+
+        if wf.status != WorkflowStatus::Delivered {
+            return Err(CoordinatorError::InvalidWorkflowState);
         }
 
-        let payment_contract = get_contract_address(&env, &DataKey::PaymentContract)?;
-        let payment_client = PaymentContractClient::new(&env, &payment_contract);
-        let coordinator = env.current_contract_address();
-        payment_client.update_status(
-            &payment_id,
-            &PaymentStatus::Released,
-            &coordinator,
-        );
+        let pay_addr: Address = get_contract_address(&env, &DataKey::PaymentContract)?;
+        let pay_client = PaymentContractClient::new(&env, &pay_addr);
 
-        workflow.status = WorkflowStatus::Settled;
-        workflow.payment_id = payment_id;
-        save_workflow(&env, &workflow);
+        pay_client.update_status(&payment_id, &PaymentStatus::Released, &admin);
+
+        wf.status = WorkflowStatus::Settled;
+        wf.payment_id = payment_id;
+        save_workflow(&env, &wf);
 
         CoordSettled {
             request_id,
             payment_id,
         }
         .publish(&env);
+
         Ok(())
     }
 
-    /// Roll back an allocated or delivered workflow, refunding escrow and
-    /// freeing reserved units.
-    pub fn rollback(env: Env, request_id: u64, caller: Address) -> Result<(), CoordinatorError> {
-        caller.require_auth();
+    /// Rolls back an in-flight allocation, returning reserved units to the
+    /// available pool.
+    ///
+    /// Only an `Allocated` workflow may be rolled back. Terminal states
+    /// (`Settled`, `RolledBack`) and post-delivery states (`Delivered`) are
+    /// rejected: unit IDs are a global, reusable pool, so replaying a rollback
+    /// against an already-terminal workflow could release units that have since
+    /// been reserved by a different, active workflow.
+    pub fn rollback(env: Env, request_id: u64) -> Result<(), CoordinatorError> {
         Self::require_not_halted(&env)?;
 
-        let mut workflow =
-            load_workflow(&env, request_id).ok_or(CoordinatorError::WorkflowNotFound)?;
-        if is_terminal(workflow.status) {
-            return Err(CoordinatorError::InvalidWorkflowStatus);
-        }
-
-        let inventory_contract = get_contract_address(&env, &DataKey::InventoryContract)?;
-        let inventory_client = InventoryContractClient::new(&env, &inventory_contract);
         let admin = get_admin(&env)?;
-        for unit_id in workflow.unit_ids.iter() {
-            inventory_client.update_status(
-                &unit_id,
-                &BloodStatus::Available,
-                &admin,
-                &None,
-            );
+        admin.require_auth();
+
+        let mut wf = load_workflow(&env, request_id).ok_or(CoordinatorError::WorkflowNotFound)?;
+
+        // Whitelist guard: only an Allocated workflow may be rolled back.
+        // This rejects Settled, Delivered, and RolledBack (already terminal),
+        // preventing a replayed rollback from mutating units now held by a
+        // different, active workflow.
+        if wf.status != WorkflowStatus::Allocated {
+            return Err(CoordinatorError::InvalidWorkflowState);
         }
 
-        if workflow.payment_id != 0 {
-            let payment_contract = get_contract_address(&env, &DataKey::PaymentContract)?;
-            let payment_client = PaymentContractClient::new(&env, &payment_contract);
-            let coordinator = env.current_contract_address();
-            payment_client.update_status(
-                &workflow.payment_id,
-                &PaymentStatus::Refunded,
-                &coordinator,
-            );
+        let inv_addr: Address = get_contract_address(&env, &DataKey::InventoryContract)?;
+        let inv_client = InventoryContractClient::new(&env, &inv_addr);
+        let inv_admin = inv_client.get_admin();
+
+        for i in 0..wf.unit_ids.len() {
+            let uid = wf.unit_ids.get(i).unwrap();
+            inv_client
+                .try_update_status(&uid, &BloodStatus::Available, &inv_admin, &None)
+                .map_err(|_| CoordinatorError::InventoryUpdateFailed)?
+                .map_err(|_| CoordinatorError::InventoryUpdateFailed)?;
         }
 
-        workflow.status = WorkflowStatus::RolledBack;
-        save_workflow(&env, &workflow);
+        wf.status = WorkflowStatus::RolledBack;
+        save_workflow(&env, &wf);
 
         CoordRolledBack { request_id }.publish(&env);
+
         Ok(())
     }
 
-    /// Expire a workflow that has exceeded the timeout window, rolling it back.
+    /// Expires a stale allocation after `WORKFLOW_TIMEOUT_SECS`.
+    ///
+    /// Only an `Allocated` workflow may be expired.
     pub fn expire_workflow(env: Env, request_id: u64) -> Result<(), CoordinatorError> {
         Self::require_not_halted(&env)?;
 
-        let mut workflow =
-            load_workflow(&env, request_id).ok_or(CoordinatorError::WorkflowNotFound)?;
-        if is_terminal(workflow.status) {
-            return Err(CoordinatorError::InvalidWorkflowStatus);
+        let mut wf = load_workflow(&env, request_id).ok_or(CoordinatorError::WorkflowNotFound)?;
+
+        if wf.status != WorkflowStatus::Allocated {
+            return Err(CoordinatorError::InvalidWorkflowState);
         }
 
         let now = env.ledger().timestamp();
-        if now < workflow.allocated_at + WORKFLOW_TIMEOUT_SECS {
+        if now < wf.allocated_at + WORKFLOW_TIMEOUT_SECS {
             return Err(CoordinatorError::WorkflowNotExpired);
         }
 
-        let inventory_contract = get_contract_address(&env, &DataKey::InventoryContract)?;
-        let inventory_client = InventoryContractClient::new(&env, &inventory_contract);
-        let admin = get_admin(&env)?;
-        for unit_id in workflow.unit_ids.iter() {
-            inventory_client.update_status(
-                &unit_id,
-                &BloodStatus::Available,
-                &admin,
-                &None,
-            );
+        let inv_addr: Address = get_contract_address(&env, &DataKey::InventoryContract)?;
+        let inv_client = InventoryContractClient::new(&env, &inv_addr);
+        let inv_admin = inv_client.get_admin();
+
+        for i in 0..wf.unit_ids.len() {
+            let uid = wf.unit_ids.get(i).unwrap();
+            inv_client
+                .try_update_status(&uid, &BloodStatus::Available, &inv_admin, &None)
+                .map_err(|_| CoordinatorError::InventoryUpdateFailed)?
+                .map_err(|_| CoordinatorError::InventoryUpdateFailed)?;
         }
 
-        if workflow.payment_id != 0 {
-            let payment_contract = get_contract_address(&env, &DataKey::PaymentContract)?;
-            let payment_client = PaymentContractClient::new(&env, &payment_contract);
-            let coordinator = env.current_contract_address();
-            payment_client.update_status(
-                &workflow.payment_id,
-                &PaymentStatus::Refunded,
-                &coordinator,
-            );
-        }
-
-        workflow.status = WorkflowStatus::RolledBack;
-        save_workflow(&env, &workflow);
+        wf.status = WorkflowStatus::RolledBack;
+        save_workflow(&env, &wf);
 
         CoordExpired { request_id }.publish(&env);
+
         Ok(())
     }
 
-    /// Flag a temperature breach on a delivered unit, raising a dispute on the
-    /// associated payment.
-    pub fn flag_temperature_breach(
+    /// Records a temperature excursion against a payment and unit.
+    pub fn report_temperature_breach(
         env: Env,
-        request_id: u64,
-        unit_id: u64,
         payment_id: u64,
-        case_id: String,
-        caller: Address,
+        unit_id: u64,
     ) -> Result<(), CoordinatorError> {
-        caller.require_auth();
         Self::require_not_halted(&env)?;
 
-        let workflow =
-            load_workflow(&env, request_id).ok_or(CoordinatorError::WorkflowNotFound)?;
-        if workflow.status != WorkflowStatus::Delivered {
-            return Err(CoordinatorError::InvalidWorkflowStatus);
-        }
+        let admin = get_admin(&env)?;
+        admin.require_auth();
 
-        let payment_contract = get_contract_address(&env, &DataKey::PaymentContract)?;
-        let payment_client = PaymentContractClient::new(&env, &payment_contract);
-        let coordinator = env.current_contract_address();
-        payment_client.record_dispute(
+        let pay_addr: Address = get_contract_address(&env, &DataKey::PaymentContract)?;
+        let pay_client = PaymentContractClient::new(&env, &pay_addr);
+
+        pay_client.record_dispute(
             &payment_id,
             &payment_client::DisputeReason::TemperatureExcursion,
-            &case_id,
-            &coordinator,
+            &String::from_str(&env, "temp-breach"),
+            &admin,
         );
 
         CoordTemperatureBreach {
@@ -594,28 +626,12 @@ impl CoordinatorContract {
             timestamp: env.ledger().timestamp(),
         }
         .publish(&env);
+
         Ok(())
     }
 
-    /// Read the workflow record for a request.
-    pub fn get_workflow(env: Env, request_id: u64) -> Option<WorkflowRecord> {
-        load_workflow(&env, request_id)
-    }
-
-    /// Read the stored admin address.
-    pub fn get_admin_address(env: Env) -> Result<Address, CoordinatorError> {
-        get_admin(&env)
-    }
-
-    fn require_not_halted(env: &Env) -> Result<(), CoordinatorError> {
-        let halted: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::Halted)
-            .unwrap_or(false);
-        if halted {
-            return Err(CoordinatorError::Halted);
-        }
-        Ok(())
+    /// Read-only accessor for a workflow record.
+    pub fn get_workflow(env: Env, request_id: u64) -> Result<WorkflowRecord, CoordinatorError> {
+        load_workflow(&env, request_id).ok_or(CoordinatorError::WorkflowNotFound)
     }
 }
