@@ -8,6 +8,20 @@ import {
   HttpStatus,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { Type } from 'class-transformer';
+import {
+  ArrayMaxSize,
+  IsArray,
+  IsEnum,
+  IsInt,
+  IsNotEmpty,
+  IsNumber,
+  IsOptional,
+  IsString,
+  IsUUID,
+  Min,
+  ValidateNested,
+} from 'class-validator';
 
 import { RequirePermissions } from '../../auth/decorators/require-permissions.decorator';
 import { Permission } from '../../auth/enums/permission.enum';
@@ -25,6 +39,39 @@ import {
   ApiLegacyAdapter,
 } from '../../common/versioning/api-compatibility.decorator';
 
+/**
+ * Validated body for the match endpoints. Replaces the previous bare
+ * TypeScript interface so the global ValidationPipe actually enforces
+ * the shape of the payload before it reaches the service.
+ */
+export class MatchRequestDto implements MatchingRequest {
+  @IsUUID()
+  @IsNotEmpty()
+  requestId: string;
+
+  @IsUUID()
+  @IsNotEmpty()
+  hospitalId: string;
+
+  @IsOptional()
+  @IsString()
+  bloodType?: string;
+
+  @IsOptional()
+  @IsEnum(['low', 'medium', 'high', 'critical'])
+  urgency?: 'low' | 'medium' | 'high' | 'critical';
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  quantityMl?: number;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  maxResults?: number;
+}
+
 @ApiTags('Blood Matching')
 @ApiBearerAuth()
 @Controller('blood-matching')
@@ -34,22 +81,22 @@ export class BloodMatchingController {
     private readonly compatibilityEngine: BloodCompatibilityEngine,
   ) {}
 
-  @RequirePermissions(Permission.VIEW_BLOOD_REQUESTS)
+  @RequirePermissions(Permission.ALLOCATE_BLOOD_UNITS)
   @ApiOperation({ summary: 'Post match' })
   @ApiResponse({ status: 201, description: 'Resource created successfully' })
   @Post('match')
   @HttpCode(HttpStatus.OK)
-  findMatches(@Body() request: MatchingRequest): Promise<MatchingResponse> {
+  findMatches(@Body() request: MatchRequestDto): Promise<MatchingResponse> {
     return this.matchingService.findMatches(request);
   }
 
-  @RequirePermissions(Permission.VIEW_BLOOD_REQUESTS)
+  @RequirePermissions(Permission.ALLOCATE_BLOOD_UNITS)
   @ApiOperation({ summary: 'Post match multiple' })
   @ApiResponse({ status: 201, description: 'Resource created successfully' })
   @Post('match-multiple')
   @HttpCode(HttpStatus.OK)
   findMatchesForMultipleRequests(
-    @Body() requests: MatchingRequest[],
+    @Body() requests: MatchRequestDto[],
   ): Promise<MatchingResponse[]> {
     return this.matchingService.findMatchesForMultipleRequests(requests);
   }
