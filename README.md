@@ -109,3 +109,6 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1490 -->
 - #1490: [backend/auth] Account lockout is never enforced — ensureAccountIsUsable() has no throw for a still-locked account
+
+<!-- handsoff-issue-1444 -->
+- #1444: [contracts] cancel_request can cancel Rejected, Disputed, and Resolved requests, which the request state machine forbids
