@@ -115,3 +115,6 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1450 -->
 - #1450: [lifebank/identity] register_organization silently overwrites an existing organization record, letting any org wipe its own accumulated rating/reputation on demand
+
+<!-- handsoff-issue-1451 -->
+- #1451: [lifebank/identity] get_verified_organizations/get_top_rated_organizations perform an unbounded full scan of OrgTypeList with no offset/cursor, regressing as registrations
