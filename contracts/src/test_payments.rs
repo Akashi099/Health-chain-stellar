@@ -486,17 +486,15 @@ fn setup_dispute_contract(
 }
 
 fn move_payment_to_disputed_ready_state(env: &Env, contract_id: &Address, payment_id: u64) {
-    env.as_contract(contract_id, || {
-        let mut payment = env
-            .storage()
-            .persistent()
-            .get::<crate::DataKey, crate::payments::Payment>(&crate::DataKey::Payment(payment_id))
-            .unwrap();
-        payment.status = PaymentStatus::Escrowed;
+    // Fund the escrow through the real Pending -> Escrowed entrypoint (#1431).
+    let payer = env.as_contract(contract_id, || {
         env.storage()
             .persistent()
-            .set(&crate::DataKey::Payment(payment_id), &payment);
+            .get::<crate::DataKey, crate::payments::Payment>(&crate::DataKey::Payment(payment_id))
+            .unwrap()
+            .payer
     });
+    HealthChainContractClient::new(env, contract_id).fund_escrow(&payment_id, &payer);
 }
 
 #[test]
@@ -506,7 +504,7 @@ fn auto_refund_after_timeout() {
     let payer = Address::generate(&env);
     let payee = Address::generate(&env);
     let asset = Address::generate(&env);
-    let raiser = Address::generate(&env);
+    let raiser = payer.clone();
 
     client.set_dispute_timeout(&10);
     let payment_id = client.create_payment(
@@ -602,7 +600,7 @@ fn no_refund_before_deadline() {
     let payer = Address::generate(&env);
     let payee = Address::generate(&env);
     let asset = Address::generate(&env);
-    let raiser = Address::generate(&env);
+    let raiser = payer.clone();
 
     client.set_dispute_timeout(&10);
     let payment_id = client.create_payment(
@@ -769,7 +767,7 @@ fn manual_resolution_prevents_refund() {
     let payer = Address::generate(&env);
     let payee = Address::generate(&env);
     let asset = Address::generate(&env);
-    let raiser = Address::generate(&env);
+    let raiser = payer.clone();
 
     client.set_dispute_timeout(&10);
     let payment_id = client.create_payment(
@@ -1541,4 +1539,285 @@ fn fee_structure_validate_fee_cap_fails_on_zero_gross() {
         fee.validate_fee_cap(0),
         Err(PaymentError::InvalidAmount)
     );
+}
+
+fn payment_status(env: &Env, contract_id: &Address, payment_id: u64) -> PaymentStatus {
+    env.as_contract(contract_id, || {
+        env.storage()
+            .persistent()
+            .get::<crate::DataKey, Payment>(&crate::DataKey::Payment(payment_id))
+            .unwrap()
+            .status
+    })
+}
+
+// ── #1429: raise_dispute compiles and validates the evidence digest ─────────
+
+#[test]
+fn raise_dispute_rejects_non_sha256_evidence_digest() {
+    let env = Env::default();
+    let (contract_id, client, admin) = setup_dispute_contract(&env);
+    let payer = Address::generate(&env);
+    let payee = Address::generate(&env);
+    let asset = Address::generate(&env);
+
+    let payment_id = client.create_payment(
+        &1,
+        &payer,
+        &payee,
+        &1_000,
+        &asset,
+        &default_fee_structure(&env),
+        &admin,
+    );
+    move_payment_to_disputed_ready_state(&env, &contract_id, payment_id);
+
+    let result = client.try_raise_dispute(
+        &payment_id,
+        &payer,
+        &String::from_str(&env, "short_digest"),
+        &Bytes::from_slice(&env, &[7; 31]),
+        &vec![&env],
+    );
+    assert_eq!(result, Err(Ok(crate::Error::InvalidEvidenceDigest)));
+    assert_eq!(
+        payment_status(&env, &contract_id, payment_id),
+        PaymentStatus::Escrowed
+    );
+}
+
+#[test]
+fn raise_dispute_persists_dispute_and_deadline_metadata() {
+    let env = Env::default();
+    let (contract_id, client, admin) = setup_dispute_contract(&env);
+    let payer = Address::generate(&env);
+    let payee = Address::generate(&env);
+    let asset = Address::generate(&env);
+
+    client.set_dispute_timeout(&100);
+    let payment_id = client.create_payment(
+        &1,
+        &payer,
+        &payee,
+        &1_000,
+        &asset,
+        &default_fee_structure(&env),
+        &admin,
+    );
+    move_payment_to_disputed_ready_state(&env, &contract_id, payment_id);
+
+    let raised_at = env.ledger().timestamp();
+    let dispute_id = client.raise_dispute(
+        &payment_id,
+        &payee,
+        &String::from_str(&env, "not_delivered"),
+        &Bytes::from_slice(&env, &[9; 32]),
+        &vec![&env],
+    );
+
+    env.as_contract(&contract_id, || {
+        let dispute = env
+            .storage()
+            .persistent()
+            .get::<crate::DataKey, Dispute>(&crate::DataKey::Dispute(dispute_id))
+            .unwrap();
+        assert_eq!(dispute.payment_id, payment_id);
+        assert_eq!(dispute.raised_by, payee);
+
+        let metadata = env
+            .storage()
+            .persistent()
+            .get::<crate::DataKey, DisputeMetadata>(&crate::DataKey::DisputeMetadata(dispute_id))
+            .unwrap();
+        assert_eq!(metadata.dispute_deadline, raised_at + 100);
+    });
+    assert_eq!(
+        payment_status(&env, &contract_id, payment_id),
+        PaymentStatus::Disputed
+    );
+}
+
+#[test]
+fn auto_refund_is_persisted_and_not_repeated() {
+    let env = Env::default();
+    let (contract_id, client, admin) = setup_dispute_contract(&env);
+    let payer = Address::generate(&env);
+    let payee = Address::generate(&env);
+    let asset = Address::generate(&env);
+
+    client.set_dispute_timeout(&10);
+    let payment_id = client.create_payment(
+        &1,
+        &payer,
+        &payee,
+        &5_000,
+        &asset,
+        &default_fee_structure(&env),
+        &admin,
+    );
+    move_payment_to_disputed_ready_state(&env, &contract_id, payment_id);
+    let dispute_id = client.raise_dispute(
+        &payment_id,
+        &payer,
+        &String::from_str(&env, "timeout_case"),
+        &Bytes::from_slice(&env, &[1; 32]),
+        &vec![&env],
+    );
+
+    env.ledger().with_mut(|ledger| {
+        ledger.timestamp += 11;
+    });
+
+    let dispute_ids = vec![&env, dispute_id];
+    assert_eq!(client.process_expired_disputes(&dispute_ids), 1);
+    assert_eq!(
+        payment_status(&env, &contract_id, payment_id),
+        PaymentStatus::Refunded
+    );
+
+    // A second sweep must not refund or count the same dispute again.
+    assert_eq!(client.process_expired_disputes(&dispute_ids), 0);
+    let stats = client.get_payment_stats();
+    assert_eq!(stats.count_auto_refunded, 1);
+    assert_eq!(stats.total_auto_refunded, 5_000);
+}
+
+// ── #1431: payments start Pending and fund_escrow is reachable ──────────────
+
+#[test]
+fn create_payment_starts_pending_and_fund_escrow_moves_to_escrowed() {
+    let env = Env::default();
+    let (contract_id, client, admin) = setup_dispute_contract(&env);
+    let payer = Address::generate(&env);
+    let payee = Address::generate(&env);
+    let asset = Address::generate(&env);
+
+    let payment_id = client.create_payment(
+        &1,
+        &payer,
+        &payee,
+        &1_000,
+        &asset,
+        &default_fee_structure(&env),
+        &admin,
+    );
+    assert_eq!(
+        payment_status(&env, &contract_id, payment_id),
+        PaymentStatus::Pending
+    );
+
+    // Unfunded payments cannot be disputed or released.
+    let dispute = client.try_raise_dispute(
+        &payment_id,
+        &payer,
+        &String::from_str(&env, "early"),
+        &Bytes::from_slice(&env, &[1; 32]),
+        &vec![&env],
+    );
+    assert_eq!(dispute, Err(Ok(crate::Error::InvalidTransition)));
+    let release = client.try_propose_release(&payment_id, &admin);
+    assert_eq!(release, Err(Ok(crate::Error::InvalidPaymentStatus)));
+
+    client.fund_escrow(&payment_id, &payer);
+    assert_eq!(
+        payment_status(&env, &contract_id, payment_id),
+        PaymentStatus::Escrowed
+    );
+
+    // Funding twice is rejected — Escrowed -> Escrowed is not a transition.
+    let again = client.try_fund_escrow(&payment_id, &payer);
+    assert_eq!(again, Err(Ok(crate::Error::InvalidPaymentStatus)));
+}
+
+#[test]
+fn fund_escrow_rejects_non_payer() {
+    let env = Env::default();
+    let (contract_id, client, admin) = setup_dispute_contract(&env);
+    let payer = Address::generate(&env);
+    let payee = Address::generate(&env);
+    let asset = Address::generate(&env);
+
+    let payment_id = client.create_payment(
+        &1,
+        &payer,
+        &payee,
+        &1_000,
+        &asset,
+        &default_fee_structure(&env),
+        &admin,
+    );
+
+    let result = client.try_fund_escrow(&payment_id, &payee);
+    assert_eq!(result, Err(Ok(crate::Error::Unauthorized)));
+    assert_eq!(
+        payment_status(&env, &contract_id, payment_id),
+        PaymentStatus::Pending
+    );
+}
+
+#[test]
+fn funded_low_value_payment_can_be_released_by_admin() {
+    let env = Env::default();
+    let (contract_id, client, admin) = setup_dispute_contract(&env);
+    let payer = Address::generate(&env);
+    let payee = Address::generate(&env);
+    let asset = Address::generate(&env);
+
+    let payment_id = client.create_payment(
+        &1,
+        &payer,
+        &payee,
+        &1_000,
+        &asset,
+        &default_fee_structure(&env),
+        &admin,
+    );
+    client.fund_escrow(&payment_id, &payer);
+    satisfy_escrow_conditions(&env, &contract_id, payment_id, &admin);
+
+    assert!(client.propose_release(&payment_id, &admin));
+    assert_eq!(
+        payment_status(&env, &contract_id, payment_id),
+        PaymentStatus::Completed
+    );
+}
+
+// ── #1430: payment/dispute records get their TTL extended on write ─────────
+
+#[test]
+fn payment_escrow_and_dispute_records_have_extended_ttl() {
+    use soroban_sdk::testutils::storage::Persistent as _;
+
+    let env = Env::default();
+    let (contract_id, client, admin) = setup_dispute_contract(&env);
+    let payer = Address::generate(&env);
+    let payee = Address::generate(&env);
+    let asset = Address::generate(&env);
+
+    let payment_id = client.create_payment(
+        &1,
+        &payer,
+        &payee,
+        &1_000,
+        &asset,
+        &default_fee_structure(&env),
+        &admin,
+    );
+    client.fund_escrow(&payment_id, &payer);
+    let dispute_id = client.raise_dispute(
+        &payment_id,
+        &payer,
+        &String::from_str(&env, "ttl"),
+        &Bytes::from_slice(&env, &[4; 32]),
+        &vec![&env],
+    );
+
+    let min_ttl = crate::storage_lifecycle::MIN_TTL_LEDGERS;
+    env.as_contract(&contract_id, || {
+        let storage = env.storage().persistent();
+        assert!(storage.get_ttl(&crate::DataKey::Payment(payment_id)) >= min_ttl);
+        assert!(storage.get_ttl(&crate::DataKey::EscrowAccount(payment_id)) >= min_ttl);
+        assert!(storage.get_ttl(&crate::DataKey::Dispute(dispute_id)) >= min_ttl);
+        assert!(storage.get_ttl(&crate::DataKey::DisputeMetadata(dispute_id)) >= min_ttl);
+    });
 }

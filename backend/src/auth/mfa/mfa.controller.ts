@@ -13,6 +13,7 @@ import {
   ApiResponse,
   ApiTags,
 } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
 import { IsNotEmpty, IsString, Matches } from 'class-validator';
 
 import { Public } from '../decorators/public.decorator';
@@ -29,6 +30,10 @@ export class MfaLoginChallengeDto {
   @IsString()
   @IsNotEmpty()
   user_id: string;
+
+  @IsString()
+  @IsNotEmpty()
+  mfa_challenge: string;
 
   @IsString()
   @IsNotEmpty()
@@ -84,21 +89,26 @@ export class MfaController {
   }
 
   @Public()
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
   @Post('login-challenge')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
     summary: 'Complete step-up MFA login',
     description:
-      'Unauthenticated endpoint used after login() returns { mfa_required: true, user_id }. ' +
-      'Accepts the user_id and a valid TOTP code, and returns a short-lived mfaToken ' +
-      'that must be exchanged for a full access token via POST /auth/mfa/exchange.',
+      'Unauthenticated endpoint used after login() returns { mfa_required: true, user_id, mfa_challenge }. ' +
+      'Accepts the user_id, the single-use mfa_challenge and a valid TOTP code, and returns a ' +
+      'short-lived, single-use mfaToken that must be exchanged via POST /auth/mfa/exchange.',
   })
   @ApiResponse({
     status: 200,
     schema: { example: { mfaToken: 'eyJ...' } },
   })
   async loginChallenge(@Body() dto: MfaLoginChallengeDto) {
-    return this.mfaService.validateMfaCode(dto.user_id, dto.token);
+    return this.mfaService.validateLoginChallenge(
+      dto.user_id,
+      dto.mfa_challenge,
+      dto.token,
+    );
   }
 
   @Delete('disable')

@@ -14,6 +14,7 @@ import Redis from 'ioredis';
 
 import { WsAuthService, AuthenticatedSocket } from './ws-auth.service';
 import { JwtKeyService } from './jwt-key.service';
+import { SessionStatusService } from './session-status.service';
 import { SecurityEventLoggerService, SecurityEventType } from '../user-activity/security-event-logger.service';
 import { REDIS_CLIENT } from '../redis/redis.constants';
 
@@ -85,6 +86,10 @@ describe('WsAuthService', () => {
         { provide: JwtKeyService, useValue: jwtKeyService },
         { provide: REDIS_CLIENT, useValue: redis },
         { provide: SecurityEventLoggerService, useValue: securityEventLogger },
+        {
+          provide: SessionStatusService,
+          useValue: { isSessionActive: jest.fn().mockResolvedValue(true) },
+        },
       ],
     }).compile();
 
