@@ -112,3 +112,6 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1460 -->
 - #1460: [lifebank/payments] Vesting schedules and escrow payments share one undifferentiated per-token balance with no reservation accounting
+
+<!-- handsoff-issue-1461 -->
+- #1461: [lifebank/reputation] resolve_penalty bypasses the pause() circuit breaker entirely
