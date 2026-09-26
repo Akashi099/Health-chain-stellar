@@ -32,15 +32,6 @@ export class RegisterDto {
   password: string;
 
   @ApiProperty({
-    description: 'User role',
-    example: 'donor',
-    required: false,
-  })
-  @IsString()
-  @IsOptional()
-  role?: string;
-
-  @ApiProperty({
     description: 'User full name',
     example: 'John Doe',
     required: false,

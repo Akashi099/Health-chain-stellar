@@ -104,8 +104,8 @@ For contract deployment, full environment variable reference, and contributor gu
 
 ## Handsoff notes
 
-<!-- handsoff-issue-1485 -->
-- #1485: [lifebank/temperature] pause() does not block propose_threshold_change/apply_threshold_change, contradicting its "all state-mutating functions" contract
+<!-- handsoff-issue-1291 -->
+- #1291: [contracts/temperature] log_reading never emits an event for detected violations
 
-<!-- handsoff-issue-1486 -->
-- #1486: [lifebank/temperature] set_threshold/propose_threshold_change never bound min/max to a plausible range, letting cold-chain breach detection be silently disabled
+<!-- handsoff-issue-1490 -->
+- #1490: [backend/auth] Account lockout is never enforced — ensureAccountIsUsable() has no throw for a still-locked account
