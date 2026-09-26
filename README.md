@@ -112,3 +112,6 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1452 -->
 - #1452: [lifebank/payments] Mirrored BloodRequest struct is missing a field, so every cross-call to the requests contract fails and create_payment/create_escrow become permanently
+
+<!-- handsoff-issue-1454 -->
+- #1454: [lifebank/payments] index_by_request never extends its persistent-storage TTL, letting the DuplicatePayment guard silently expire
