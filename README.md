@@ -109,3 +109,6 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1490 -->
 - #1490: [backend/auth] Account lockout is never enforced — ensureAccountIsUsable() has no throw for a still-locked account
+
+<!-- handsoff-issue-1441 -->
+- #1441: [contracts] confirm_transfer's expiry-recovery branch writes state and then returns Err, so Soroban rolls all of it back
