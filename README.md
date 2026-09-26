@@ -104,5 +104,8 @@ For contract deployment, full environment variable reference, and contributor gu
 
 ## Handsoff notes
 
-<!-- handsoff-issue-1531 -->
-- #1531: [backend/route-deviation] RouteDeviationService injects three classes it never imports, breaking compilation and DI
+<!-- handsoff-issue-1485 -->
+- #1485: [lifebank/temperature] pause() does not block propose_threshold_change/apply_threshold_change, contradicting its "all state-mutating functions" contract
+
+<!-- handsoff-issue-1486 -->
+- #1486: [lifebank/temperature] set_threshold/propose_threshold_change never bound min/max to a plausible range, letting cold-chain breach detection be silently disabled
