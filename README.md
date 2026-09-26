@@ -101,3 +101,8 @@ For contract deployment, full environment variable reference, and contributor gu
 | `lifebank-soroban/` | [Lifebank Soroban README](./lifebank-soroban/README.md) |
 | `docs/contracts/` | [Contract Reference Docs](./docs/contracts/) |
 | `docs/architecture.md` | [Architecture Diagram](./docs/architecture.md) |
+
+## Handsoff notes
+
+<!-- handsoff-issue-1291 -->
+- #1291: [contracts/temperature] log_reading never emits an event for detected violations
