@@ -3,7 +3,9 @@
 ## Architecture Decision Record
 
 ### Decision
-Replace external address re-signing with contract-level trust verification for cross-contract authorization in reservation release operations.
+Replace external address re-signing with admin-configured, stored contract-level trust verification for cross-contract authorization in reservation release operations.
+
+**Implementation status:** The current inventory entry point does not yet perform this stored-address check. It only calls `authorized_contract.require_auth()`, so #1472 remains open until the trusted requests-contract address is stored and compared.
 
 ### Context
 - Requests contract was passing its own admin address to inventory contract
@@ -43,21 +45,24 @@ pub fn release_reservation_by_authority(
 - ❌ Requires new auth framework
 - ❌ More difficult to audit
 
-**Option 4: Contract-Level Trust (Selected Solution)** ✅
+**Option 4: Stored Contract-Level Trust (Selected Solution)** ✅
 ```rust
 fn release_reservation_by_contract(
     env: &Env,
     authorized_contract: &Address,
     reservation_id: u64,
 ) -> Result<(), ContractError> {
-    if &env.current_contract_address() != authorized_contract {
+    let trusted_requests_contract = storage::get_requests_contract(&env)
+        .ok_or(ContractError::Unauthorized)?;
+    if *authorized_contract != trusted_requests_contract {
         return Err(ContractError::Unauthorized);
     }
+    authorized_contract.require_auth();
     // ... proceed with release
 }
 ```
-- ✅ Uses Soroban's native execution model
-- ✅ No new abstractions needed
+- ✅ Uses Soroban's native authorization model
+- ✅ Trust is limited to an admin-configured address
 - ✅ Clear and auditable authorization chain
 - ✅ Contract address is cryptographically unforgeable
 - ✅ Minimal code changes
@@ -65,11 +70,11 @@ fn release_reservation_by_contract(
 ### Decision
 **Go with Option 4: Contract-level trust verification**
 
-The `env.current_contract_address()` check is:
-- Native to Soroban (no emulation needed)
-- Cryptographically secure (address is bytecode-derived)
-- Impossible to spoof (contract address = cryptographic commitment to bytecode)
-- Elegant (no bloated types or configuration)
+The stored-address check is:
+- Explicitly configured by the inventory admin
+- Compared before authorization is accepted
+- Combined with `authorized_contract.require_auth()`
+- Easy to audit and test
 
 ---
 
@@ -100,9 +105,12 @@ fn release_reservation_by_contract(
     authorized_contract: &Address,
     reservation_id: u64,
 ) -> Result<(), ContractError> {
-    if &env.current_contract_address() != authorized_contract {
+    let trusted_requests_contract = storage::get_requests_contract(&env)
+        .ok_or(ContractError::Unauthorized)?;
+    if *authorized_contract != trusted_requests_contract {
         return Err(ContractError::Unauthorized);  // ← Contract address verified
     }
+    authorized_contract.require_auth();
     // ... validation ...
     Self::release_reservation_internal(&env, &reservation, reservation_id)?;
     Ok(())
@@ -145,7 +153,8 @@ fn release_reservation_internal(
 ├─────────────────────────────────────┤
 │ caller.require_auth()               │ External path
 │ -or-                                │
-│ verify current_contract_address()   │ Cross-contract path
+│ compare stored requests address     │ Cross-contract path
+│ require_auth() on trusted contract  │
 ├─────────────────────────────────────┤
 │ Shared Internal Function            │
 │ (Validation + Business Logic)       │
@@ -193,8 +202,8 @@ fn release_reservation_if_present(env: &Env, request: &mut BloodRequest) -> bool
     if let Some(res_id) = request.reservation_id {
         let inventory_addr = storage::get_inventory_contract(env);
         let inv_client = InventoryContractClient::new(env, &inventory_addr);
-        let requests_contract = env.current_contract_address();
-        inv_client.release_reservation_by_contract(&requests_contract, &res_id);  // ✅ Correct
+        let requests_contract = configured_requests_contract(env);
+        inv_client.release_reservation_by_contract(&requests_contract, &res_id);  // ✅ after #1472
         request.reservation_id = None;
         true
     } else {
@@ -204,8 +213,8 @@ fn release_reservation_if_present(env: &Env, request: &mut BloodRequest) -> bool
 ```
 
 **Solution:**
-- Passes `requests_contract` (calling contract's address)
-- Contract address is verified in inventory (no re-signing needed)
+- Passes the configured requests contract address
+- Inventory compares it with the stored trusted address and calls `require_auth()`
 - Authorization succeeds
 
 ---
@@ -288,8 +297,8 @@ fn test_release_reservation_by_contract_requires_matching_address() {
     let attacker_addr = Address::random(&env);
     
     // Call: release_reservation_by_contract(attacker_addr, res_id)
-    // Current contract: requests_contract_addr
-    // Result: Unauthorized (attacker_addr != requests_contract_addr)
+    // Stored trusted address: requests_contract_addr
+    // Result: Unauthorized (attacker_addr != stored trusted address)
     assert_eq!(result, Err(ContractError::Unauthorized));
 }
 
@@ -364,7 +373,7 @@ fn test_update_request_status_rejected_releases_reservation() {
 - [ ] Code review complete
 - [ ] Unit tests pass
 - [ ] Integration tests pass
-- [ ] No breaking changes to public APIs (only added private function)
+- [ ] No breaking changes to public APIs (the protected entry point remains callable by the requests contract)
 - [ ] Contract size unchanged (should still compile to WASM)
 - [ ] No new dependencies added
 - [ ] No configuration changes required
@@ -400,7 +409,7 @@ fn test_update_request_status_rejected_releases_reservation() {
 
 1. **Uses Native Primitives**
    - Doesn't invent new auth mechanisms
-   - Relies on Soroban's built-in `env.current_contract_address()`
+    - Uses Soroban's native `require_auth()` together with an admin-configured trusted address
    - Documented behavior, well-tested in Soroban runtime
 
 2. **Minimal Code Changes**
@@ -424,10 +433,10 @@ fn test_update_request_status_rejected_releases_reservation() {
    - Existing code continues to function
 
 **What to verify in code review:**
-- [ ] Does `env.current_contract_address()` return what we expect?
+- [ ] Is the supplied address compared with the admin-configured trusted address?
 - [ ] Is the comparison done correctly (reference vs value)?
 - [ ] Are both authorization paths using the same shared logic?
-- [ ] Is the private/public function visibility correct?
+- [ ] Is the public entry point protected by both authorization checks?
 
 **Questions to ask:**
 - Q: Why not add more parameters to original function?
@@ -436,8 +445,8 @@ fn test_update_request_status_rejected_releases_reservation() {
 - Q: Could an attacker run their own "fake" inventory contract?
   - A: Yes, but that's out of scope. The risks are at the deployment/governance layer (which contracts are deployed and who can deploy them).
   
-- Q: Why is `release_reservation_by_contract` private?
-  - A: Any contract can call any function (Soroban doesn't have visibility), but keeping it private documents that it's internal. The actual security comes from the address check.
+- Q: Why is `release_reservation_by_contract` public?
+    - A: Cross-contract calls require a public entry point. The actual security comes from the stored-address comparison and `require_auth()` checks.
   
 - Q: What if requests contract is upgraded?
   - A: New bytecode = new address = fix stops working. Solution: Never upgrade requests contract address, or update inventory to allow multiple trusted addresses.
@@ -448,4 +457,4 @@ fn test_update_request_status_rejected_releases_reservation() {
 
 This fix establishes a **reusable pattern for cross-contract authorization** that leverages Soroban's native execution model. It's secure, maintainable, and doesn't require changes to the storage schema or existing public APIs.
 
-The key insight: **Trust the calling contract, not the external address it passes.**
+The key insight: **Trust only the admin-configured requests contract address, and authenticate it with `require_auth()`.**
