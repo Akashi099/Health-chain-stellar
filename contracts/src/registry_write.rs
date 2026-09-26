@@ -8,8 +8,8 @@
 //! ## Storage Write Audit (PR checklist)
 //! - [x] `register_unit`          — writes DataKey::Unit(id), NEXT_ID, BankUnits index, DonorUnits index, StatusUnits index
 //! - [x] `update_status`          — writes DataKey::Unit(id), StatusUnits index
-//! - [x] `expire_unit`            — 1 read + 1 write of DataKey::Unit(id), StatusUnits index
-//! - [x] `check_and_expire_batch` — N individual reads + writes of DataKey::Unit(id)
+//! - [x] `expire_unit`            — 1 read + 1 write of DataKey::Unit(id), StatusUnits index, HospitalUnits index (undelivered allocations)
+//! - [x] `check_and_expire_batch` — N individual reads + writes of DataKey::Unit(id), HospitalUnits index (undelivered allocations)
 
 use soroban_sdk::{symbol_short, Address, Env, Symbol, Vec};
 
@@ -19,8 +19,8 @@ use crate::{
         MIN_SHELF_LIFE_DAYS, SECONDS_PER_DAY,
     },
     get_next_id, index_bank_unit, index_blood_type_unit, index_donor_unit, record_status_change,
-    reindex_status, BloodComponent, BloodRegisteredEvent, BloodStatus, BloodType, BloodUnit,
-    DataKey, Error,
+    reindex_status, release_undelivered_allocation, BloodComponent, BloodRegisteredEvent,
+    BloodStatus, BloodType, BloodUnit, DataKey, Error,
 };
 
 // ── WRITE ─────────────────────────────────────────────────────────────────────
@@ -185,6 +185,9 @@ pub fn expire_unit(env: &Env, unit_id: u64) -> Result<(), Error> {
 
     let old_status = unit.status;
     unit.status = BloodStatus::Expired;
+    // Fix #1436: a force-expired Reserved/InTransit unit will never reach its
+    // allocated hospital, so remove the stale allocation and index entry.
+    release_undelivered_allocation(env, unit_id, &mut unit);
     env.storage()
         .persistent()
         .set(&DataKey::Unit(unit_id), &unit);
@@ -232,6 +235,7 @@ pub fn check_and_expire_batch(env: &Env, unit_ids: Vec<u64>) -> Result<Vec<u64>,
 
         let old_status = unit.status;
         unit.status = BloodStatus::Expired;
+        release_undelivered_allocation(env, unit_id, &mut unit);
         env.storage()
             .persistent()
             .set(&DataKey::Unit(unit_id), &unit);
