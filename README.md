@@ -118,3 +118,6 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1462 -->
 - #1462: [lifebank/reputation] appeal_penalty's is_appealed flag is fully decorative — appeals never affect the score
+
+<!-- handsoff-issue-1463 -->
+- #1463: [lifebank/reputation] RatingScaleConfig, BadgeConfig and MinimumInteractions are stored at init but never consulted by the scoring algorithm
