@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post, Query, UploadedFile, UseInterceptors } from '@nestjs/common';
+import { Body, Controller, Get, Param, ParseUUIDPipe, Post, Query, UploadedFile, UseInterceptors } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { FileInterceptor } from '@nestjs/platform-express';
 
@@ -29,7 +29,7 @@ export class DeliveryProofController {
   @Post(':orderId/upload')
   @UseInterceptors(FileInterceptor('image'))
   async uploadPhoto(
-    @Param('orderId') orderId: string,
+    @Param('orderId', new ParseUUIDPipe({ version: '4' })) orderId: string,
     @UploadedFile() file: any, // Express.Multer.File
   ) {
     return this.service.uploadPhoto(orderId, file);
