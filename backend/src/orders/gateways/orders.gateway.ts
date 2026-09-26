@@ -30,6 +30,8 @@ export interface OrderStatusUpdatedPayload {
   eventType: string;
   actorId?: string | null;
   timestamp: Date;
+  hospitalId?: string;
+  bloodBankId?: string | null;
 }
 
 @WebSocketGateway({
@@ -138,8 +140,33 @@ export class OrdersGateway
     this.logger.log(`Broadcasting order update to room: ${roomName}, order: ${order.id}`);
   }
 
-  /** Kept for backward compatibility with OrdersService callers */
+  /**
+   * Emits an order status change only to the rooms that are authorized to see
+   * the order (the owning hospital and, when present, the blood bank). This
+   * replaces the previous global broadcast that leaked every tenant's order
+   * status to all connected sockets.
+   */
   emitOrderStatusUpdated(payload: OrderStatusUpdatedPayload): void {
-    this.server.emit('order.status.updated', payload);
+    const rooms: string[] = [];
+
+    if (payload.hospitalId) {
+      rooms.push(`hospital:${payload.hospitalId}`);
+    }
+
+    if (payload.bloodBankId) {
+      rooms.push(`bloodbank:${payload.bloodBankId}`);
+    }
+
+    if (rooms.length === 0) {
+      this.logger.warn(
+        `emitOrderStatusUpdated called without hospitalId/bloodBankId for order=${payload.orderId}; dropping event to avoid cross-tenant leak`,
+      );
+      return;
+    }
+
+    this.server.to(rooms).emit('order.status.updated', payload);
+    this.logger.log(
+      `Emitting order.status.updated for order=${payload.orderId} to rooms: ${rooms.join(', ')}`,
+    );
   }
 }
