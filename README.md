@@ -109,3 +109,6 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1490 -->
 - #1490: [backend/auth] Account lockout is never enforced — ensureAccountIsUsable() has no throw for a still-locked account
+
+<!-- handsoff-issue-1438 -->
+- #1438: [contracts] A single escrow authorized_approver conflicts with both the admin release path and the M-of-N path, blocking releases
