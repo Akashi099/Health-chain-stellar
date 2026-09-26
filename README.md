@@ -115,3 +115,6 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1461 -->
 - #1461: [lifebank/reputation] resolve_penalty bypasses the pause() circuit breaker entirely
+
+<!-- handsoff-issue-1462 -->
+- #1462: [lifebank/reputation] appeal_penalty's is_appealed flag is fully decorative — appeals never affect the score
