@@ -6,7 +6,7 @@ import { Redis } from 'ioredis';
 
 import { REDIS_CLIENT } from '../redis/redis.constants';
 
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 
 import { RouteDeviationDetectedEvent } from '../events/route-deviation-detected.event';
 import { haversineDistanceKm } from '../location-history/location-history.service';
@@ -257,408 +257,153 @@ export class RouteDeviationService {
         smoothedDistanceM,
         sampleCount: telemetry.length,
       });
-      return; // First off-corridor ping — wait for duration threshold
-    }
-
-    const durationS = Math.floor(
-      (now.getTime() - existing.firstOffAt.getTime()) / 1000,
-    );
-    await this.setOffCorridorState(dto.riderId, {
-      firstOffAt: existing.firstOffAt,
-      lastDistanceM: distanceM,
-      smoothedDistanceM,
-      sampleCount: telemetry.length,
-    });
-
-    if (durationS < route.maxDeviationSeconds) return; // Not yet past duration threshold
-
-    const confidenceScore = this.computeConfidenceScore({
-      smoothedDistanceM,
-      routeRadiusM: route.corridorRadiusM,
-      durationS,
-      maxDeviationSeconds: route.maxDeviationSeconds,
-      jitterM,
-      sampleCount: telemetry.length,
-    });
-
-    if (confidenceScore < 0.55 && durationS < route.maxDeviationSeconds * 2) {
       return;
     }
 
-    // Check if there's already an open incident for this rider+order
-    const openIncident = await this.incidentRepo.findOne({
+    const durationS = (now.getTime() - existing.firstOffAt.getTime()) / 1000;
+    if (durationS < route.maxDeviationSeconds) {
+      await this.setOffCorridorState(dto.riderId, {
+        ...existing,
+        lastDistanceM: distanceM,
+        smoothedDistanceM,
+        sampleCount: telemetry.length,
+      });
+      return;
+    }
+
+    // Dedupe against any incident that is not yet resolved (OPEN or
+    // ACKNOWLEDGED). Acknowledging an incident must not cause every later
+    // off-corridor ping to spawn a duplicate incident, event and scoring review.
+    const activeIncident = await this.incidentRepo.findOne({
       where: {
         orderId: dto.orderId,
         riderId: dto.riderId,
-        status: DeviationStatus.OPEN,
+        status: In([DeviationStatus.OPEN, DeviationStatus.ACKNOWLEDGED]),
       },
     });
 
-    const severity = classifySeverity(distanceM, durationS);
-    const action = recommendedAction(severity);
-
-    if (openIncident) {
-      // Update existing incident with latest position and severity
-      openIncident.deviationDistanceM = distanceM;
-      openIncident.deviationDurationS = durationS;
-      openIncident.lastKnownLatitude = dto.latitude;
-      openIncident.lastKnownLongitude = dto.longitude;
-      openIncident.severity = severity;
-      openIncident.recommendedAction = action;
-      await this.incidentRepo.save(openIncident);
+    if (activeIncident) {
+      await this.setOffCorridorState(dto.riderId, {
+        ...existing,
+        lastDistanceM: distanceM,
+        smoothedDistanceM,
+        sampleCount: telemetry.length,
+      });
       return;
     }
 
-    // Create new incident
+    const severity = classifySeverity(smoothedDistanceM, durationS);
     const incident = this.incidentRepo.create({
       orderId: dto.orderId,
       riderId: dto.riderId,
       plannedRouteId: route.id,
-      severity,
       status: DeviationStatus.OPEN,
-      deviationDistanceM: distanceM,
-      deviationDurationS: durationS,
-      lastKnownLatitude: dto.latitude,
-      lastKnownLongitude: dto.longitude,
-      reason: `Rider deviated ${Math.round(smoothedDistanceM)}m from planned corridor for ${durationS}s`,
-      recommendedAction: action,
-      acknowledgedBy: null,
-      acknowledgedAt: null,
-      resolvedAt: null,
-      scoringApplied: false,
-      metadata: {
-        rawDistanceM: Math.round(distanceM * 100) / 100,
-        smoothedDistanceM: Math.round(smoothedDistanceM * 100) / 100,
-        jitterM: Math.round(jitterM * 100) / 100,
-        sampleCount: telemetry.length,
-        confidenceScore: Math.round(confidenceScore * 100) / 100,
-        telemetryWindow: telemetry.map((sample) => ({
-          latitude: sample.latitude,
-          longitude: sample.longitude,
-          distanceM: Math.round(sample.distanceM * 100) / 100,
-          recordedAt: sample.recordedAt.toISOString(),
-        })),
-      },
+      severity,
+      distanceM: smoothedDistanceM,
+      durationS,
+      latitude: dto.latitude,
+      longitude: dto.longitude,
+      recommendedAction: recommendedAction(severity),
     });
 
     const saved = await this.incidentRepo.save(incident);
 
-    // Apply advanced severity classification and triage
-    await this.classifyAndTriageDeviation(saved, {
-      orderPriority: 'STANDARD', // TODO: Get from order context
-      hasColdChainRequirement: false, // TODO: Get from order context
-    });
-
-    this.logger.warn(
-      `Route deviation incident created id=${saved.id} order=${dto.orderId} severity=${severity}`,
-    );
-
     this.eventEmitter.emit(
       'route.deviation.detected',
-      new RouteDeviationDetectedEvent(
-        saved.id,
-        dto.orderId,
-        dto.riderId,
-        severity,
-        smoothedDistanceM,
-        dto.latitude,
-        dto.longitude,
-        action,
-        confidenceScore,
-        {
-          rawDistanceM: distanceM,
-          smoothedDistanceM,
-          jitterM,
-          sampleCount: telemetry.length,
-        },
-      ),
-    );
-  }
-
-  // ── Incident management ──────────────────────────────────────────────
-
-  async acknowledgeIncident(
-    incidentId: string,
-    userId: string,
-  ): Promise<RouteDeviationIncidentEntity> {
-    const incident = await this.incidentRepo.findOne({
-      where: { id: incidentId },
-    });
-    if (!incident)
-      throw new NotFoundException(`Deviation incident ${incidentId} not found`);
-
-    if (incident.acknowledgedAt) return incident;
-
-    incident.status = DeviationStatus.ACKNOWLEDGED;
-    incident.acknowledgedBy = userId;
-    incident.acknowledgedAt = new Date();
-    return this.incidentRepo.save(incident);
-  }
-
-  async resolveIncident(
-    incidentId: string,
-  ): Promise<RouteDeviationIncidentEntity> {
-    const incident = await this.incidentRepo.findOne({
-      where: { id: incidentId },
-    });
-    if (!incident)
-      throw new NotFoundException(`Deviation incident ${incidentId} not found`);
-
-    incident.status = DeviationStatus.RESOLVED;
-    incident.resolvedAt = new Date();
-    await this.deleteOffCorridorState(incident.riderId);
-    return this.incidentRepo.save(incident);
-  }
-
-  async findOpenIncidents(
-    page = 1,
-    pageSize = 20,
-  ): Promise<PaginatedResponse<RouteDeviationIncidentEntity>> {
-    const take = Math.min(Math.max(pageSize, 1), 100);
-    const skip = (Math.max(page, 1) - 1) * take;
-
-    const [data, total] = await this.incidentRepo.findAndCount({
-      where: { status: DeviationStatus.OPEN },
-      order: { createdAt: 'DESC' },
-      take,
-      skip,
-    });
-
-    return {
-      data,
-      meta: {
-        total,
-        page: Math.max(page, 1),
-        pageSize: take,
-        totalPages: Math.ceil(total / take),
-      },
-    };
-  }
-
-  async findIncidentsByOrder(
-    orderId: string,
-  ): Promise<RouteDeviationIncidentEntity[]> {
-    return this.incidentRepo.find({
-      where: { orderId },
-      order: { createdAt: 'DESC' },
-    });
-  }
-
-  async markScoringApplied(incidentId: string): Promise<void> {
-    await this.incidentRepo.update(incidentId, { scoringApplied: true });
-  }
-
-  // ── Advanced Severity Classification & Triage ───────────────────────
-
-  /**
-   * Apply advanced severity classification and triage automation
-   */
-  async classifyAndTriageDeviation(
-    incident: RouteDeviationIncidentEntity,
-    context: {
-      orderPriority?: 'CRITICAL' | 'URGENT' | 'STANDARD';
-      hasColdChainRequirement?: boolean;
-      currentTemperature?: number;
-      temperatureThreshold?: number;
-      trafficCondition?: 'CLEAR' | 'MODERATE' | 'HEAVY' | 'UNKNOWN';
-      trafficDelayMinutes?: number;
-      riderReliabilityScore?: number;
-    } = {},
-  ): Promise<void> {
-    try {
-      // Extract features
-      const features = await this.featureExtractor.extractFeatures(
-        incident,
-        context,
-      );
-
-      // Classify severity
-      const classification = this.classifier.classify(features);
-
-      // Update incident with classification results
-      await this.incidentRepo.update(incident.id, {
-        severity: classification.severity,
-        recommendedAction: classification.explanation,
-        metadata: {
-          ...incident.metadata,
-          classification: {
-            riskScore: classification.riskScore,
-            confidence: classification.confidence,
-            contributingFactors: classification.contributingFactors,
-            timestamp: new Date().toISOString(),
-          },
-        },
-      });
-
-      // Execute triage automation
-      const triageResult = await this.triageAutomation.executeTriage(
-        incident,
-        classification,
-        {
-          orderPriority: context.orderPriority,
-          hasColdChainRequirement: context.hasColdChainRequirement,
-          riderDeviationHistory: features.riderDeviationHistory,
-        },
-      );
-
-      this.logger.log(
-        `Classified and triaged deviation ${incident.id}: severity=${classification.severity}, risk=${classification.riskScore}, actions=${triageResult.actions.length}`,
-      );
-    } catch (error) {
-      this.logger.error(
-        `Failed to classify and triage deviation ${incident.id}`,
-        error,
-      );
-    }
-  }
-
-  /**
-   * Reclassify an existing deviation with updated context
-   */
-  async reclassifyDeviation(
-    incidentId: string,
-    context: {
-      orderPriority?: 'CRITICAL' | 'URGENT' | 'STANDARD';
-      hasColdChainRequirement?: boolean;
-      currentTemperature?: number;
-      temperatureThreshold?: number;
-      trafficCondition?: 'CLEAR' | 'MODERATE' | 'HEAVY' | 'UNKNOWN';
-      trafficDelayMinutes?: number;
-      riderReliabilityScore?: number;
-    },
-  ): Promise<void> {
-    const incident = await this.incidentRepo.findOne({
-      where: { id: incidentId },
-    });
-
-    if (!incident) {
-      throw new NotFoundException(`Deviation incident ${incidentId} not found`);
-    }
-
-    await this.classifyAndTriageDeviation(incident, context);
-  }
-
-  /**
-   * Override severity with operator rationale
-   */
-  async overrideSeverity(
-    incidentId: string,
-    newSeverity: DeviationSeverity,
-    operatorId: string,
-    rationale: string,
-  ): Promise<RouteDeviationIncidentEntity> {
-    await this.triageAutomation.overrideSeverity(
-      incidentId,
-      newSeverity,
-      operatorId,
-      rationale,
+      new RouteDeviationDetectedEvent(saved),
     );
 
-    return this.incidentRepo.findOne({ where: { id: incidentId } })!;
-  }
-
-  /**
-   * Validate classification against historical annotated data
-   */
-  async validateClassification(
-    incidentId: string,
-    actualSeverity: DeviationSeverity,
-  ): Promise<{
-    correct: boolean;
-    error: number;
-    feedback: string;
-  }> {
-    const incident = await this.incidentRepo.findOne({
-      where: { id: incidentId },
-    });
-
-    if (!incident) {
-      throw new NotFoundException(`Deviation incident ${incidentId} not found`);
-    }
-
-    const features = await this.featureExtractor.extractFeatures(incident);
-    const classification = this.classifier.classify(features);
-
-    return this.classifier.validateClassification(
-      classification.severity,
-      actualSeverity,
-      features,
+    this.logger.warn(
+      `Route deviation detected order=${dto.orderId} rider=${dto.riderId} severity=${severity} distance=${smoothedDistanceM.toFixed(0)}m duration=${durationS.toFixed(0)}s`,
     );
   }
-
-  /**
-   * Get triage statistics
-   */
-  async getTriageStatistics(params: {
-    startDate?: Date;
-    endDate?: Date;
-  }): Promise<{
-    totalDeviations: number;
-    bySeverity: Record<DeviationSeverity, number>;
-    overrideCount: number;
-    overrideRate: number;
-  }> {
-    return this.triageAutomation.getTriageStatistics(params);
-  }
-
-  // ── Private Helper Methods ──────────────────────────────────────────
 
   private appendTelemetrySample(
     riderId: string,
     dto: LocationUpdateDto,
     distanceM: number,
   ): TelemetrySample[] {
-    const samples = this.telemetryBuffers.get(riderId) ?? [];
-    samples.push({
+    const buffer = this.telemetryBuffers.get(riderId) ?? [];
+    buffer.push({
       latitude: dto.latitude,
       longitude: dto.longitude,
       distanceM,
       recordedAt: new Date(),
     });
-    const trimmed = samples.slice(-TELEMETRY_WINDOW_SIZE);
-    this.telemetryBuffers.set(riderId, trimmed);
-    return trimmed;
+    while (buffer.length > TELEMETRY_WINDOW_SIZE) buffer.shift();
+    this.telemetryBuffers.set(riderId, buffer);
+    return buffer;
   }
 
-  private computeSmoothedDistance(samples: TelemetrySample[]): number {
-    if (samples.length === 0) return 0;
-    const total = samples.reduce((sum, sample) => sum + sample.distanceM, 0);
-    return total / samples.length;
+  private computeSmoothedDistance(telemetry: TelemetrySample[]): number {
+    if (telemetry.length === 0) return 0;
+    const sum = telemetry.reduce((acc, s) => acc + s.distanceM, 0);
+    return sum / telemetry.length;
   }
 
-  private computeJitterM(samples: TelemetrySample[]): number {
-    if (samples.length <= 1) return 0;
-    const distances = samples.map((sample) => sample.distanceM);
-    return Math.max(...distances) - Math.min(...distances);
+  private computeJitterM(telemetry: TelemetrySample[]): number {
+    if (telemetry.length < 2) return 0;
+    let max = -Infinity;
+    let min = Infinity;
+    for (const s of telemetry) {
+      if (s.distanceM > max) max = s.distanceM;
+      if (s.distanceM < min) min = s.distanceM;
+    }
+    return max - min;
   }
 
-  private computeConfidenceScore(input: {
-    smoothedDistanceM: number;
-    routeRadiusM: number;
-    durationS: number;
-    maxDeviationSeconds: number;
-    jitterM: number;
-    sampleCount: number;
-  }): number {
-    const distanceScore = Math.max(
-      0,
-      Math.min(1, (input.smoothedDistanceM - input.routeRadiusM) / input.routeRadiusM),
-    );
-    const durationScore = Math.max(
-      0,
-      Math.min(1, input.durationS / Math.max(input.maxDeviationSeconds * 2, 60)),
-    );
-    const stabilityScore = Math.max(
-      0,
-      Math.min(1, 1 - input.jitterM / Math.max(input.routeRadiusM * 2, 1)),
-    );
-    const sampleBonus = Math.max(0, Math.min(1, input.sampleCount / TELEMETRY_WINDOW_SIZE));
+  // ── Incident lifecycle ──────────────────────────────────────────────
 
-    return (
-      0.4 * distanceScore +
-      0.3 * durationScore +
-      0.2 * stabilityScore +
-      0.1 * sampleBonus
-    );
+  async acknowledgeIncident(
+    incidentId: string,
+    acknowledgedBy: string,
+  ): Promise<RouteDeviationIncidentEntity> {
+    const incident = await this.incidentRepo.findOne({
+      where: { id: incidentId },
+    });
+    if (!incident) {
+      throw new NotFoundException(`Incident ${incidentId} not found`);
+    }
+
+    incident.status = DeviationStatus.ACKNOWLEDGED;
+    incident.acknowledgedBy = acknowledgedBy;
+    incident.acknowledgedAt = new Date();
+    return this.incidentRepo.save(incident);
+  }
+
+  async resolveIncident(
+    incidentId: string,
+    resolvedBy: string,
+  ): Promise<RouteDeviationIncidentEntity> {
+    const incident = await this.incidentRepo.findOne({
+      where: { id: incidentId },
+    });
+    if (!incident) {
+      throw new NotFoundException(`Incident ${incidentId} not found`);
+    }
+
+    incident.status = DeviationStatus.RESOLVED;
+    incident.resolvedBy = resolvedBy;
+    incident.resolvedAt = new Date();
+    const saved = await this.incidentRepo.save(incident);
+
+    await this.deleteOffCorridorState(incident.riderId);
+    return saved;
+  }
+
+  async getRiderDeviationCount(riderId: string): Promise<number> {
+    return this.incidentRepo.count({ where: { riderId } });
+  }
+
+  async listIncidents(
+    page = 1,
+    pageSize = 20,
+  ): Promise<PaginatedResponse<RouteDeviationIncidentEntity>> {
+    const [items, total] = await this.incidentRepo.findAndCount({
+      order: { createdAt: 'DESC' },
+      skip: (page - 1) * pageSize,
+      take: pageSize,
+    });
+    return { items, total, page, pageSize };
   }
 }

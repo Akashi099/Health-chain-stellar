@@ -28,6 +28,16 @@ interface TrustedSignerKey {
   publicKey: string;
 }
 
+/**
+ * Actor context used to scope delivery-proof reads and uploads to the
+ * assigned rider, the order's tenants, and admins (issue #1535).
+ */
+export interface DeliveryProofActor {
+  userId: string;
+  roles?: string[];
+  permissions?: string[];
+}
+
 export interface DeliveryStatistics {
   totalDeliveries: number;
   successfulDeliveries: number;
@@ -51,7 +61,72 @@ export class DeliveryProofService {
     private readonly fileMetadata: FileMetadataService,
   ) {}
 
-  async uploadPhoto(orderId: string, file: Express.Multer.File) {
+  /**
+   * Returns true when the actor is an admin or holds an admin-level role.
+   */
+  private isAdmin(actor?: DeliveryProofActor): boolean {
+    if (!actor) return false;
+    const roles = (actor.roles ?? []).map((r) => r.toLowerCase());
+    const permissions = (actor.permissions ?? []).map((p) => p.toLowerCase());
+    return (
+      roles.includes('admin') ||
+      roles.includes('super_admin') ||
+      permissions.includes('admin') ||
+      permissions.includes('*') ||
+      permissions.includes('delivery_proof:admin')
+    );
+  }
+
+  /**
+   * Asserts the actor may read the given proof. Admins may read any proof;
+   * otherwise the actor must be the assigned rider or one of the order's
+   * tenants (matched by userId).
+   */
+  private assertCanReadProof(proof: DeliveryProofEntity, actor?: DeliveryProofActor): void {
+    if (this.isAdmin(actor)) return;
+    if (!actor) {
+      throw new NotFoundException('Delivery proof not found');
+    }
+    const isRider = proof.riderId === actor.userId;
+    const isTenant =
+      (proof as any).tenantId === actor.userId ||
+      (proof as any).donorId === actor.userId ||
+      (proof as any).recipientId === actor.userId;
+    if (!isRider && !isTenant) {
+      // Do not leak existence of proofs the actor cannot access.
+      throw new NotFoundException('Delivery proof not found');
+    }
+  }
+
+  /**
+   * Asserts the actor may upload to the given order. Admins may upload to any
+   * order; otherwise the actor must be the assigned rider or one of the
+   * order's tenants.
+   */
+  private async assertCanUploadToOrder(orderId: string, actor?: DeliveryProofActor): Promise<void> {
+    if (this.isAdmin(actor)) return;
+    if (!actor) {
+      throw new NotFoundException('Delivery proof not found');
+    }
+    const existing = await this.proofRepo.findOne({ where: { orderId } });
+    if (existing) {
+      const isRider = existing.riderId === actor.userId;
+      const isTenant =
+        (existing as any).tenantId === actor.userId ||
+        (existing as any).donorId === actor.userId ||
+        (existing as any).recipientId === actor.userId;
+      if (!isRider && !isTenant) {
+        throw new NotFoundException('Delivery proof not found');
+      }
+      return;
+    }
+    // No proof yet: only the assigned rider may create the initial proof.
+    // Without an existing proof we cannot resolve the order's tenants here,
+    // so deny non-admins to avoid arbitrary uploads to any order.
+    throw new NotFoundException('Delivery proof not found');
+  }
+
+  async uploadPhoto(orderId: string, file: Express.Multer.File, actor?: DeliveryProofActor) {
     if (!file) throw new BadRequestException('No file uploaded');
 
     // Reject path-traversal payloads (e.g. "../../../tmp/x") before the value
@@ -136,89 +211,44 @@ export class DeliveryProofService {
     };
   }
 
-  async create(dto: CreateDeliveryProofDto): Promise<DeliveryProofEntity> {
-    this.assertEvidenceDigestReferences(dto.evidenceDigestReferences);
-
-    if (!dto.requestId) {
-      throw new BadRequestException('requestId is required for delivery proof binding');
+  /**
+   * Deterministically serialises a value so that structurally identical
+   * evidence always produces the same digest (stable key ordering).
+   */
+  private stableStringify(value: unknown): string {
+    if (value === null || value === undefined) return 'null';
+    if (Array.isArray(value)) {
+      return `[${value.map((v) => this.stableStringify(v)).join(',')}]`;
     }
-
-    const pickupTimestamp = new Date(dto.pickupTimestamp);
-    const deliveredAt = new Date(dto.deliveredAt);
-    const signedAt = new Date(dto.signedAt);
-
-    if (deliveredAt < pickupTimestamp) {
-      throw new BadRequestException(
-        'deliveredAt must be after pickupTimestamp',
-      );
+    if (typeof value === 'object') {
+      const obj = value as Record<string, unknown>;
+      const keys = Object.keys(obj).sort();
+      return `{${keys
+        .map((k) => `${JSON.stringify(k)}:${this.stableStringify(obj[k])}`)
+        .join(',')}}`;
     }
-    if (signedAt > new Date()) {
-      throw new BadRequestException('signedAt cannot be in the future');
-    }
-    if (!dto.temperatureReadings || dto.temperatureReadings.length === 0) {
-      throw new BadRequestException(
-        'At least one temperature reading is required',
-      );
-    }
+    return JSON.stringify(value);
+  }
 
-    // Require all custody handoffs confirmed before delivery can be recorded (#380)
-    await this.custodyService.assertCustodyComplete(dto.orderId);
-
-    const trustedSigner = this.resolveTrustedSigner(dto.signerKeyId);
-    if (trustedSigner.publicKey !== dto.signerPublicKey) {
-      throw new BadRequestException('Signer key does not match trusted rotation set');
-    }
-
-    const signedPayload = this.buildSignedPayload({
+  /**
+   * Builds a digest over every evidential field so the signature binds the
+   * cold-chain readings, delivery times, recipient and photo/location hashes
+   * (issue #1536). Without this, a legitimately signed payload could be
+   * replayed with tampered evidence.
+   */
+  private buildEvidenceDigest(dto: CreateDeliveryProofDto): string {
+    const evidence = {
       deliveryId: dto.deliveryId,
       orderId: dto.orderId,
       requestId: dto.requestId,
       riderId: dto.riderId,
       signerRole: dto.signerRole,
       signedAt: dto.signedAt,
-      evidenceDigestReferences: dto.evidenceDigestReferences,
-    });
-    const payloadDigest = crypto.createHash('sha256').update(signedPayload).digest('hex');
-    try {
-      const keypair = Keypair.fromPublicKey(dto.signerPublicKey);
-      const signatureBytes = Buffer.from(dto.signature, 'base64');
-      const digestBytes = Buffer.from(payloadDigest, 'hex');
-      if (!keypair.verify(digestBytes, signatureBytes)) {
-        throw new BadRequestException('Signature verification failed');
-      }
-    } catch (error) {
-      if (error instanceof BadRequestException) {
-        throw error;
-      }
-      throw new BadRequestException('Signature verification failed');
-    }
-
-    const isTemperatureCompliant = dto.temperatureReadings.every(
-      (t) => t >= TEMP_MIN_CELSIUS && t <= TEMP_MAX_CELSIUS,
-    );
-
-    const trustedTimestampAt = new Date();
-    const timestampAnchorHash =
-      dto.externalTimestampAnchorHash ??
-      crypto
-        .createHash('sha256')
-        .update(`${dto.deliveryId}:${dto.requestId}:${trustedTimestampAt.toISOString()}`)
-        .digest('hex');
-
-    const proof = this.proofRepo.create({
-      deliveryId: dto.deliveryId,
-      orderId: dto.orderId,
-      requestId: dto.requestId,
-      riderId: dto.riderId,
-      pickupTimestamp,
-      pickupLocationHash: dto.pickupLocationHash ?? null,
-      deliveredAt,
-      deliveryLocationHash: dto.deliveryLocationHash ?? null,
+      pickupTimestamp: dto.pickupTimestamp,
+      deliveredAt: dto.deliveredAt,
       recipientName: dto.recipientName,
-      recipientSignatureUrl: dto.recipientSignatureUrl ?? null,
-      recipientSignatureHash: dto.recipientSignatureHash ?? null,
-      photoUrl: dto.photoUrl ?? null,
-      photoHashes: dto.photoHashes ?? [],
+      recipientSignatureUrl: dto.recipientSignatureUrl,
+      recipientSignatureHash: dto.recipientSignatureHash,
       temperatureReadings: dto.temperatureReadings,
       temperatureCelsius: dto.temperatureCelsius ?? null,
       notes: dto.notes ?? null,

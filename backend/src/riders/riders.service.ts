@@ -7,7 +7,7 @@ import {
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { InjectRepository } from '@nestjs/typeorm';
 
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 
 import {
   PaginatedResponse,
@@ -244,15 +244,50 @@ export class RidersService {
     const riders = await this.riderRepository.find({
       where: { status: RiderStatus.AVAILABLE, isVerified: true },
     });
+
+    const activeCounts = await this.countActiveDeliveries(
+      riders.map((r) => r.id),
+    );
+
     const data: RiderRecord[] = riders.map((r) => ({
       ...r,
       averageRating: r.rating,
-      activeDeliveries: r.completedDeliveries,
+      activeDeliveries: activeCounts.get(r.id) ?? 0,
     }));
     return {
       message: 'Available riders retrieved successfully',
       data,
     };
+  }
+
+  /**
+   * Counts in-flight dispatches per rider so dispatch scoring reflects
+   * current workload rather than lifetime completed deliveries.
+   */
+  private async countActiveDeliveries(
+    riderIds: string[],
+  ): Promise<Map<string, number>> {
+    const counts = new Map<string, number>();
+    if (riderIds.length === 0) {
+      return counts;
+    }
+
+    const rows = await this.riderRepository.manager
+      .createQueryBuilder()
+      .select('dispatch.rider_id', 'riderId')
+      .addSelect('COUNT(*)', 'count')
+      .from('dispatches', 'dispatch')
+      .where('dispatch.rider_id IN (:...riderIds)', { riderIds })
+      .andWhere('dispatch.status IN (:...activeStatuses)', {
+        activeStatuses: ACTIVE_DISPATCH_STATUSES,
+      })
+      .groupBy('dispatch.rider_id')
+      .getRawMany<{ riderId: string; count: string }>();
+
+    for (const row of rows) {
+      counts.set(row.riderId, Number(row.count));
+    }
+    return counts;
   }
 
   async queryAvailability(dto: AvailabilityQueryDto) {

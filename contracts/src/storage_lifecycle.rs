@@ -143,8 +143,8 @@ pub struct ArchivedCustodySummary {
 
 /// Extend the TTL of a single persistent key to at least `MIN_TTL_LEDGERS`.
 ///
-/// Call this after every write to a persistent key to prevent rent expiry.
-/// No-op if the key does not exist.
+/// Guards with `has()` first so it is safe to call even when the key may not
+/// exist yet (e.g. during a first-write path in tests).
 pub fn bump_persistent<K>(env: &Env, key: &K)
 where
     K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
@@ -156,6 +156,14 @@ where
     }
 }
 
+/// Bump TTL for a single `DataKey`-keyed per-record entry.
+///
+/// Call this immediately after every `env.storage().persistent().set(&DataKey::*, …)`
+/// in production write paths so the record survives past the default ledger TTL.
+pub fn bump_record(env: &Env, key: &DataKey) {
+    bump_persistent(env, key);
+}
+
 /// Bump TTL for all per-unit storage keys associated with `unit_id`.
 ///
 /// `unit` should be the current `BloodUnit` record so that the secondary
@@ -165,58 +173,39 @@ where
 ///
 /// Should be called after any write that touches a blood unit or its history.
 pub fn bump_rent_for_unit(env: &Env, unit_id: u64, unit: Option<&BloodUnit>) {
-    // Blood unit record
+    // Core per-unit records: unit, status history, trail metadata.
     bump_persistent(env, &DataKey::Unit(unit_id));
-
-    // Status history
-    let history_key = (HISTORY, unit_id);
-    env.storage()
-        .persistent()
-        .extend_ttl(&history_key, MIN_TTL_LEDGERS, EXTENDED_TTL_LEDGERS);
-
-    // Trail metadata
-    let meta_key = DataKey::UnitTrailMeta(unit_id);
-    env.storage()
-        .persistent()
-        .extend_ttl(&meta_key, MIN_TTL_LEDGERS, EXTENDED_TTL_LEDGERS);
+    bump_persistent(env, &(HISTORY, unit_id));
+    bump_persistent(env, &DataKey::UnitTrailMeta(unit_id));
 
     // Secondary index keys — only bumpable when we have the unit record.
+    // `bump_persistent` skips keys that do not exist yet (e.g. HospitalUnits
+    // before allocation), since `extend_ttl` on a missing key traps.
     if let Some(u) = unit {
-        // BankUnits index for the owning bank.
-        let bank_key = DataKey::BankUnits(u.bank_id.clone());
-        env.storage()
-            .persistent()
-            .extend_ttl(&bank_key, MIN_TTL_LEDGERS, EXTENDED_TTL_LEDGERS);
-
-        // DonorUnits per-bank index.
-        let donor_key = DataKey::DonorUnits(u.bank_id.clone(), u.donor_id.clone());
-        env.storage()
-            .persistent()
-            .extend_ttl(&donor_key, MIN_TTL_LEDGERS, EXTENDED_TTL_LEDGERS);
-
-        // DonorUnits global cross-bank index (sentinel = current contract address).
-        let sentinel = env.current_contract_address();
-        let global_donor_key = DataKey::DonorUnits(sentinel, u.donor_id.clone());
-        env.storage().persistent().extend_ttl(
-            &global_donor_key,
-            MIN_TTL_LEDGERS,
-            EXTENDED_TTL_LEDGERS,
+        bump_persistent(env, &DataKey::BankUnits(u.bank_id.clone()));
+        bump_persistent(
+            env,
+            &DataKey::DonorUnits(u.bank_id.clone(), u.donor_id.clone()),
         );
-
-        // HospitalUnits index — only present after allocation.
+        // Global cross-bank donor index (sentinel = current contract address).
+        bump_persistent(
+            env,
+            &DataKey::DonorUnits(env.current_contract_address(), u.donor_id.clone()),
+        );
+        bump_persistent(env, &DataKey::BloodTypeUnits(u.blood_type));
         if let Some(ref hospital) = u.recipient_hospital {
-            let hosp_key = DataKey::HospitalUnits(hospital.clone());
-            env.storage()
-                .persistent()
-                .extend_ttl(&hosp_key, MIN_TTL_LEDGERS, EXTENDED_TTL_LEDGERS);
+            bump_persistent(env, &DataKey::HospitalUnits(hospital.clone()));
         }
-
-        // StatusUnits index for the unit's current status.
-        let status_key = DataKey::StatusUnits(u.status);
-        env.storage()
-            .persistent()
-            .extend_ttl(&status_key, MIN_TTL_LEDGERS, EXTENDED_TTL_LEDGERS);
+        bump_persistent(env, &DataKey::StatusUnits(u.status));
     }
+}
+
+/// Bump TTL for every per-record key tied to `payment_id`: the payment, its
+/// escrow account and any in-flight multisig approval record.
+pub fn bump_rent_for_payment(env: &Env, payment_id: u64) {
+    bump_persistent(env, &DataKey::Payment(payment_id));
+    bump_persistent(env, &DataKey::EscrowAccount(payment_id));
+    bump_persistent(env, &DataKey::PendingApprovalRecord(payment_id));
 }
 
 /// Bump TTL for all shared registry maps.
@@ -224,8 +213,10 @@ pub fn bump_rent_for_unit(env: &Env, unit_id: u64, unit: Option<&BloodUnit>) {
 /// These are the highest-risk keys because they are large and shared across
 /// all operations. Call this periodically (e.g., from an admin cron job).
 ///
-/// Also extends TTL for all secondary index keys (BankUnits, DonorUnits,
-/// HospitalUnits, StatusUnits) keys.
+/// Also extends TTL for the fixed, enumerable StatusUnits and BloodTypeUnits
+/// buckets. Per-record keys (units, payments, disputes and their indexes) are
+/// bumped on every write path; `bump_record_ttl` in `lib.rs` rescues records
+/// that have not been written recently.
 pub fn bump_all_registries(env: &Env) {
     // Bump shared singleton/config keys (counters, stats, multisig config).
     for key in &[NEXT_ID, NEXT_REQUEST_ID, PAYMENT_STATS, MULTISIG_CONFIG] {
@@ -243,9 +234,22 @@ pub fn bump_all_registries(env: &Env) {
         BloodStatus::Discarded,
     ] {
         let key = DataKey::StatusUnits(*status);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, MIN_TTL_LEDGERS, EXTENDED_TTL_LEDGERS);
+        bump_persistent(env, &key);
+    }
+
+    // Bump all BloodTypeUnits variants — fixed and enumerable.
+    for bt in &[
+        crate::BloodType::APositive,
+        crate::BloodType::ANegative,
+        crate::BloodType::BPositive,
+        crate::BloodType::BNegative,
+        crate::BloodType::ABPositive,
+        crate::BloodType::ABNegative,
+        crate::BloodType::OPositive,
+        crate::BloodType::ONegative,
+    ] {
+        let key = DataKey::BloodTypeUnits(*bt);
+        bump_persistent(env, &key);
     }
 }
 

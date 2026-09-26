@@ -17,6 +17,8 @@ import { Inject } from '@nestjs/common';
 import { REDIS_CLIENT } from '../redis/redis.constants';
 import { SecurityEventLoggerService } from '../user-activity/security-event-logger.service';
 import { JwtKeyService } from './jwt-key.service';
+import { MFA_TOKEN_AUDIENCE } from './mfa/mfa.constants';
+import { SessionStatusService } from './session-status.service';
 
 /**
  * Authenticated socket with user context attached
@@ -75,6 +77,7 @@ export class WsAuthService {
     private readonly jwtKeyService: JwtKeyService,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
     private readonly securityEventLogger: SecurityEventLoggerService,
+    private readonly sessionStatusService: SessionStatusService,
   ) {}
 
   /**
@@ -265,6 +268,17 @@ export class WsAuthService {
     // Additional expiry check (should be redundant with jwt.verify, but explicit)
     if (payload.exp && payload.exp * 1000 < Date.now()) {
       throw new Error('Token expired');
+    }
+
+    // MFA challenge tokens are not access tokens
+    const aud = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+    if (payload.purpose === 'mfa' || aud.includes(MFA_TOKEN_AUDIENCE)) {
+      throw new Error('Invalid access token');
+    }
+
+    // Reject tokens whose session was logged out or revoked (HTTP parity)
+    if (!(await this.sessionStatusService.isSessionActive(payload.sid))) {
+      throw new Error('Session has been revoked');
     }
 
     // Map HTTP JWT claims to WS user object
