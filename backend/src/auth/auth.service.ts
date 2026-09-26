@@ -161,7 +161,8 @@ export class AuthService {
     // If MFA is enabled, return a challenge instead of full tokens
     const mfaEnabled = await this.mfaService.isMfaEnabled(user.id);
     if (mfaEnabled) {
-      return { mfa_required: true, user_id: user.id };
+      const mfaChallenge = await this.mfaService.createLoginChallenge(user.id);
+      return { mfa_required: true, user_id: user.id, mfa_challenge: mfaChallenge };
     }
 
     const sessionId = randomBytes(16).toString('hex');
@@ -237,7 +238,7 @@ export class AuthService {
    * Exchange a valid MFA token (issued by MfaService) for a full access + refresh token pair.
    */
   async exchangeMfaToken(mfaToken: string, meta: SessionMetadata = {}) {
-    const userId = this.mfaService.verifyMfaToken(mfaToken);
+    const userId = await this.mfaService.verifyMfaToken(mfaToken);
 
     const user = await this.userRepository.findOne({ where: { id: userId } });
     if (!user) {
@@ -245,6 +246,25 @@ export class AuthService {
         JSON.stringify({
           code: ErrorCode.AUTH_INVALID_CREDENTIALS,
           message: 'User not found',
+        }),
+      );
+    }
+
+    // Re-check account state; it may have changed since the password step
+    if (!user.isActive) {
+      throw new ForbiddenException(
+        JSON.stringify({
+          code: ErrorCode.AUTH_FORBIDDEN,
+          message: 'Account is inactive',
+        }),
+      );
+    }
+    await this.ensureAccountIsUsable(user);
+    if (user.lockedUntil && user.lockedUntil.getTime() > Date.now()) {
+      throw new ForbiddenException(
+        JSON.stringify({
+          code: ErrorCode.AUTH_ACCOUNT_LOCKED,
+          message: 'Account is temporarily locked',
         }),
       );
     }
