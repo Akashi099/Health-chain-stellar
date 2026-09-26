@@ -112,3 +112,6 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1441 -->
 - #1441: [contracts] confirm_transfer's expiry-recovery branch writes state and then returns Err, so Soroban rolls all of it back
+
+<!-- handsoff-issue-1442 -->
+- #1442: [contracts] quarantine_blood accepts Discarded/Delivered units, so finalize_quarantine(Release) can bring them back as Available
