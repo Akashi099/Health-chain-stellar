@@ -109,3 +109,6 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1490 -->
 - #1490: [backend/auth] Account lockout is never enforced — ensureAccountIsUsable() has no throw for a still-locked account
+
+<!-- handsoff-issue-1460 -->
+- #1460: [lifebank/payments] Vesting schedules and escrow payments share one undifferentiated per-token balance with no reservation accounting
