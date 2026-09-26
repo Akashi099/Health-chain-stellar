@@ -275,7 +275,5 @@ export class RidersService {
       qb
         .andWhere('rider.latitude IS NOT NULL')
         .andWhere('rider.longitude IS NOT NULL')
-        .andWhere(
-          `(6
 
-/* … truncated 3874 chars — edit only what you need near the top … */
+/* … truncated 105 chars — edit only what you need near the top … */
