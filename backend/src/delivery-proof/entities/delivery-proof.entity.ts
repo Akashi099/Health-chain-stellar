@@ -1,4 +1,4 @@
-import { Column, Entity } from 'typeorm';
+import { Column, Entity, Index } from 'typeorm';
 
 import { BaseEntity } from '../../common/entities/base.entity';
 
@@ -7,6 +7,7 @@ const TEMP_MIN_CELSIUS = 2;
 const TEMP_MAX_CELSIUS = 8;
 
 @Entity('delivery_proofs')
+@Index('uq_delivery_proofs_order_delivery', ['orderId', 'deliveryId'], { unique: true })
 export class DeliveryProofEntity extends BaseEntity {
   @Column({ name: 'delivery_id', type: 'bigint' })
   deliveryId: number;
@@ -82,6 +83,11 @@ export class DeliveryProofEntity extends BaseEntity {
   @Column({ name: 'proof_signature', type: 'text', nullable: true })
   proofSignature: string | null;
 
+  /**
+   * Digest of the full signed payload (all evidential fields). Unique so a
+   * legitimately signed payload cannot be replayed with altered evidence.
+   */
+  @Index('uq_delivery_proofs_payload_digest', { unique: true })
   @Column({ name: 'proof_payload_digest', type: 'varchar', length: 64, nullable: true })
   proofPayloadDigest: string | null;
 

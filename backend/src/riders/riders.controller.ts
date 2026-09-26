@@ -106,6 +106,27 @@ export class RidersController {
   }
 
   @RequirePermissions(Permission.VIEW_RIDERS)
+  @ApiOperation({ summary: 'Get search' })
+  @ApiResponse({ status: 200, description: 'Resource retrieved successfully' })
+  @Get('search')
+  search(
+    @Query(
+      new ValidationPipe({ transform: true, whitelist: true }),
+    )
+    query: PaginationQueryDto,
+  ) {
+    return this.ridersService.search(query);
+  }
+
+  @RequirePermissions(Permission.VIEW_RIDERS)
+  @ApiOperation({ summary: 'Get statistics' })
+  @ApiResponse({ status: 200, description: 'Resource retrieved successfully' })
+  @Get('statistics')
+  getStatistics() {
+    return this.ridersService.getStatistics();
+  }
+
+  @RequirePermissions(Permission.VIEW_RIDERS)
   @ApiOperation({ summary: 'Get :id' })
   @ApiResponse({ status: 200, description: 'Resource retrieved successfully' })
   @Get(':id')
