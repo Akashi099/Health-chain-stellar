@@ -127,6 +127,8 @@ export class RequestStatusService {
 
     this.ordersGateway.emitOrderStatusUpdated({
       orderId: order.id,
+      hospitalId: order.hospitalId,
+      bloodBankId: order.bloodBankId ?? null,
       previousStatus,
       newStatus: nextStatus,
       eventType,
@@ -285,37 +287,29 @@ export class RequestStatusService {
     nextStatus: OrderStatus,
     actorId?: string,
     reason?: string,
-    manager?: EntityManager,
   ): Promise<void> {
     if (!this.blockchainEventRepo) {
       return;
     }
 
     try {
-      const repo = manager
-        ? manager.getRepository(BlockchainEvent)
-        : this.blockchainEventRepo;
-
-      const txHash = `order-status-${order.id}-${Date.now()}`;
-      const entity = repo.create({
-        eventType: 'ORDER_STATUS_UPDATED',
-        transactionHash: txHash,
-        eventData: {
+      await this.blockchainEventRepo.save(
+        this.blockchainEventRepo.create({
           orderId: order.id,
-          previousStatus,
-          nextStatus,
-          actorId: actorId ?? null,
-          reason: reason ?? null,
-        },
-        blockchainTimestamp: new Date(),
-        processed: false,
-      });
-
-      await repo.save(entity);
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : 'Unknown error';
+          eventType: STATUS_TO_EVENT_TYPE[nextStatus],
+          payload: {
+            previousStatus,
+            newStatus: nextStatus,
+            actorId: actorId ?? null,
+            reason: reason ?? null,
+          },
+        }),
+      );
+    } catch (error) {
       this.logger.warn(
-        `Blockchain sync failed for order ${order.id}: ${message}`,
+        `Failed to sync order ${order.id} status change with blockchain: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
       );
     }
   }
@@ -326,16 +320,25 @@ export class RequestStatusService {
     nextStatus: OrderStatus,
     reason?: string,
   ): Promise<void> {
-    if (!this.notificationDispatch) return;
-    await this.notificationDispatch.dispatch({
-      recipientId: order.hospitalId,
-      templateKey: 'order.status.updated',
-      variables: {
+    if (!this.notificationDispatch) {
+      return;
+    }
+
+    try {
+      await this.notificationDispatch.dispatchOrderStatusChange({
         orderId: order.id,
+        hospitalId: order.hospitalId,
+        bloodBankId: order.bloodBankId ?? null,
         previousStatus,
         newStatus: nextStatus,
-        reason: reason ?? '',
-      },
-    });
+        reason: reason ?? null,
+      });
+    } catch (error) {
+      this.logger.warn(
+        `Failed to dispatch notification for order ${order.id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 }
