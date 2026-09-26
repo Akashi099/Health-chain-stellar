@@ -106,3 +106,6 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1485 -->
 - #1485: [lifebank/temperature] pause() does not block propose_threshold_change/apply_threshold_change, contradicting its "all state-mutating functions" contract
+
+<!-- handsoff-issue-1486 -->
+- #1486: [lifebank/temperature] set_threshold/propose_threshold_change never bound min/max to a plausible range, letting cold-chain breach detection be silently disabled
