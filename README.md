@@ -109,3 +109,6 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1490 -->
 - #1490: [backend/auth] Account lockout is never enforced — ensureAccountIsUsable() has no throw for a still-locked account
+
+<!-- handsoff-issue-1448 -->
+- #1448: [lifebank/coordinator] Mirrored RequestStatus enum in coordinator is missing two variants present in the real requests contract, corrupting decode of cross-contract status
