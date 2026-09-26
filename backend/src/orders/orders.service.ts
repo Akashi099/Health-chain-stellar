@@ -124,16 +124,28 @@ export class OrdersService {
       sortBy = 'placedAt',
       sortOrder = 'desc',
     } = params;
-    const scopedHospitalId =
-      actor?.organizationId && (actor.role ?? '').toLowerCase() !== 'admin'
-        ? actor.organizationId
-        : hospitalId;
 
-    const query = this.orderRepo
-      .createQueryBuilder('order')
-      .where('order.hospitalId = :hospitalId', {
-        hospitalId: scopedHospitalId,
-      });
+    const isAdmin = (actor?.role ?? '').toLowerCase() === 'admin';
+
+    // Non-admins are always scoped to their own organization. An org-less
+    // non-admin (e.g. rider, dispatcher, donor) must not be able to list
+    // orders for an arbitrary caller-supplied hospitalId.
+    if (actor && !isAdmin && !actor.organizationId) {
+      return PaginationUtil.createResponse([], page, pageSize, 0);
+    }
+
+    const query = this.orderRepo.createQueryBuilder('order');
+
+    if (actor && !isAdmin) {
+      // Match orders where the actor's org is either the hospital or the
+      // blood bank, so blood-bank tenants see their orders too.
+      query.where(
+        '(order.hospitalId = :orgId OR order.bloodBankId = :orgId)',
+        { orgId: actor.organizationId },
+      );
+    } else if (hospitalId) {
+      query.where('order.hospitalId = :hospitalId', { hospitalId });
+    }
 
     if (params.startDate)
       query.andWhere('order.placedAt >= :startDate', {
@@ -218,30 +230,6 @@ export class OrdersService {
     statusUpdate: UpdateRequestStatusDto | string,
     actorId?: string,
     actorRole?: string,
-    actor?: TenantActorContext,
-  ) {
-    const dto =
-      typeof statusUpdate === 'string'
-        ? { status: statusUpdate as OrderStatus }
-        : statusUpdate;
-    const order = await this.findOrderOrFail(id, actor);
-    const updated = await this.dataSource.transaction(async (manager) => {
-      await this.requestStatusService.applyStatusUpdate(
-        order,
-        dto,
-        actorId,
-        actorRole,
-        manager,
-      );
-      return manager.save(OrderEntity, order);
-    });
-    return { message: 'Order status updated successfully', data: updated };
-  }
+    actor?: TenantActorCo
 
-  async remove(id: string, actorId?: string, actor?: TenantActorContext) {
-    const order = await this.findOrderOrFail(id, actor);
-    await this.dataSource.transaction(async (manager) => {
-      await this.requestStatusService.applyStatusUpdate(
-    
-
-/* … truncated 6514 chars — edit only what you need near the top … */
+/* … truncated 881 chars — edit only what you need near the top … */
