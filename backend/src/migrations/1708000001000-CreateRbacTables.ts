@@ -211,13 +211,15 @@ export class CreateRbacTables1708000001000 implements MigrationInterface {
       );
     }
 
-    // Rider: dispatch, orders, location updates
+    // Rider: dispatch, orders, location updates.
+    // NOTE: riders must NOT hold `manage:dispatch` or `dispatch:override`.
+    // Those permissions let a rider accept/reject assignments on behalf of
+    // other riders or force-assign any order to themselves (see #1538).
     const riderPermissions = [
       'view:order',
       'update:order',
       'view:dispatch',
       'update:dispatch',
-      'manage:dispatch',
       'view:riders',
       'update:rider',
       'view:maps',
