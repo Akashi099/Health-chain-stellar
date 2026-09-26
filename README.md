@@ -115,3 +115,6 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1454 -->
 - #1454: [lifebank/payments] index_by_request never extends its persistent-storage TTL, letting the DuplicatePayment guard silently expire
+
+<!-- handsoff-issue-1455 -->
+- #1455: [lifebank/payments] update_status can silently exit Disputed status, bypassing resolve_dispute and leaving stale dispute fields
