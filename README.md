@@ -115,3 +115,6 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1458 -->
 - #1458: [lifebank/payments] payer/payee/status indexes remain single unbounded Vecs that must be fully loaded and rewritten on every write
+
+<!-- handsoff-issue-1459 -->
+- #1459: [lifebank/payments] create_vesting has no upper bound on cliff_secs/duration_secs, allowing u64 timestamp-addition overflow
