@@ -106,3 +106,6 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1291 -->
 - #1291: [contracts/temperature] log_reading never emits an event for detected violations
+
+<!-- handsoff-issue-1490 -->
+- #1490: [backend/auth] Account lockout is never enforced — ensureAccountIsUsable() has no throw for a still-locked account
