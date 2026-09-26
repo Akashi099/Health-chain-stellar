@@ -115,3 +115,6 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1439 -->
 - #1439: [contracts] raise_dispute builds DisputeMetadata but never stores it, so process_expired_disputes can never auto-refund
+
+<!-- handsoff-issue-1440 -->
+- #1440: [contracts] process_expired_disputes changes Payment and Dispute in memory only, so repeat calls inflate refund stats and emit duplicate refund events
