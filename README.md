@@ -112,3 +112,6 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1448 -->
 - #1448: [lifebank/coordinator] Mirrored RequestStatus enum in coordinator is missing two variants present in the real requests contract, corrupting decode of cross-contract status
+
+<!-- handsoff-issue-1450 -->
+- #1450: [lifebank/identity] register_organization silently overwrites an existing organization record, letting any org wipe its own accumulated rating/reputation on demand
