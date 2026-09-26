@@ -23,7 +23,10 @@ import { UpdateRiderLocationDto } from './dto/update-rider-location.dto';
 import { UpdateRiderStatusDto } from './dto/update-rider-status.dto';
 import { WorkingHoursDto } from './dto/working-hours.dto';
 import { RiderEntity } from './entities/rider.entity';
-import { RiderStatus } from './enums/rider-status.enum';
+import {
+  ALLOWED_STATUS_TRANSITIONS,
+  RiderStatus,
+} from './enums/rider-status.enum';
 
 /** Public record shape returned by getAvailableRiders — maps to RiderEntity */
 export type RiderRecord = RiderEntity & {
@@ -273,139 +276,6 @@ export class RidersService {
         .andWhere('rider.latitude IS NOT NULL')
         .andWhere('rider.longitude IS NOT NULL')
         .andWhere(
-          `(6371 * acos(LEAST(1.0,
-            cos(radians(:lat)) * cos(radians(CAST(rider.latitude AS float))) *
-            cos(radians(CAST(rider.longitude AS float)) - radians(:lng)) +
-            sin(radians(:lat)) * sin(radians(CAST(rider.latitude AS float)))
-          ))) <= :radius`,
-          { lat: dto.latitude, lng: dto.longitude, radius: dto.radiusKm },
-        );
-    }
+          `(6
 
-    const results = await qb.getMany();
-    return {
-      message: 'Availability query successful',
-      data: results,
-      total: results.length,
-    };
-  }
-
-  async getNearbyRiders(latitude: number, longitude: number, radiusKm: number) {
-    const riders = await this.riderRepository.find({
-      where: { status: RiderStatus.AVAILABLE, isVerified: true },
-    });
-
-    const nearbyRiders = riders.filter((rider) => {
-      if (rider.latitude === null || rider.longitude === null) {
-        return false;
-      }
-      return haversineKm(latitude, longitude, rider.latitude, rider.longitude) <= radiusKm;
-    });
-
-    return {
-      message: 'Nearby riders retrieved successfully',
-      data: nearbyRiders,
-    };
-  }
-
-  async getPerformance(id: string): Promise<{
-    message: string;
-    data: {
-      riderId: string;
-      totalDeliveries: number;
-      completedDeliveries: number;
-      cancelledDeliveries: number;
-      failedDeliveries: number;
-      successRate: number;
-      onTimeRate: number;
-      rating: number;
-      status: RiderStatus;
-      isVerified: boolean;
-    };
-  }> {
-    const { data: rider } = await this.findOne(id);
-
-    const total =
-      rider.completedDeliveries +
-      rider.cancelledDeliveries +
-      rider.failedDeliveries;
-
-    const successRate =
-      total === 0
-        ? 0
-        : Math.round((rider.completedDeliveries / total) * 10000) / 100;
-
-    const onTimeRate = successRate;
-
-    return {
-      message: 'Rider performance retrieved successfully',
-      data: {
-        riderId: rider.id,
-        totalDeliveries: total,
-        completedDeliveries: rider.completedDeliveries,
-        cancelledDeliveries: rider.cancelledDeliveries,
-        failedDeliveries: rider.failedDeliveries,
-        successRate,
-        onTimeRate,
-        rating: rider.rating,
-        status: rider.status,
-        isVerified: rider.isVerified,
-      },
-    };
-  }
-
-  async getLeaderboard(limit = 10): Promise<{
-    message: string;
-    data: Array<{
-      rank: number;
-      riderId: string;
-      completedDeliveries: number;
-      successRate: number;
-      rating: number;
-    }>;
-  }> {
-    const riders = await this.riderRepository.find({
-      where: { isVerified: true },
-      order: { completedDeliveries: 'DESC', rating: 'DESC' },
-      take: limit,
-    });
-
-    return {
-      message: 'Leaderboard retrieved successfully',
-      data: riders.map((r, i) => {
-        const total =
-          r.completedDeliveries + r.cancelledDeliveries + r.failedDeliveries;
-        const successRate =
-          total === 0 ? 0 : Math.round((r.completedDeliveries / total) * 10000) / 100;
-        return {
-          rank: i + 1,
-          riderId: r.id,
-          completedDeliveries: r.completedDeliveries,
-          successRate,
-          rating: r.rating,
-        };
-      }),
-    };
-  }
-
-  private emitStatusChangeEvent(rider: RiderEntity, previousStatus: RiderStatus) {
-    if (
-      previousStatus === RiderStatus.OFFLINE &&
-      rider.status === RiderStatus.AVAILABLE
-    ) {
-      this.eventEmitter.emit('rider.online', { riderId: rider.id, userId: rider.userId });
-    } else if (
-      previousStatus !== RiderStatus.OFFLINE &&
-      rider.status === RiderStatus.OFFLINE
-    ) {
-      this.eventEmitter.emit('rider.offline', { riderId: rider.id, userId: rider.userId });
-    }
-
-    this.eventEmitter.emit('rider.status.changed', {
-      riderId: rider.id,
-      userId: rider.userId,
-      previousStatus,
-      newStatus: rider.status,
-    });
-  }
-}
+/* … truncated 3874 chars — edit only what you need near the top … */
