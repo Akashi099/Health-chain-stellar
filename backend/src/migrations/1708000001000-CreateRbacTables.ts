@@ -113,15 +113,54 @@ export class CreateRbacTables1708000001000 implements MigrationInterface {
       }
     }
 
-    // Defensive cleanup: ensure the rider role never holds dispatch-management
-    // or dispatch-override permissions, even if a prior seed granted them.
-    await queryRunner.query(
-      `DELETE FROM "role_permissions"
-       WHERE "role_id" = (SELECT "id" FROM "roles" WHERE "name" = 'rider')
-         AND "permission_id" IN (
-           SELECT "id" FROM "permissions" WHERE "name" IN ('manage:dispatch', 'dispatch:override')
-         )`,
-    );
+    // Rider: dispatch, orders, location updates.
+    // NOTE: riders must NOT hold `manage:dispatch` or `dispatch:override`.
+    // Those permissions let a rider accept/reject assignments on behalf of
+    // other riders or force-assign any order to themselves (see #1538).
+    const riderPermissions = [
+      'view:order',
+      'update:order',
+      'view:dispatch',
+      'update:dispatch',
+      'view:riders',
+      'update:rider',
+      'view:maps',
+      'view:bloodunit:trail',
+      'transfer:custody',
+      'log:temperature',
+      'view:notifications',
+    ];
+
+    for (const permission of riderPermissions) {
+      await queryRunner.query(
+        `INSERT INTO role_permissions (role_id, permission)
+         SELECT id, $1 FROM roles WHERE name = 'rider'
+         ON CONFLICT DO NOTHING`,
+        [permission],
+      );
+    }
+
+    // Vendor: inventory management, blood unit registration
+    const vendorPermissions = [
+      'view:inventory',
+      'create:inventory',
+      'update:inventory',
+      'view:bloodunit:trail',
+      'register:bloodunit',
+      'transfer:custody',
+      'log:temperature',
+      'view:order',
+      'view:notifications',
+    ];
+
+    for (const permission of vendorPermissions) {
+      await queryRunner.query(
+        `INSERT INTO role_permissions (role_id, permission)
+         SELECT id, $1 FROM roles WHERE name = 'vendor'
+         ON CONFLICT DO NOTHING`,
+        [permission],
+      );
+    }
   }
 
   public async down(queryRunner: QueryRunner): Promise<void> {

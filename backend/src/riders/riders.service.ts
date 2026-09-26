@@ -23,7 +23,10 @@ import { UpdateRiderLocationDto } from './dto/update-rider-location.dto';
 import { UpdateRiderStatusDto } from './dto/update-rider-status.dto';
 import { WorkingHoursDto } from './dto/working-hours.dto';
 import { RiderEntity } from './entities/rider.entity';
-import { RiderStatus } from './enums/rider-status.enum';
+import {
+  ALLOWED_STATUS_TRANSITIONS,
+  RiderStatus,
+} from './enums/rider-status.enum';
 
 /** Public record shape returned by getAvailableRiders — maps to RiderEntity */
 export type RiderRecord = RiderEntity & {
@@ -307,7 +310,5 @@ export class RidersService {
       qb
         .andWhere('rider.latitude IS NOT NULL')
         .andWhere('rider.longitude IS NOT NULL')
-        .andWhere(
-          `(6
 
-/* … truncated 3874 chars — edit only what you need near the top … */
+/* … truncated 105 chars — edit only what you need near the top … */

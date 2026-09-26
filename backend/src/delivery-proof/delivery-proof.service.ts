@@ -21,6 +21,8 @@ import { FileOwnerType } from '../file-metadata/entities/file-metadata.entity';
 const TEMP_MIN_CELSIUS = 2;
 const TEMP_MAX_CELSIUS = 6;
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 interface TrustedSignerKey {
   kid: string;
   publicKey: string;
@@ -127,7 +129,11 @@ export class DeliveryProofService {
   async uploadPhoto(orderId: string, file: Express.Multer.File, actor?: DeliveryProofActor) {
     if (!file) throw new BadRequestException('No file uploaded');
 
-    await this.assertCanUploadToOrder(orderId, actor);
+    // Reject path-traversal payloads (e.g. "../../../tmp/x") before the value
+    // is ever embedded in a file name or used as an owner id.
+    if (!UUID_REGEX.test(orderId)) {
+      throw new BadRequestException('orderId must be a valid UUID');
+    }
 
     // Validate against photo policy (MIME, extension, size, content sniffing).
     this.uploadValidation.validate(file, 'photo');
@@ -138,10 +144,18 @@ export class DeliveryProofService {
     const storagePath = this.configService.get<string>('STORAGE_PATH', './uploads');
     if (!fs.existsSync(storagePath)) fs.mkdirSync(storagePath, { recursive: true });
 
+    const storageRoot = path.resolve(storagePath);
     const fileExt = path.extname(file.originalname) || '.png';
     const fileName = `dp-${orderId}-${Date.now()}${fileExt}`;
+    const resolvedPath = path.resolve(storageRoot, fileName);
+
+    // Defense-in-depth: the resolved path must stay inside the storage root.
+    if (resolvedPath !== storageRoot && !resolvedPath.startsWith(storageRoot + path.sep)) {
+      throw new BadRequestException('Invalid storage path');
+    }
+
     try {
-      fs.writeFileSync(path.join(storagePath, fileName), file.buffer);
+      fs.writeFileSync(resolvedPath, file.buffer);
     } catch (err) {
       this.logger.error(`Failed to write file to storage: ${err.message}`);
       throw new BadRequestException('Internal Storage Error');
@@ -152,24 +166,21 @@ export class DeliveryProofService {
     await this.fileMetadata.replace({
       ownerType: FileOwnerType.DELIVERY_PROOF,
       ownerId: orderId,
-      storagePath: path.join(storagePath, fileName),
+      storagePath: resolvedPath,
       originalFilename: file.originalname,
       contentType: file.mimetype,
       sizeBytes: file.size,
       sha256Hash: hash,
     });
 
-    let proof = await this.proofRepo.findOne({ where: { orderId } });
+    const proof = await this.proofRepo.findOne({ where: { orderId } });
     if (!proof) {
-      proof = this.proofRepo.create({
-        orderId,
-        riderId: 'SYSTEM',
-        pickupTimestamp: new Date(),
-        deliveredAt: new Date(),
-        recipientName: 'Automatic Verification',
-        temperatureReadings: [4.0],
-        photoHashes: [],
-      });
+      // A delivery proof requires a NOT NULL deliveryId; without an existing
+      // proof we cannot safely auto-create one, so fail before any on-chain
+      // anchoring leaves an orphan anchor for a proof that does not exist.
+      throw new NotFoundException(
+        `No delivery proof found for order ${orderId}`,
+      );
     }
 
     proof.photoUrl = storageUrl;
@@ -239,41 +250,17 @@ export class DeliveryProofService {
       recipientSignatureUrl: dto.recipientSignatureUrl,
       recipientSignatureHash: dto.recipientSignatureHash,
       temperatureReadings: dto.temperatureReadings,
-      temperatureCelsius: dto.temperatureCelsius,
-      isTemperatureCompliant: dto.isTemperatureCompliant,
-      photoHashes: dto.photoHashes,
-      photoUrl: dto.photoUrl,
-      pickupLocationHash: dto.pickupLocationHash,
-      deliveryLocationHash: dto.deliveryLocationHash,
-      locationHash: dto.locationHash,
-      notes: dto.notes,
-      evidenceDigestReferences: dto.evidenceDigestReferences,
-    };
-    return crypto
-      .createHash('sha256')
-      .update(this.stableStringify(evidence))
-      .digest('hex');
-  }
+      temperatureCelsius: dto.temperatureCelsius ?? null,
+      notes: dto.notes ?? null,
+      isTemperatureCompliant,
+      verified: true,
+      signerKeyId: dto.signerKeyId,
+      signerPublicKey: dto.signerPublicKey,
+      signerRole: dto.signerRole,
+      signedAt,
+      proofSignature: dto.signature,
+      proofPayloadDigest: payloadDigest,
+      trustedTimestampAt,
 
-  async create(dto: CreateDeliveryProofDto, actor?: DeliveryProofActor): Promise<DeliveryProofEntity> {
-    this.assertEvidenceDigestReferences(dto.evidenceDigestReferences);
 
-    if (!dto.requestId) {
-      throw new BadRequestException('requestId is required for delivery proof binding');
-    }
-
-    if (!this.isAdmin(actor)) {
-      if (!actor || dto.riderId !== actor.userId) {
-        throw new NotFoundException('Delivery proof not found');
-      }
-    }
-
-    const pickupTimestamp = new Date(dto.pickupTimestamp);
-    const deliveredAt = new Date(dto.deliveredAt);
-    const signedAt = new Date(dto.signedAt);
-
-    if (deliveredAt < pickupTimestamp) {
-      throw new BadRequestException(
-        'deliveredAt must be af
-
-/* … truncated 3113 chars — edit only what you need near the top … */
+/* … truncated 5374 chars — edit only what you need near the top … */

@@ -1,19 +1,9 @@
-import {
-  Body,
-  Controller,
-  Get,
-  Param,
-  Post,
-  Query,
-  Req,
-  UseGuards,
-} from '@nestjs/common';
-import { Request } from 'express';
-import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
-import { PermissionsGuard } from '../auth/permissions.guard';
-import { RequirePermissions } from '../auth/decorators/permissions.decorator';
-import { Permission } from '../auth/enums/permission.enum';
-import { Role } from '../auth/enums/role.enum';
+import { Body, Controller, Get, Param, ParseUUIDPipe, Post, Query, UploadedFile, UseInterceptors } from '@nestjs/common';
+import { ApiBearerAuth, ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { FileInterceptor } from '@nestjs/platform-express';
+
+import { CreateDeliveryProofDto } from './dto/create-delivery-proof.dto';
+import { DeliveryProofQueryDto } from './dto/delivery-proof-query.dto';
 import { DeliveryProofService } from './delivery-proof.service';
 import {
   CreateDeliveryProofDto,
@@ -39,11 +29,10 @@ export class DeliveryProofController {
   }
 
   @Post(':orderId/upload')
-  @RequirePermissions(Permission.DELIVERY_PROOF_UPLOAD)
-  uploadPhoto(
-    @Param('orderId') orderId: string,
-    @Body() dto: UploadPhotoDto,
-    @Req() req: Request,
+  @UseInterceptors(FileInterceptor('image'))
+  async uploadPhoto(
+    @Param('orderId', new ParseUUIDPipe({ version: '4' })) orderId: string,
+    @UploadedFile() file: any, // Express.Multer.File
   ) {
     return this.deliveryProofService.uploadPhoto(
       orderId,
