@@ -112,3 +112,6 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1456 -->
 - #1456: [lifebank/payments] get_payment_timeline can panic from u32 addition overflow on caller-supplied offset
+
+<!-- handsoff-issue-1458 -->
+- #1458: [lifebank/payments] payer/payee/status indexes remain single unbounded Vecs that must be fully loaded and rewritten on every write
