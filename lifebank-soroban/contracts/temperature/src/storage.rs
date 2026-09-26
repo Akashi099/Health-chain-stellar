@@ -65,3 +65,18 @@ pub fn set_current_page(env: &Env, unit_id: u64, page: u32) {
         .persistent()
         .set(&DataKey::CurrentPage(unit_id), &page);
 }
+
+/// Number of most-recent pages scanned when deriving excursion data.
+/// Bounds per-call work to O(1) in unit lifetime instead of O(total pages),
+/// preventing instruction-limit failures for long-lived, heavily monitored units.
+pub const EXCURSION_SCAN_PAGE_WINDOW: u32 = 8;
+
+/// Returns the inclusive range of page numbers to scan when deriving
+/// excursion data for a unit: the most recent `EXCURSION_SCAN_PAGE_WINDOW`
+/// pages ending at the unit's current page. The scan is bounded regardless
+/// of how many pages the unit has accumulated over its lifetime.
+pub fn get_excursion_scan_range(env: &Env, unit_id: u64) -> (u32, u32) {
+    let current = get_current_page(env, unit_id);
+    let start = current.saturating_sub(EXCURSION_SCAN_PAGE_WINDOW.saturating_sub(1));
+    (start, current)
+}
