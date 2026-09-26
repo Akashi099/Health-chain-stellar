@@ -130,6 +130,16 @@ export class BloodRequestsService {
     return map[level] ?? RequestUrgency.ROUTINE;
   }
 
+  private resolveQueuePriority(urgency: QueueRequestUrgency): number {
+    const priority = QUEUE_PRIORITY[urgency];
+    if (priority === undefined) {
+      throw new Error(
+        `No queue priority configured for urgency "${urgency}"`,
+      );
+    }
+    return priority;
+  }
+
   private async enqueue(saved: BloodRequestEntity): Promise<void> {
     const urgency =
       (saved.urgency as unknown as QueueRequestUrgency) ??
@@ -138,7 +148,7 @@ export class BloodRequestsService {
       'process-request',
       { requestId: saved.id, urgency, enqueuedAt: Date.now() },
       {
-        priority: QUEUE_PRIORITY[urgency],
+        priority: this.resolveQueuePriority(urgency),
         attempts: 3,
         backoff: { type: 'exponential', delay: 5000 },
         removeOnComplete: true,
@@ -207,174 +217,6 @@ export class BloodRequestsService {
         const chainResult = await this.sorobanService.submitTransactionAndWait({
           contractMethod: LIFEBANK_REQUESTS_METHODS.createRequest,
           args: [requestNumber, dto.hospitalId, JSON.stringify(chainPayload)],
-          idempotencyKey: `blood-request:${requestNumber}`,
-          metadata: { requestNumber, hospitalId: dto.hospitalId },
-        });
-        transactionHash = chainResult.transactionHash;
-      } catch (err) {
-        // Blockchain failure — compensate inventory reservations
-        const irrecoverableErr = new BloodRequestIrrecoverableError(
-          `Soroban ${LIFEBANK_REQUESTS_METHODS.createRequest} failed for ${requestNumber}`,
-          {
-            requestNumber,
-            hospitalId: dto.hospitalId,
-            reservedItems: reserved,
-          },
-          err,
-        );
+          idempotencyKey
 
-        const releaseHandlers = reserved.map((r) => ({
-          action: CompensationAction.REVERT_INVENTORY,
-          execute: async () => {
-            await this.inventoryService.releaseStockByBankAndType(
-              r.bloodBankId,
-              r.bloodType,
-              r.quantity,
-            );
-            return true;
-          },
-        }));
-
-        const notifyHandler = {
-          action: CompensationAction.NOTIFY_USER,
-          execute: async () => {
-            try {
-              await this.emailService.sendCreationConfirmationFailure(
-                user.email,
-                requestNumber,
-              );
-              return true;
-            } catch {
-              return false;
-            }
-          },
-        };
-
-        const adminAlertHandler = {
-          action: CompensationAction.NOTIFY_ADMIN,
-          execute: () => {
-            this.logger.error(`[ADMIN ALERT] Blood request on-chain failure`, {
-              requestNumber,
-              hospitalId: dto.hospitalId,
-            });
-            return true;
-          },
-        };
-
-        const flagHandler = {
-          action: CompensationAction.FLAG_FOR_REVIEW,
-          execute: () => true,
-        };
-
-        const result = await this.compensationService.compensate(
-          irrecoverableErr,
-          [...releaseHandlers, notifyHandler, adminAlertHandler, flagHandler],
-          `blood-request:${requestNumber}`,
-        );
-
-        irrecoverableErr.context['failureRecordId'] = result.failureRecordId;
-        throw irrecoverableErr;
-      }
-
-      // 3. Compute triage score
-      const totalRequestedUnits = dto.items.reduce(
-        (sum, i) => sum + (i.quantityMl ?? i.quantity ?? 0),
-        0,
-      );
-      const highestPriority = dto.items.reduce<ItemPriority>((highest, i) => {
-        const priorityOrder: Record<string, number> = {
-          CRITICAL: 4,
-          HIGH: 3,
-          NORMAL: 2,
-          LOW: 1,
-        };
-        const current = (i.priority as ItemPriority) ?? ItemPriority.NORMAL;
-        return (priorityOrder[current] ?? 2) > (priorityOrder[highest] ?? 2)
-          ? current
-          : highest;
-      }, ItemPriority.NORMAL);
-
-      const triage = this.triageScoringService.compute({
-        urgency,
-        itemPriority: highestPriority,
-        requestedUnits: totalRequestedUnits,
-        availableUnits: totalRequestedUnits, // will be refined async
-        requiredByTimestamp: Math.floor(requiredBy.getTime() / 1000),
-        currentTimestamp: Math.floor(Date.now() / 1000),
-      });
-
-      // 4. Persist request
-      const now = Math.floor(Date.now() / 1000);
-      const items = dto.items.map((i) =>
-        this.bloodRequestItemRepo.create({
-          bloodType: i.bloodType.trim() as any,
-          component: i.component as any,
-          quantityMl: i.quantityMl ?? i.quantity ?? 0,
-          priority: (i.priority as ItemPriority) ?? ItemPriority.NORMAL,
-          compatibilityNotes: i.compatibilityNotes,
-        }),
-      );
-
-      const statusHistory = [
-        this.requestStatusHistoryRepo.create({
-          previousStatus: null,
-          newStatus: RequestStatus.PENDING,
-          reason: 'Request created',
-          changedByUserId: user.id,
-        }),
-      ];
-
-      const bloodRequest = this.bloodRequestRepo.create({
-        requestNumber,
-        hospitalId: dto.hospitalId,
-        urgency,
-        createdTimestamp: now,
-        requiredByTimestamp: Math.floor(requiredBy.getTime() / 1000),
-        status: RequestStatus.PENDING,
-        statusUpdatedAt: new Date(),
-        slaResponseDueAt,
-        slaFulfillmentDueAt: requiredBy,
-        blockchainRequestId: requestNumber,
-        blockchainNetwork: 'stellar',
-        blockchainTxHash: transactionHash,
-        blockchainConfirmedAt: new Date(),
-        deliveryAddress: dto.deliveryAddress?.trim() ?? null,
-        notes: dto.notes?.trim() ?? null,
-        createdByUserId: user.id,
-        triageScore: triage.score,
-        triagePolicyVersion: triage.policyVersion,
-        triageFactors: triage.factors,
-        items,
-        statusHistory,
-      } as Partial<BloodRequestEntity>);
-
-      const saved = await this.bloodRequestRepo.save(bloodRequest);
-
-      // 5. Enqueue for processing
-      await this.enqueue(saved);
-
-      // 6. Send confirmation email
-      await this.emailService.sendCreationConfirmation(user.email, saved);
-
-      return { message: 'Blood request created successfully', data: saved };
-    } catch (err) {
-      // Roll back inventory if error is NOT already handled by compensation
-      if (!(err instanceof BloodRequestIrrecoverableError)) {
-        for (const r of [...reserved].reverse()) {
-          try {
-            await this.inventoryService.releaseStockByBankAndType(
-              r.bloodBankId,
-              r.bloodType,
-              r.quantity,
-            );
-          } catch (releaseErr) {
-            this.logger.error(
-              `Failed to release reservation for ${r.bloodBankId}/${r.bloodType}: ${(releaseErr as Error).message}`,
-            );
-          }
-        }
-      }
-      throw err;
-    }
-  }
-}
+/* … truncated 5683 chars — edit only what you need near the top … */
