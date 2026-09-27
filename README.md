@@ -109,3 +109,12 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1490 -->
 - #1490: [backend/auth] Account lockout is never enforced — ensureAccountIsUsable() has no throw for a still-locked account
+
+<!-- handsoff-issue-1441 -->
+- #1441: [contracts] confirm_transfer's expiry-recovery branch writes state and then returns Err, so Soroban rolls all of it back
+
+<!-- handsoff-issue-1442 -->
+- #1442: [contracts] quarantine_blood accepts Discarded/Delivered units, so finalize_quarantine(Release) can bring them back as Available
+
+<!-- handsoff-issue-1443 -->
+- #1443: [contracts] fulfill_request overwrites fulfilled_quantity_ml on each call, so a request split into several deliveries can never become Fulfilled
