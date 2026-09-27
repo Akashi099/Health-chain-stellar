@@ -109,3 +109,12 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1490 -->
 - #1490: [backend/auth] Account lockout is never enforced — ensureAccountIsUsable() has no throw for a still-locked account
+
+<!-- handsoff-issue-1438 -->
+- #1438: [contracts] A single escrow authorized_approver conflicts with both the admin release path and the M-of-N path, blocking releases
+
+<!-- handsoff-issue-1439 -->
+- #1439: [contracts] raise_dispute builds DisputeMetadata but never stores it, so process_expired_disputes can never auto-refund
+
+<!-- handsoff-issue-1440 -->
+- #1440: [contracts] process_expired_disputes changes Payment and Dispute in memory only, so repeat calls inflate refund stats and emit duplicate refund events
