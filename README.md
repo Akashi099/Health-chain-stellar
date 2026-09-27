@@ -110,11 +110,11 @@ For contract deployment, full environment variable reference, and contributor gu
 <!-- handsoff-issue-1490 -->
 - #1490: [backend/auth] Account lockout is never enforced — ensureAccountIsUsable() has no throw for a still-locked account
 
-<!-- handsoff-issue-1448 -->
-- #1448: [lifebank/coordinator] Mirrored RequestStatus enum in coordinator is missing two variants present in the real requests contract, corrupting decode of cross-contract status
+<!-- handsoff-issue-1452 -->
+- #1452: [lifebank/payments] Mirrored BloodRequest struct is missing a field, so every cross-call to the requests contract fails and create_payment/create_escrow become permanently
 
-<!-- handsoff-issue-1450 -->
-- #1450: [lifebank/identity] register_organization silently overwrites an existing organization record, letting any org wipe its own accumulated rating/reputation on demand
+<!-- handsoff-issue-1454 -->
+- #1454: [lifebank/payments] index_by_request never extends its persistent-storage TTL, letting the DuplicatePayment guard silently expire
 
-<!-- handsoff-issue-1451 -->
-- #1451: [lifebank/identity] get_verified_organizations/get_top_rated_organizations perform an unbounded full scan of OrgTypeList with no offset/cursor, regressing as registrations
+<!-- handsoff-issue-1455 -->
+- #1455: [lifebank/payments] update_status can silently exit Disputed status, bypassing resolve_dispute and leaving stale dispute fields
