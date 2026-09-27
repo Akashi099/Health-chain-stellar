@@ -190,9 +190,28 @@ export class OrdersService {
     return this.eventStore.getOrderHistory(orderId);
   }
 
-  async create(dto: CreateOrderDto, actorId?: string) {
+  async create(
+    dto: CreateOrderDto,
+    actorId?: string,
+    actor?: TenantActorContext,
+  ) {
     if (!dto.bloodBankId)
       throw new BadRequestException('bloodBankId is required');
+
+    const isAdmin = (actor?.role ?? '').toLowerCase() === 'admin';
+    if (!isAdmin) {
+      if (!actor?.organizationId) {
+        throw new ForbiddenException(
+          'Caller is not associated with an organization',
+        );
+      }
+      if (dto.hospitalId !== actor.organizationId) {
+        throw new ForbiddenException(
+          'Cannot create orders for another organization',
+        );
+      }
+    }
+
     const restriction =
       await this.orgVerificationLifecycleService.getRestrictionLevel(
         dto.hospitalId,
@@ -254,4 +273,10 @@ export class OrdersService {
     actorRole?: string,
     actor?: TenantActorCo
 
-/* … truncated 881 chars — edit only what you need near the top … */
+  async remove(id: string, actorId?: string, actor?: TenantActorContext) {
+    const order = await this.findOrderOrFail(id, actor);
+    await this.dataSource.transaction(async (manager) => {
+      await this.requestStatusService.applyStatusUpdate(
+    
+
+/* … truncated 6514 chars — edit only what you need near the top … */

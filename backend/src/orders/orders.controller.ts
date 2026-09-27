@@ -184,7 +184,11 @@ export class OrdersController {
   ) {
     const actorId: string | undefined = req.user?.id;
 
-    return this.ordersService.create(createOrderDto, actorId);
+    return this.ordersService.create(createOrderDto, actorId, {
+      userId: req.user?.id ?? 'unknown',
+      role: req.user?.role,
+      organizationId: req.user?.organizationId ?? null,
+    });
   }
 
   @RequirePermissions(Permission.UPDATE_ORDER)
