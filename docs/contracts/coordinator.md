@@ -17,17 +17,34 @@ A workflow expires if `confirm_delivery` is not called within 6 hours of `alloca
 
 ---
 
+## Workflow Identity
+
+A workflow is keyed by its `request_id` (a `u64`). There is no separate
+`workflow_id`: every coordinator entry point that operates on an existing
+workflow takes the `request_id` and looks up the corresponding
+`WorkflowRecord` from persistent storage. `allocate_units` creates the record
+for a request; `confirm_delivery`, `settle_payment`, `rollback`, and
+`expire_workflow` all address it by `request_id`.
+
+---
+
 ## Public Interface
 
 | Function | Parameters | Returns | Auth |
 |---|---|---|---|
 | `initialize` | `env, admin, inventory_contract, requests_contract, payments_contract` | `Result<(), CoordinatorError>` | `admin` |
-| `allocate_units` | `env, caller, request_id, unit_ids: Vec<u64>` | `Result<u64, CoordinatorError>` (workflow_id) | Authorized |
-| `confirm_delivery` | `env, caller, workflow_id, excursion_summary?: ExcursionSummary` | `Result<(), CoordinatorError>` | Authorized |
-| `settle_payment` | `env, caller, workflow_id` | `Result<(), CoordinatorError>` | Authorized |
-| `expire_workflow` | `env, caller, workflow_id` | `Result<(), CoordinatorError>` | Anyone (after timeout) |
+| `allocate_units` | `env, request_id, unit_ids: Vec<u64>, payment_id, caller` | `Result<(), CoordinatorError>` | Authorized |
+| `confirm_delivery` | `env, request_id, caller, excursion_summary?: ExcursionSummary` | `Result<(), CoordinatorError>` | Authorized |
+| `settle_payment` | `env, request_id, caller` | `Result<(), CoordinatorError>` | Authorized |
+| `rollback` | `env, request_id` | `Result<(), CoordinatorError>` | Anyone |
+| `expire_workflow` | `env, request_id` | `Result<(), CoordinatorError>` | Anyone (after timeout) |
 | `flag_temperature_breach` | `env, caller, payment_id, excursion_summary` | `Result<(), CoordinatorError>` | TemperatureContract |
-| `get_workflow` | `env, workflow_id` | `Result<WorkflowRecord, CoordinatorError>` | Public |
+| `get_workflow` | `env, request_id` | `Result<WorkflowRecord, CoordinatorError>` | Public |
+
+> **Note:** End-to-end settlement is currently blocked by #1445 — the
+> coordinator calls the payments contract with the wrong arity. The
+> `settle_payment` flow above is documented as intended behaviour and should
+> not be treated as working until that issue is resolved.
 
 ---
 
@@ -39,8 +56,7 @@ A workflow expires if `confirm_delivery` is not called within 6 hours of `alloca
 | `DataKey::InventoryContract` | Instance | Inventory contract address |
 | `DataKey::RequestsContract` | Instance | Requests contract address |
 | `DataKey::PaymentsContract` | Instance | Payments contract address |
-| `DataKey::WorkflowCounter` | Instance | Auto-increment workflow ID |
-| `DataKey::Workflow(u64)` | Persistent | `WorkflowRecord` by workflow ID |
+| `DataKey::Workflow(u64)` | Persistent | `WorkflowRecord` keyed by `request_id` |
 
 ---
 
@@ -60,7 +76,6 @@ pub enum WorkflowStatus {
 ### `WorkflowRecord`
 ```rust
 pub struct WorkflowRecord {
-    pub id: u64,
     pub request_id: u64,
     pub unit_ids: Vec<u64>,
     pub status: WorkflowStatus,
@@ -90,6 +105,7 @@ pub struct ExcursionSummary {
 | `["workflow", "allocated"]` | `allocate_units` succeeds |
 | `["workflow", "delivered"]` | `confirm_delivery` succeeds |
 | `["workflow", "settled"]` | `settle_payment` succeeds |
+| `["workflow", "rolled_back"]` | `rollback` succeeds |
 | `["workflow", "expired"]` | `expire_workflow` succeeds |
 | `["workflow", "breach"]` | Temperature breach flagged |
 
@@ -102,7 +118,7 @@ pub struct ExcursionSummary {
 | `NotInitialized` | Contract has not been initialized |
 | `AlreadyInitialized` | `initialize` called more than once |
 | `Unauthorized` | Caller not permitted for this action |
-| `WorkflowNotFound` | No workflow with the given ID |
+| `WorkflowNotFound` | No workflow with the given `request_id` |
 | `InvalidWorkflowStatus` | Step called out of sequence |
 | `WorkflowExpired` | Workflow timeout has elapsed |
 | `WorkflowNotExpired` | `expire_workflow` called before timeout |
@@ -114,3 +130,13 @@ pub struct ExcursionSummary {
 | Name | Value | Meaning |
 |---|---|---|
 | `WORKFLOW_TIMEOUT_SECS` | `21600` (6 hours) | Window between allocate and confirm |
+
+---
+
+## Keeping This Table In Sync
+
+The signatures above are generated from the coordinator's `#[contractimpl]`
+block. To regenerate them from the contract spec instead of hand-editing,
+run `stellar contract bindings` against the built coordinator WASM (or use the
+`packages/*-sdk` output) and copy the resulting function signatures here, so
+the table cannot drift from the contract again.
