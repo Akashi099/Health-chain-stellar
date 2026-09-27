@@ -115,22 +115,28 @@ export class RequestStatusService {
       });
     }
 
+    // Restore the amount that was actually reserved at creation time, not the
+    // (possibly edited) current order.quantity. Any post-delivery status is
+    // treated as committed and must not restore stock.
     if (
       nextStatus === OrderStatus.CANCELLED &&
-      previousStatus !== OrderStatus.DELIVERED
+      !COMMITTED_STATUSES.has(previousStatus)
     ) {
-      await this.inventoryService.restoreStockOrThrow(
-        order.bloodBankId ?? '',
-        order.bloodType,
-        Number(order.quantity),
-      );
+      const reservedQuantity = this.resolveReservedQuantity(order);
+      if (reservedQuantity > 0) {
+        await this.inventoryService.restoreStockOrThrow(
+          order.bloodBankId ?? '',
+          order.bloodType,
+          reservedQuantity,
+        );
+      }
     }
 
     if (nextStatus === OrderStatus.DELIVERED) {
       await this.inventoryService.commitFulfillmentStockOrThrow(
         order.bloodBankId ?? '',
         order.bloodType,
-        Number(order.quantity),
+        this.resolveReservedQuantity(order),
       );
     }
 
@@ -168,6 +174,20 @@ export class RequestStatusService {
     );
 
     return { nextStatus, eventType };
+  }
+
+  /**
+   * Resolve the quantity that was actually reserved for this order. Prefers the
+   * persisted `reservedQuantity` captured at creation; falls back to the current
+   * `quantity` for legacy rows that predate the column.
+   */
+  private resolveReservedQuantity(order: OrderEntity): number {
+    const reserved = (order as { reservedQuantity?: number | null })
+      .reservedQuantity;
+    if (reserved !== undefined && reserved !== null) {
+      return Number(reserved);
+    }
+    return Number(order.quantity);
   }
 
   private resolveNextStatus(dto: UpdateRequestStatusDto): OrderStatus {

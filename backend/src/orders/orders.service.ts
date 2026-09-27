@@ -220,7 +220,29 @@ export class OrdersService {
     const order = await this.findOrderOrFail(id, actor);
     if (updateDto.deliveryAddress !== undefined)
       order.deliveryAddress = updateDto.deliveryAddress;
-    if (updateDto.quantity !== undefined) order.quantity = updateDto.quantity;
+    if (updateDto.quantity !== undefined) {
+      // Adjust the reservation to match the new quantity so that a later
+      // cancellation restores exactly what is currently reserved. The
+      // originally reserved amount is preserved for audit/reconciliation.
+      const previousQuantity = Number(order.quantity);
+      const nextQuantity = Number(updateDto.quantity);
+      const delta = nextQuantity - previousQuantity;
+      if (delta > 0) {
+        await this.inventoryService.reserveStockOrThrow(
+          order.bloodBankId ?? '',
+          order.bloodType,
+          delta,
+        );
+      } else if (delta < 0) {
+        await this.inventoryService.restoreStockOrThrow(
+          order.bloodBankId ?? '',
+          order.bloodType,
+          Math.abs(delta),
+        );
+      }
+      order.quantity = updateDto.quantity;
+      order.reservedQuantity = nextQuantity;
+    }
     const updated = await this.orderRepo.save(order);
     return { message: 'Order updated successfully', data: updated };
   }
