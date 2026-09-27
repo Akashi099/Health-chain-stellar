@@ -95,6 +95,7 @@ impl VerificationTrait for VerificationImpl {
     ) -> Result<VerificationMetadata, Error> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        Self::require_not_paused(&env)?;
 
         let org_key = DataKey::Org(org_id.clone());
         let mut organization: Organization = env
@@ -160,6 +161,7 @@ impl VerificationTrait for VerificationImpl {
     ) -> Result<VerificationMetadata, Error> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        Self::require_not_paused(&env)?;
 
         let org_key = DataKey::Org(org_id.clone());
         let mut organization: Organization = env
@@ -263,9 +265,10 @@ impl VerificationTrait for VerificationImpl {
 
         // Return last N events (reverse order)
         let start = all_events.len().saturating_sub(take);
-
-        for i in start..all_events.len() {
-            results.push_back(all_events.get(i).unwrap());
+        for i in (start..all_events.len()).rev() {
+            if let Some(event) = all_events.get(i) {
+                results.push_back(event);
+            }
         }
 
         Ok(results)
@@ -278,18 +281,66 @@ impl VerificationTrait for VerificationImpl {
     ) -> Result<u32, Error> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        Self::require_not_paused(&env)?;
 
         if org_ids.len() > MAX_BATCH_SIZE {
-            return Err(Error::InvalidInput);
+            return Err(Error::BatchTooLarge);
         }
 
         let mut verified_count = 0u32;
+        for org_id in org_ids.iter() {
+            let org_key = DataKey::Org(org_id.clone());
+            let mut organization: Organization = env
+                .storage()
+                .persistent()
+                .get(&org_key)
+                .ok_or(Error::OrganizationNotFound)?;
 
-        for i in 0..org_ids.len() {
-            let org_id = org_ids.get(i).unwrap();
-            if Self::verify_organization(env.clone(), admin.clone(), org_id).is_ok() {
-                verified_count += 1;
+            if organization.verified {
+                continue;
             }
+
+            let now = env.ledger().timestamp();
+            organization.verified = true;
+            organization.verified_timestamp = Some(now);
+
+            env.storage().persistent().set(&org_key, &organization);
+            env.storage()
+                .persistent()
+                .extend_ttl(&org_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+            let metadata = VerificationMetadata {
+                org_id: org_id.clone(),
+                verified: true,
+                verified_at: Some(now),
+                verified_by: Some(admin.clone()),
+                revoked_at: None,
+                revocation_reason: None,
+            };
+
+            let metadata_key = DataKey::VerificationMetadata(org_id.clone());
+            env.storage().persistent().set(&metadata_key, &metadata);
+            env.storage()
+                .persistent()
+                .extend_ttl(&metadata_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+            Self::record_verification_event(
+                &env,
+                &org_id,
+                String::from_str(&env, "verified"),
+                now,
+                &admin,
+                None,
+            );
+
+            OrgVerified {
+                org_id: org_id.clone(),
+                admin: admin.clone(),
+                timestamp: now,
+            }
+            .publish(&env);
+
+            verified_count += 1;
         }
 
         Ok(verified_count)
@@ -303,20 +354,65 @@ impl VerificationTrait for VerificationImpl {
     ) -> Result<u32, Error> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        Self::require_not_paused(&env)?;
 
         if org_ids.len() > MAX_BATCH_SIZE {
-            return Err(Error::InvalidInput);
+            return Err(Error::BatchTooLarge);
         }
 
         let mut revoked_count = 0u32;
+        for org_id in org_ids.iter() {
+            let org_key = DataKey::Org(org_id.clone());
+            let mut organization: Organization = env
+                .storage()
+                .persistent()
+                .get(&org_key)
+                .ok_or(Error::OrganizationNotFound)?;
 
-        for i in 0..org_ids.len() {
-            let org_id = org_ids.get(i).unwrap();
-            if Self::unverify_organization(env.clone(), admin.clone(), org_id, reason.clone())
-                .is_ok()
-            {
-                revoked_count += 1;
+            if !organization.verified {
+                continue;
             }
+
+            let now = env.ledger().timestamp();
+            organization.verified = false;
+            organization.verified_timestamp = None;
+
+            env.storage().persistent().set(&org_key, &organization);
+            env.storage()
+                .persistent()
+                .extend_ttl(&org_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+            let metadata = VerificationMetadata {
+                org_id: org_id.clone(),
+                verified: false,
+                verified_at: None,
+                verified_by: None,
+                revoked_at: Some(now),
+                revocation_reason: Some(reason.clone()),
+            };
+
+            let metadata_key = DataKey::VerificationMetadata(org_id.clone());
+            env.storage().persistent().set(&metadata_key, &metadata);
+            env.storage()
+                .persistent()
+                .extend_ttl(&metadata_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+            Self::record_verification_event(
+                &env,
+                &org_id,
+                String::from_str(&env, "revoked"),
+                now,
+                &admin,
+                Some(reason.clone()),
+            );
+
+            OrgUnverified {
+                org_id: org_id.clone(),
+                reason: reason.clone(),
+            }
+            .publish(&env);
+
+            revoked_count += 1;
         }
 
         Ok(revoked_count)
@@ -324,10 +420,7 @@ impl VerificationTrait for VerificationImpl {
 }
 
 impl VerificationImpl {
-    fn require_admin(env: &Env, account: &Address) -> Result<(), Error> {
-        IdentityContract::require_role(env, account, Role::Admin)
-    }
-
+    /// Record a verification event in the audit trail
     fn record_verification_event(
         env: &Env,
         org_id: &Address,
@@ -336,6 +429,13 @@ impl VerificationImpl {
         actor: &Address,
         reason: Option<String>,
     ) {
+        let events_key = DataKey::VerificationEvents(org_id.clone());
+        let mut events: Vec<VerificationEvent> = env
+            .storage()
+            .persistent()
+            .get(&events_key)
+            .unwrap_or(Vec::new(env));
+
         let event = VerificationEvent {
             org_id: org_id.clone(),
             event_type,
@@ -344,14 +444,20 @@ impl VerificationImpl {
             reason,
         };
 
-        let events_key = DataKey::VerificationEvents(org_id.clone());
-        let mut events: Vec<VerificationEvent> = env
-            .storage()
-            .persistent()
-            .get(&events_key)
-            .unwrap_or(Vec::new(env));
-
         events.push_back(event);
+
+        // Keep only the last 100 events to bound storage growth
+        if events.len() > 100 {
+            let mut trimmed = Vec::new(env);
+            let start = events.len() - 100;
+            for i in start..events.len() {
+                if let Some(e) = events.get(i) {
+                    trimmed.push_back(e);
+                }
+            }
+            events = trimmed;
+        }
+
         env.storage().persistent().set(&events_key, &events);
         env.storage()
             .persistent()

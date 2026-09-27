@@ -110,14 +110,11 @@ For contract deployment, full environment variable reference, and contributor gu
 <!-- handsoff-issue-1490 -->
 - #1490: [backend/auth] Account lockout is never enforced — ensureAccountIsUsable() has no throw for a still-locked account
 
-<!-- handsoff-issue-1460 -->
-- #1460: [lifebank/payments] Vesting schedules and escrow payments share one undifferentiated per-token balance with no reservation accounting
+<!-- handsoff-issue-1448 -->
+- #1448: [lifebank/coordinator] Mirrored RequestStatus enum in coordinator is missing two variants present in the real requests contract, corrupting decode of cross-contract status
 
-<!-- handsoff-issue-1461 -->
-- #1461: [lifebank/reputation] resolve_penalty bypasses the pause() circuit breaker entirely
+<!-- handsoff-issue-1450 -->
+- #1450: [lifebank/identity] register_organization silently overwrites an existing organization record, letting any org wipe its own accumulated rating/reputation on demand
 
-<!-- handsoff-issue-1462 -->
-- #1462: [lifebank/reputation] appeal_penalty's is_appealed flag is fully decorative — appeals never affect the score
-
-<!-- handsoff-issue-1463 -->
-- #1463: [lifebank/reputation] RatingScaleConfig, BadgeConfig and MinimumInteractions are stored at init but never consulted by the scoring algorithm
+<!-- handsoff-issue-1451 -->
+- #1451: [lifebank/identity] get_verified_organizations/get_top_rated_organizations perform an unbounded full scan of OrgTypeList with no offset/cursor, regressing as registrations
