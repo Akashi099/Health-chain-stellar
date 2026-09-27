@@ -39,6 +39,17 @@ const STATUS_TO_EVENT_TYPE: Record<OrderStatus, OrderEventType> = {
   [OrderStatus.CANCELLED]: OrderEventType.ORDER_CANCELLED,
 };
 
+/**
+ * Maps a target status to the action it implies, so that a raw `status`
+ * update is subject to the same role policy as the equivalent `action`.
+ * Statuses without a role-restricted action (e.g. DISPATCHED, IN_TRANSIT)
+ * return undefined and are not role-gated here.
+ */
+const STATUS_TO_IMPLIED_ACTION: Partial<Record<OrderStatus, RequestStatusAction>> = {
+  [OrderStatus.CONFIRMED]: RequestStatusAction.APPROVE,
+  [OrderStatus.DELIVERED]: RequestStatusAction.FULFILL,
+};
+
 @Injectable()
 export class RequestStatusService {
   private readonly logger = new Logger(RequestStatusService.name);
@@ -67,7 +78,9 @@ export class RequestStatusService {
     const previousStatus = order.status;
 
     if (actorRole) {
-      this.enforceActionRole(dto.action, actorRole);
+      const impliedAction =
+        dto.action ?? STATUS_TO_IMPLIED_ACTION[nextStatus];
+      this.enforceActionRole(impliedAction, actorRole);
     }
     this.stateMachine.transition(previousStatus, nextStatus);
 
@@ -102,22 +115,28 @@ export class RequestStatusService {
       });
     }
 
+    // Restore the amount that was actually reserved at creation time, not the
+    // (possibly edited) current order.quantity. Any post-delivery status is
+    // treated as committed and must not restore stock.
     if (
       nextStatus === OrderStatus.CANCELLED &&
-      previousStatus !== OrderStatus.DELIVERED
+      !COMMITTED_STATUSES.has(previousStatus)
     ) {
-      await this.inventoryService.restoreStockOrThrow(
-        order.bloodBankId ?? '',
-        order.bloodType,
-        Number(order.quantity),
-      );
+      const reservedQuantity = this.resolveReservedQuantity(order);
+      if (reservedQuantity > 0) {
+        await this.inventoryService.restoreStockOrThrow(
+          order.bloodBankId ?? '',
+          order.bloodType,
+          reservedQuantity,
+        );
+      }
     }
 
     if (nextStatus === OrderStatus.DELIVERED) {
       await this.inventoryService.commitFulfillmentStockOrThrow(
         order.bloodBankId ?? '',
         order.bloodType,
-        Number(order.quantity),
+        this.resolveReservedQuantity(order),
       );
     }
 
