@@ -184,7 +184,11 @@ export class OrdersController {
   ) {
     const actorId: string | undefined = req.user?.id;
 
-    return this.ordersService.create(createOrderDto, actorId);
+    return this.ordersService.create(createOrderDto, actorId, {
+      userId: req.user?.id ?? 'unknown',
+      role: req.user?.role,
+      organizationId: req.user?.organizationId ?? null,
+    });
   }
 
   @RequirePermissions(Permission.UPDATE_ORDER)
@@ -239,62 +243,6 @@ export class OrdersController {
     const actorId: string | undefined = req.user?.id;
     return this.ordersService.assignRider(id, riderId, actorId, {
       userId: req.user?.id ?? 'unknown',
-      role: req.user?.role,
-      organizationId: req.user?.organizationId ?? null,
-    });
-  }
+      role: req.user?.rol
 
-  @RequirePermissions(Permission.DELETE_ORDER)
-  @ApiOperation({ summary: 'Delete :id' })
-  @ApiResponse({ status: 200, description: 'Resource deleted successfully' })
-  @Delete(':id')
-  @HttpCode(HttpStatus.NO_CONTENT)
-  remove(@Param('id') id: string, @Request() req: AuthenticatedRequest) {
-    const actorId: string | undefined = req.user?.id;
-    return this.ordersService.remove(id, actorId, {
-      userId: req.user?.id ?? 'unknown',
-      role: req.user?.role,
-      organizationId: req.user?.organizationId ?? null,
-    });
-  }
-
-  @RequirePermissions(Permission.UPDATE_ORDER)
-  @ApiOperation({ summary: 'Patch :id raise dispute' })
-  @ApiResponse({ status: 200, description: 'Resource updated successfully' })
-  @Patch(':id/raise-dispute')
-  @HttpCode(HttpStatus.OK)
-  raiseDispute(
-    @Param('id') id: string,
-
-    @Body() dto: RaiseDisputeDto,
-    @Request() req: AuthenticatedRequest,
-  ) {
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-call
-    return this.ordersService.raiseDispute(id, dto, req.user?.id, {
-      userId: req.user?.id ?? 'unknown',
-      role: req.user?.role,
-      organizationId: req.user?.organizationId ?? null,
-    });
-  }
-
-  @RequirePermissions(Permission.UPDATE_ORDER)
-  @Auditable({ action: 'order.resolve-dispute', resourceType: 'Order' })
-  @UseInterceptors(AuditLogInterceptor)
-  @ApiOperation({ summary: 'Patch :id resolve dispute' })
-  @ApiResponse({ status: 200, description: 'Resource updated successfully' })
-  @Patch(':id/resolve-dispute')
-  @HttpCode(HttpStatus.OK)
-  resolveDispute(
-    @Param('id') id: string,
-
-    @Body() dto: ResolveDisputeDto,
-    @Request() req: AuthenticatedRequest,
-  ) {
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-call
-    return this.ordersService.resolveDispute(id, dto, req.user?.id, {
-      userId: req.user?.id ?? 'unknown',
-      role: req.user?.role,
-      organizationId: req.user?.organizationId ?? null,
-    });
-  }
-}
+/* … truncated 2084 chars — edit only what you need near the top … */
