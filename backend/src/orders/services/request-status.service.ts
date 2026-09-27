@@ -39,6 +39,15 @@ const STATUS_TO_EVENT_TYPE: Record<OrderStatus, OrderEventType> = {
   [OrderStatus.CANCELLED]: OrderEventType.ORDER_CANCELLED,
 };
 
+/**
+ * Statuses at or beyond physical delivery. Once an order reaches any of these,
+ * the reserved stock has been committed and must never be restored on a later
+ * cancellation (e.g. DELIVERED -> DISPUTED -> RESOLVED -> CANCELLED).
+ */
+const COMMITTED_STATUSES: ReadonlySet<OrderStatus> = new Set([
+  OrderStatus.DELIVERED,
+]);
+
 @Injectable()
 export class RequestStatusService {
   private readonly logger = new Logger(RequestStatusService.name);
@@ -102,22 +111,28 @@ export class RequestStatusService {
       });
     }
 
+    // Restore the amount that was actually reserved at creation time, not the
+    // (possibly edited) current order.quantity. Any post-delivery status is
+    // treated as committed and must not restore stock.
     if (
       nextStatus === OrderStatus.CANCELLED &&
-      previousStatus !== OrderStatus.DELIVERED
+      !COMMITTED_STATUSES.has(previousStatus)
     ) {
-      await this.inventoryService.restoreStockOrThrow(
-        order.bloodBankId ?? '',
-        order.bloodType,
-        Number(order.quantity),
-      );
+      const reservedQuantity = this.resolveReservedQuantity(order);
+      if (reservedQuantity > 0) {
+        await this.inventoryService.restoreStockOrThrow(
+          order.bloodBankId ?? '',
+          order.bloodType,
+          reservedQuantity,
+        );
+      }
     }
 
     if (nextStatus === OrderStatus.DELIVERED) {
       await this.inventoryService.commitFulfillmentStockOrThrow(
         order.bloodBankId ?? '',
         order.bloodType,
-        Number(order.quantity),
+        this.resolveReservedQuantity(order),
       );
     }
 
@@ -155,6 +170,20 @@ export class RequestStatusService {
     );
 
     return { nextStatus, eventType };
+  }
+
+  /**
+   * Resolve the quantity that was actually reserved for this order. Prefers the
+   * persisted `reservedQuantity` captured at creation; falls back to the current
+   * `quantity` for legacy rows that predate the column.
+   */
+  private resolveReservedQuantity(order: OrderEntity): number {
+    const reserved = (order as { reservedQuantity?: number | null })
+      .reservedQuantity;
+    if (reserved !== undefined && reserved !== null) {
+      return Number(reserved);
+    }
+    return Number(order.quantity);
   }
 
   private resolveNextStatus(dto: UpdateRequestStatusDto): OrderStatus {
@@ -278,6 +307,9 @@ export class RequestStatusService {
           ),
         );
         break;
+
+      default:
+        break;
     }
   }
 
@@ -307,8 +339,8 @@ export class RequestStatusService {
       );
     } catch (error) {
       this.logger.warn(
-        `Failed to sync order ${order.id} status change with blockchain: ${
-          error instanceof Error ? error.message : String(error)
+        `Failed to sync order ${order.id} status with blockchain: ${
+          (error as Error).message
         }`,
       );
     }
@@ -336,7 +368,7 @@ export class RequestStatusService {
     } catch (error) {
       this.logger.warn(
         `Failed to dispatch notification for order ${order.id}: ${
-          error instanceof Error ? error.message : String(error)
+          (error as Error).message
         }`,
       );
     }
