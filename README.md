@@ -110,11 +110,11 @@ For contract deployment, full environment variable reference, and contributor gu
 <!-- handsoff-issue-1490 -->
 - #1490: [backend/auth] Account lockout is never enforced — ensureAccountIsUsable() has no throw for a still-locked account
 
-<!-- handsoff-issue-1441 -->
-- #1441: [contracts] confirm_transfer's expiry-recovery branch writes state and then returns Err, so Soroban rolls all of it back
+<!-- handsoff-issue-1456 -->
+- #1456: [lifebank/payments] get_payment_timeline can panic from u32 addition overflow on caller-supplied offset
 
-<!-- handsoff-issue-1442 -->
-- #1442: [contracts] quarantine_blood accepts Discarded/Delivered units, so finalize_quarantine(Release) can bring them back as Available
+<!-- handsoff-issue-1458 -->
+- #1458: [lifebank/payments] payer/payee/status indexes remain single unbounded Vecs that must be fully loaded and rewritten on every write
 
-<!-- handsoff-issue-1443 -->
-- #1443: [contracts] fulfill_request overwrites fulfilled_quantity_ml on each call, so a request split into several deliveries can never become Fulfilled
+<!-- handsoff-issue-1459 -->
+- #1459: [lifebank/payments] create_vesting has no upper bound on cliff_secs/duration_secs, allowing u64 timestamp-addition overflow
