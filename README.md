@@ -110,5 +110,14 @@ For contract deployment, full environment variable reference, and contributor gu
 <!-- handsoff-issue-1490 -->
 - #1490: [backend/auth] Account lockout is never enforced — ensureAccountIsUsable() has no throw for a still-locked account
 
-<!-- handsoff-issue-1444 -->
-- #1444: [contracts] cancel_request can cancel Rejected, Disputed, and Resolved requests, which the request state machine forbids
+<!-- handsoff-issue-1460 -->
+- #1460: [lifebank/payments] Vesting schedules and escrow payments share one undifferentiated per-token balance with no reservation accounting
+
+<!-- handsoff-issue-1461 -->
+- #1461: [lifebank/reputation] resolve_penalty bypasses the pause() circuit breaker entirely
+
+<!-- handsoff-issue-1462 -->
+- #1462: [lifebank/reputation] appeal_penalty's is_appealed flag is fully decorative — appeals never affect the score
+
+<!-- handsoff-issue-1463 -->
+- #1463: [lifebank/reputation] RatingScaleConfig, BadgeConfig and MinimumInteractions are stored at init but never consulted by the scoring algorithm
