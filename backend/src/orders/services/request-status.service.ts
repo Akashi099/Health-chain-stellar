@@ -40,13 +40,15 @@ const STATUS_TO_EVENT_TYPE: Record<OrderStatus, OrderEventType> = {
 };
 
 /**
- * Statuses at or beyond physical delivery. Once an order reaches any of these,
- * the reserved stock has been committed and must never be restored on a later
- * cancellation (e.g. DELIVERED -> DISPUTED -> RESOLVED -> CANCELLED).
+ * Maps a target status to the action it implies, so that a raw `status`
+ * update is subject to the same role policy as the equivalent `action`.
+ * Statuses without a role-restricted action (e.g. DISPATCHED, IN_TRANSIT)
+ * return undefined and are not role-gated here.
  */
-const COMMITTED_STATUSES: ReadonlySet<OrderStatus> = new Set([
-  OrderStatus.DELIVERED,
-]);
+const STATUS_TO_IMPLIED_ACTION: Partial<Record<OrderStatus, RequestStatusAction>> = {
+  [OrderStatus.CONFIRMED]: RequestStatusAction.APPROVE,
+  [OrderStatus.DELIVERED]: RequestStatusAction.FULFILL,
+};
 
 @Injectable()
 export class RequestStatusService {
@@ -76,7 +78,9 @@ export class RequestStatusService {
     const previousStatus = order.status;
 
     if (actorRole) {
-      this.enforceActionRole(dto.action, actorRole);
+      const impliedAction =
+        dto.action ?? STATUS_TO_IMPLIED_ACTION[nextStatus];
+      this.enforceActionRole(impliedAction, actorRole);
     }
     this.stateMachine.transition(previousStatus, nextStatus);
 
