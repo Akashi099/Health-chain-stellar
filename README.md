@@ -99,7 +99,7 @@ For contract deployment, full environment variable reference, and contributor gu
 | `backend/` | [Backend README](./backend/README.md) |
 | `contracts/` | [Contracts README](./contracts/README.md) |
 | `lifebank-soroban/` | [Lifebank Soroban README](./lifebank-soroban/README.md) |
-| `docs/contracts/` | [Contract Reference Docs](./docs/contracts/) |
+| `lifebank-soroban/docs/contracts/` | [Contract Reference Docs](./lifebank-soroban/docs/contracts/) |
 | `docs/architecture.md` | [Architecture Diagram](./docs/architecture.md) |
 
 ## Handsoff notes

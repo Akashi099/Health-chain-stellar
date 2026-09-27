@@ -177,17 +177,29 @@ export class RequestStatusService {
   }
 
   /**
-   * Resolve the quantity that was actually reserved for this order. Prefers the
-   * persisted `reservedQuantity` captured at creation; falls back to the current
-   * `quantity` for legacy rows that predate the column.
+   * Cancel an order through the order state machine so that reserved inventory
+   * is released, an ORDER_CANCELLED event-store row is written, and the
+   * order.cancelled domain event / WebSocket update / notification are emitted.
+   *
+   * Used by the org verification lifecycle (suspend/unverify with CANCEL_ALL)
+   * instead of a raw repository UPDATE that bypassed all of the above.
    */
-  private resolveReservedQuantity(order: OrderEntity): number {
-    const reserved = (order as { reservedQuantity?: number | null })
-      .reservedQuantity;
-    if (reserved !== undefined && reserved !== null) {
-      return Number(reserved);
-    }
-    return Number(order.quantity);
+  async cancelOrder(
+    order: OrderEntity,
+    reason?: string,
+    actorId?: string,
+    manager?: EntityManager,
+  ): Promise<{ nextStatus: OrderStatus; eventType: OrderEventType }> {
+    return this.applyStatusUpdate(
+      order,
+      {
+        action: RequestStatusAction.CANCEL,
+        reason: reason ?? 'Order cancelled by organization lifecycle policy',
+      },
+      actorId,
+      undefined,
+      manager,
+    );
   }
 
   private resolveNextStatus(dto: UpdateRequestStatusDto): OrderStatus {
@@ -332,18 +344,15 @@ export class RequestStatusService {
       await this.blockchainEventRepo.save(
         this.blockchainEventRepo.create({
           orderId: order.id,
-          eventType: STATUS_TO_EVENT_TYPE[nextStatus],
-          payload: {
-            previousStatus,
-            newStatus: nextStatus,
-            actorId: actorId ?? null,
-            reason: reason ?? null,
-          },
+          previousStatus,
+          newStatus: nextStatus,
+          actorId: actorId ?? null,
+          reason: reason ?? null,
         }),
       );
     } catch (error) {
       this.logger.warn(
-        `Failed to sync order ${order.id} status with blockchain: ${
+        `Failed to sync order ${order.id} status change with blockchain: ${
           (error as Error).message
         }`,
       );
