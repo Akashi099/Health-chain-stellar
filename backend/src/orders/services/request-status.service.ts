@@ -157,6 +157,32 @@ export class RequestStatusService {
     return { nextStatus, eventType };
   }
 
+  /**
+   * Cancel an order through the order state machine so that reserved inventory
+   * is released, an ORDER_CANCELLED event-store row is written, and the
+   * order.cancelled domain event / WebSocket update / notification are emitted.
+   *
+   * Used by the org verification lifecycle (suspend/unverify with CANCEL_ALL)
+   * instead of a raw repository UPDATE that bypassed all of the above.
+   */
+  async cancelOrder(
+    order: OrderEntity,
+    reason?: string,
+    actorId?: string,
+    manager?: EntityManager,
+  ): Promise<{ nextStatus: OrderStatus; eventType: OrderEventType }> {
+    return this.applyStatusUpdate(
+      order,
+      {
+        action: RequestStatusAction.CANCEL,
+        reason: reason ?? 'Order cancelled by organization lifecycle policy',
+      },
+      actorId,
+      undefined,
+      manager,
+    );
+  }
+
   private resolveNextStatus(dto: UpdateRequestStatusDto): OrderStatus {
     if (dto.status) {
       return dto.status;
@@ -278,6 +304,9 @@ export class RequestStatusService {
           ),
         );
         break;
+
+      default:
+        break;
     }
   }
 
@@ -296,19 +325,16 @@ export class RequestStatusService {
       await this.blockchainEventRepo.save(
         this.blockchainEventRepo.create({
           orderId: order.id,
-          eventType: STATUS_TO_EVENT_TYPE[nextStatus],
-          payload: {
-            previousStatus,
-            newStatus: nextStatus,
-            actorId: actorId ?? null,
-            reason: reason ?? null,
-          },
+          previousStatus,
+          newStatus: nextStatus,
+          actorId: actorId ?? null,
+          reason: reason ?? null,
         }),
       );
     } catch (error) {
       this.logger.warn(
         `Failed to sync order ${order.id} status change with blockchain: ${
-          error instanceof Error ? error.message : String(error)
+          (error as Error).message
         }`,
       );
     }
@@ -336,7 +362,7 @@ export class RequestStatusService {
     } catch (error) {
       this.logger.warn(
         `Failed to dispatch notification for order ${order.id}: ${
-          error instanceof Error ? error.message : String(error)
+          (error as Error).message
         }`,
       );
     }
