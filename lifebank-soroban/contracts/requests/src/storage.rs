@@ -15,10 +15,17 @@ pub fn is_initialized(env: &Env) -> bool {
 
 pub fn require_initialized(env: &Env) -> Result<(), ContractError> {
     if is_initialized(env) {
+        bump_instance_ttl(env);
         Ok(())
     } else {
         Err(ContractError::NotInitialized)
     }
+}
+
+pub fn bump_instance_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
 }
 
 pub fn set_initialized(env: &Env) {
@@ -123,7 +130,6 @@ pub fn revoke_rider(env: &Env, rider: &Address) {
         .remove(&DataKey::AuthorizedRider(rider.clone()));
 }
 
-#[allow(dead_code)]
 pub fn is_rider_authorized(env: &Env, rider: &Address) -> bool {
     env.storage()
         .instance()
@@ -173,6 +179,27 @@ pub fn append_to_hospital_requests(env: &Env, hospital: &Address, request_id: u6
         .unwrap_or_else(|| soroban_sdk::Vec::new(env));
     ids.push_back(request_id);
     env.storage().persistent().set(&key, &ids);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+}
+
+/// Remove a terminal-state request ID from a hospital's index to prevent unbounded growth.
+pub fn remove_from_hospital_requests(env: &Env, hospital: &Address, request_id: u64) {
+    let key = DataKey::HospitalRequestIds(hospital.clone());
+    let ids: soroban_sdk::Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+    let mut pruned: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(env);
+    for i in 0..ids.len() {
+        let id = ids.get(i).unwrap();
+        if id != request_id {
+            pruned.push_back(id);
+        }
+    }
+    env.storage().persistent().set(&key, &pruned);
     env.storage()
         .persistent()
         .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
