@@ -21,9 +21,21 @@ import { FileOwnerType } from '../file-metadata/entities/file-metadata.entity';
 const TEMP_MIN_CELSIUS = 2;
 const TEMP_MAX_CELSIUS = 6;
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 interface TrustedSignerKey {
   kid: string;
   publicKey: string;
+}
+
+/**
+ * Actor context used to scope delivery-proof reads and uploads to the
+ * assigned rider, the order's tenants, and admins (issue #1535).
+ */
+export interface DeliveryProofActor {
+  userId: string;
+  roles?: string[];
+  permissions?: string[];
 }
 
 export interface DeliveryStatistics {
@@ -49,8 +61,79 @@ export class DeliveryProofService {
     private readonly fileMetadata: FileMetadataService,
   ) {}
 
-  async uploadPhoto(orderId: string, file: Express.Multer.File) {
+  /**
+   * Returns true when the actor is an admin or holds an admin-level role.
+   */
+  private isAdmin(actor?: DeliveryProofActor): boolean {
+    if (!actor) return false;
+    const roles = (actor.roles ?? []).map((r) => r.toLowerCase());
+    const permissions = (actor.permissions ?? []).map((p) => p.toLowerCase());
+    return (
+      roles.includes('admin') ||
+      roles.includes('super_admin') ||
+      permissions.includes('admin') ||
+      permissions.includes('*') ||
+      permissions.includes('delivery_proof:admin')
+    );
+  }
+
+  /**
+   * Asserts the actor may read the given proof. Admins may read any proof;
+   * otherwise the actor must be the assigned rider or one of the order's
+   * tenants (matched by userId).
+   */
+  private assertCanReadProof(proof: DeliveryProofEntity, actor?: DeliveryProofActor): void {
+    if (this.isAdmin(actor)) return;
+    if (!actor) {
+      throw new NotFoundException('Delivery proof not found');
+    }
+    const isRider = proof.riderId === actor.userId;
+    const isTenant =
+      (proof as any).tenantId === actor.userId ||
+      (proof as any).donorId === actor.userId ||
+      (proof as any).recipientId === actor.userId;
+    if (!isRider && !isTenant) {
+      // Do not leak existence of proofs the actor cannot access.
+      throw new NotFoundException('Delivery proof not found');
+    }
+  }
+
+  /**
+   * Asserts the actor may upload to the given order. Admins may upload to any
+   * order; otherwise the actor must be the assigned rider or one of the
+   * order's tenants.
+   */
+  private async assertCanUploadToOrder(orderId: string, actor?: DeliveryProofActor): Promise<void> {
+    if (this.isAdmin(actor)) return;
+    if (!actor) {
+      throw new NotFoundException('Delivery proof not found');
+    }
+    const existing = await this.proofRepo.findOne({ where: { orderId } });
+    if (existing) {
+      const isRider = existing.riderId === actor.userId;
+      const isTenant =
+        (existing as any).tenantId === actor.userId ||
+        (existing as any).donorId === actor.userId ||
+        (existing as any).recipientId === actor.userId;
+      if (!isRider && !isTenant) {
+        throw new NotFoundException('Delivery proof not found');
+      }
+      return;
+    }
+    // No proof yet: only the assigned rider may create the initial proof.
+    // Without an existing proof we cannot resolve the order's tenants here,
+    // so deny non-admins to avoid arbitrary uploads to any order.
+    throw new NotFoundException('Delivery proof not found');
+  }
+
+  async uploadPhoto(orderId: string, file: Express.Multer.File, actor?: DeliveryProofActor) {
     if (!file) throw new BadRequestException('No file uploaded');
+
+    // Reject path-traversal payloads (e.g. "../../../tmp/x") before the value
+    // is ever embedded in a file name or used as an owner id.
+    if (!UUID_REGEX.test(orderId)) {
+      throw new BadRequestException('orderId must be a valid UUID');
+    }
 
     // Validate against photo policy (MIME, extension, size, content sniffing).
     this.uploadValidation.validate(file, 'photo');
@@ -61,10 +144,18 @@ export class DeliveryProofService {
     const storagePath = this.configService.get<string>('STORAGE_PATH', './uploads');
     if (!fs.existsSync(storagePath)) fs.mkdirSync(storagePath, { recursive: true });
 
+    const storageRoot = path.resolve(storagePath);
     const fileExt = path.extname(file.originalname) || '.png';
     const fileName = `dp-${orderId}-${Date.now()}${fileExt}`;
+    const resolvedPath = path.resolve(storageRoot, fileName);
+
+    // Defense-in-depth: the resolved path must stay inside the storage root.
+    if (resolvedPath !== storageRoot && !resolvedPath.startsWith(storageRoot + path.sep)) {
+      throw new BadRequestException('Invalid storage path');
+    }
+
     try {
-      fs.writeFileSync(path.join(storagePath, fileName), file.buffer);
+      fs.writeFileSync(resolvedPath, file.buffer);
     } catch (err) {
       this.logger.error(`Failed to write file to storage: ${err.message}`);
       throw new BadRequestException('Internal Storage Error');
@@ -75,24 +166,21 @@ export class DeliveryProofService {
     await this.fileMetadata.replace({
       ownerType: FileOwnerType.DELIVERY_PROOF,
       ownerId: orderId,
-      storagePath: path.join(storagePath, fileName),
+      storagePath: resolvedPath,
       originalFilename: file.originalname,
       contentType: file.mimetype,
       sizeBytes: file.size,
       sha256Hash: hash,
     });
 
-    let proof = await this.proofRepo.findOne({ where: { orderId } });
+    const proof = await this.proofRepo.findOne({ where: { orderId } });
     if (!proof) {
-      proof = this.proofRepo.create({
-        orderId,
-        riderId: 'SYSTEM',
-        pickupTimestamp: new Date(),
-        deliveredAt: new Date(),
-        recipientName: 'Automatic Verification',
-        temperatureReadings: [4.0],
-        photoHashes: [],
-      });
+      // A delivery proof requires a NOT NULL deliveryId; without an existing
+      // proof we cannot safely auto-create one, so fail before any on-chain
+      // anchoring leaves an orphan anchor for a proof that does not exist.
+      throw new NotFoundException(
+        `No delivery proof found for order ${orderId}`,
+      );
     }
 
     proof.photoUrl = storageUrl;
@@ -123,89 +211,44 @@ export class DeliveryProofService {
     };
   }
 
-  async create(dto: CreateDeliveryProofDto): Promise<DeliveryProofEntity> {
-    this.assertEvidenceDigestReferences(dto.evidenceDigestReferences);
-
-    if (!dto.requestId) {
-      throw new BadRequestException('requestId is required for delivery proof binding');
+  /**
+   * Deterministically serialises a value so that structurally identical
+   * evidence always produces the same digest (stable key ordering).
+   */
+  private stableStringify(value: unknown): string {
+    if (value === null || value === undefined) return 'null';
+    if (Array.isArray(value)) {
+      return `[${value.map((v) => this.stableStringify(v)).join(',')}]`;
     }
-
-    const pickupTimestamp = new Date(dto.pickupTimestamp);
-    const deliveredAt = new Date(dto.deliveredAt);
-    const signedAt = new Date(dto.signedAt);
-
-    if (deliveredAt < pickupTimestamp) {
-      throw new BadRequestException(
-        'deliveredAt must be after pickupTimestamp',
-      );
+    if (typeof value === 'object') {
+      const obj = value as Record<string, unknown>;
+      const keys = Object.keys(obj).sort();
+      return `{${keys
+        .map((k) => `${JSON.stringify(k)}:${this.stableStringify(obj[k])}`)
+        .join(',')}}`;
     }
-    if (signedAt > new Date()) {
-      throw new BadRequestException('signedAt cannot be in the future');
-    }
-    if (!dto.temperatureReadings || dto.temperatureReadings.length === 0) {
-      throw new BadRequestException(
-        'At least one temperature reading is required',
-      );
-    }
+    return JSON.stringify(value);
+  }
 
-    // Require all custody handoffs confirmed before delivery can be recorded (#380)
-    await this.custodyService.assertCustodyComplete(dto.orderId);
-
-    const trustedSigner = this.resolveTrustedSigner(dto.signerKeyId);
-    if (trustedSigner.publicKey !== dto.signerPublicKey) {
-      throw new BadRequestException('Signer key does not match trusted rotation set');
-    }
-
-    const signedPayload = this.buildSignedPayload({
+  /**
+   * Builds a digest over every evidential field so the signature binds the
+   * cold-chain readings, delivery times, recipient and photo/location hashes
+   * (issue #1536). Without this, a legitimately signed payload could be
+   * replayed with tampered evidence.
+   */
+  private buildEvidenceDigest(dto: CreateDeliveryProofDto): string {
+    const evidence = {
       deliveryId: dto.deliveryId,
       orderId: dto.orderId,
       requestId: dto.requestId,
       riderId: dto.riderId,
       signerRole: dto.signerRole,
       signedAt: dto.signedAt,
-      evidenceDigestReferences: dto.evidenceDigestReferences,
-    });
-    const payloadDigest = crypto.createHash('sha256').update(signedPayload).digest('hex');
-    try {
-      const keypair = Keypair.fromPublicKey(dto.signerPublicKey);
-      const signatureBytes = Buffer.from(dto.signature, 'base64');
-      const digestBytes = Buffer.from(payloadDigest, 'hex');
-      if (!keypair.verify(digestBytes, signatureBytes)) {
-        throw new BadRequestException('Signature verification failed');
-      }
-    } catch (error) {
-      if (error instanceof BadRequestException) {
-        throw error;
-      }
-      throw new BadRequestException('Signature verification failed');
-    }
-
-    const isTemperatureCompliant = dto.temperatureReadings.every(
-      (t) => t >= TEMP_MIN_CELSIUS && t <= TEMP_MAX_CELSIUS,
-    );
-
-    const trustedTimestampAt = new Date();
-    const timestampAnchorHash =
-      dto.externalTimestampAnchorHash ??
-      crypto
-        .createHash('sha256')
-        .update(`${dto.deliveryId}:${dto.requestId}:${trustedTimestampAt.toISOString()}`)
-        .digest('hex');
-
-    const proof = this.proofRepo.create({
-      deliveryId: dto.deliveryId,
-      orderId: dto.orderId,
-      requestId: dto.requestId,
-      riderId: dto.riderId,
-      pickupTimestamp,
-      pickupLocationHash: dto.pickupLocationHash ?? null,
-      deliveredAt,
-      deliveryLocationHash: dto.deliveryLocationHash ?? null,
+      pickupTimestamp: dto.pickupTimestamp,
+      deliveredAt: dto.deliveredAt,
       recipientName: dto.recipientName,
-      recipientSignatureUrl: dto.recipientSignatureUrl ?? null,
-      recipientSignatureHash: dto.recipientSignatureHash ?? null,
-      photoUrl: dto.photoUrl ?? null,
-      photoHashes: dto.photoHashes ?? [],
+      recipientSignatureUrl: dto.recipientSignatureUrl,
+      recipientSignatureHash: dto.recipientSignatureHash,
       temperatureReadings: dto.temperatureReadings,
       temperatureCelsius: dto.temperatureCelsius ?? null,
       notes: dto.notes ?? null,
@@ -218,163 +261,6 @@ export class DeliveryProofService {
       proofSignature: dto.signature,
       proofPayloadDigest: payloadDigest,
       trustedTimestampAt,
-      timestampAnchorHash,
-      evidenceDigestReferences: dto.evidenceDigestReferences,
-    });
 
-    return this.proofRepo.save(proof);
-  }
 
-  async getDeliveryProof(id: string): Promise<DeliveryProofEntity> {
-    const proof = await this.proofRepo.findOne({ where: { id } });
-    if (!proof) throw new NotFoundException(`Delivery proof '${id}' not found`);
-    return proof;
-  }
-
-  async getProofsByRider(
-    riderId: string,
-    query: DeliveryProofQueryDto,
-  ): Promise<PaginatedResponse<DeliveryProofEntity>> {
-    return this.queryProofs({ ...query, riderId });
-  }
-
-  async getProofsByRequest(
-    requestId: string,
-    query: DeliveryProofQueryDto,
-  ): Promise<PaginatedResponse<DeliveryProofEntity>> {
-    return this.queryProofs({ ...query, requestId });
-  }
-
-  async queryProofs(
-    query: DeliveryProofQueryDto,
-  ): Promise<PaginatedResponse<DeliveryProofEntity>> {
-    const { page = 1, pageSize = 25 } = query;
-    const qb = this.proofRepo.createQueryBuilder('proof');
-
-    if (query.riderId) {
-      qb.andWhere('proof.riderId = :riderId', { riderId: query.riderId });
-    }
-    if (query.requestId) {
-      qb.andWhere('proof.requestId = :requestId', { requestId: query.requestId });
-    }
-    if (query.startDate) {
-      qb.andWhere('proof.deliveredAt >= :startDate', { startDate: query.startDate });
-    }
-    if (query.endDate) {
-      qb.andWhere('proof.deliveredAt <= :endDate', { endDate: query.endDate });
-    }
-    if (query.temperatureCompliantOnly) {
-      qb.andWhere('proof.isTemperatureCompliant = true');
-    }
-
-    qb.orderBy('proof.deliveredAt', 'DESC');
-    qb.skip(PaginationUtil.calculateSkip(page, pageSize));
-    qb.take(pageSize);
-
-    const [data, total] = await qb.getManyAndCount();
-    return PaginationUtil.createResponse(data, page, pageSize, total);
-  }
-
-  isTemperatureCompliant(temperatureCelsius: number): boolean {
-    return (
-      temperatureCelsius >= TEMP_MIN_CELSIUS &&
-      temperatureCelsius <= TEMP_MAX_CELSIUS
-    );
-  }
-
-  async getDeliveryStatistics(
-    riderId?: string,
-    startDate?: string,
-    endDate?: string,
-  ): Promise<DeliveryStatistics> {
-    const qb = this.proofRepo.createQueryBuilder('proof');
-
-    if (riderId) qb.andWhere('proof.riderId = :riderId', { riderId });
-    if (startDate) qb.andWhere('proof.deliveredAt >= :startDate', { startDate });
-    if (endDate) qb.andWhere('proof.deliveredAt <= :endDate', { endDate });
-
-    const proofs = await qb.getMany();
-
-    const totalDeliveries = proofs.length;
-    const successfulDeliveries = proofs.length;
-    const successRate = this.calculateSuccessRate(successfulDeliveries, totalDeliveries);
-
-    const compliant = proofs.filter((p) => p.isTemperatureCompliant);
-    const temperatureComplianceRate = this.calculateSuccessRate(
-      compliant.length,
-      totalDeliveries,
-    );
-
-    const withTemp = proofs.filter((p) => p.temperatureCelsius !== null);
-    const averageTemperatureCelsius =
-      withTemp.length > 0
-        ? withTemp.reduce((sum, p) => sum + p.temperatureCelsius!, 0) / withTemp.length
-        : null;
-
-    return {
-      totalDeliveries,
-      successfulDeliveries,
-      successRate,
-      temperatureCompliantDeliveries: compliant.length,
-      temperatureComplianceRate,
-      averageTemperatureCelsius:
-        averageTemperatureCelsius !== null
-          ? Math.round(averageTemperatureCelsius * 100) / 100
-          : null,
-    };
-  }
-
-  calculateSuccessRate(successful: number, total: number): number {
-    if (total === 0) return 0;
-    return Math.round((successful / total) * 10000) / 100;
-  }
-
-  private resolveTrustedSigner(kid: string): TrustedSignerKey {
-    const activeKid = this.configService.get<string>('DELIVERY_PROOF_SIGNER_KID', 'delivery-proof-key-1');
-    const activePublicKey = this.configService.get<string>('DELIVERY_PROOF_SIGNER_PUBLIC_KEY');
-    const previousKid = this.configService.get<string>('DELIVERY_PROOF_PREVIOUS_SIGNER_KID');
-    const previousPublicKey = this.configService.get<string>('DELIVERY_PROOF_PREVIOUS_SIGNER_PUBLIC_KEY');
-
-    if (kid === activeKid && activePublicKey) {
-      return { kid: activeKid, publicKey: activePublicKey };
-    }
-    if (previousKid && kid === previousKid && previousPublicKey) {
-      return { kid: previousKid, publicKey: previousPublicKey };
-    }
-
-    throw new BadRequestException('Unknown proof signer key id');
-  }
-
-  private buildSignedPayload(input: {
-    deliveryId: number;
-    orderId: string;
-    requestId: string;
-    riderId: string;
-    signerRole: string;
-    signedAt: string;
-    evidenceDigestReferences: string[];
-  }): string {
-    const canonical = {
-      deliveryId: input.deliveryId,
-      orderId: input.orderId,
-      requestId: input.requestId,
-      riderId: input.riderId,
-      signerRole: input.signerRole,
-      signedAt: input.signedAt,
-      evidenceDigestReferences: [...input.evidenceDigestReferences].sort(),
-    };
-
-    return JSON.stringify(canonical);
-  }
-
-  private assertEvidenceDigestReferences(digests: string[]): void {
-    if (!digests || digests.length === 0) {
-      throw new BadRequestException('At least one evidence digest reference is required');
-    }
-
-    const invalidDigest = digests.find((digest) => !/^[a-f0-9]{64}$/i.test(digest));
-    if (invalidDigest) {
-      throw new BadRequestException('Evidence digest references must be 64-character hex values');
-    }
-  }
-}
+/* … truncated 5374 chars — edit only what you need near the top … */

@@ -9,6 +9,8 @@ import {
   HttpCode,
   HttpStatus,
   Query,
+  Req,
+  ForbiddenException,
 } from '@nestjs/common';
 
 import { RequirePermissions } from '../auth/decorators/require-permissions.decorator';
@@ -70,8 +72,9 @@ export class DispatchController {
   assignOrder(
     @Body('orderId') orderId: string,
     @Body('riderId') riderId: string,
+    @Req() req: any,
   ) {
-    return this.dispatchService.assignOrder(orderId, riderId);
+    return this.dispatchService.assignOrder(orderId, riderId, req.user);
   }
 
   @RequirePermissions(Permission.MANAGE_DISPATCH)
@@ -80,10 +83,14 @@ export class DispatchController {
   @Post('assignments/respond')
   respondToAssignment(
     @Body('orderId') orderId: string,
-    @Body('riderId') riderId: string,
     @Body('accepted') accepted: boolean,
+    @Req() req: any,
   ) {
-    return this.dispatchService.respondToAssignment(orderId, riderId, accepted);
+    const riderId = req.user?.riderId ?? req.user?.id;
+    if (!riderId) {
+      throw new ForbiddenException('Authenticated rider context is required');
+    }
+    return this.dispatchService.respondToAssignment(orderId, riderId, accepted, req.user);
   }
 
   @RequirePermissions(Permission.UPDATE_DISPATCH)

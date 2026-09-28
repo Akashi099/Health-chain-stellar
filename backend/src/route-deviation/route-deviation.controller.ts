@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Patch, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, Param, Patch, Post, Query, Req, ForbiddenException } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
 
 import { RequirePermissions } from '../auth/decorators/require-permissions.decorator';
@@ -52,13 +52,24 @@ export class RouteDeviationController {
 
   @Patch('incidents/:id/acknowledge')
   @RequirePermissions(Permission.MANAGE_DISPATCH)
-  acknowledge(@Param('id') id: string, @Body() dto: AcknowledgeDeviationDto) {
-    return this.service.acknowledgeIncident(id, dto.userId);
+  async acknowledge(
+    @Param('id') id: string,
+    @Body() dto: AcknowledgeDeviationDto,
+    @Req() req: { user?: { id?: string } },
+  ) {
+    const actorId = req.user?.id;
+    await this.assertNotIncidentRider(id, actorId);
+    return this.service.acknowledgeIncident(id, actorId);
   }
 
   @Patch('incidents/:id/resolve')
   @RequirePermissions(Permission.MANAGE_DISPATCH)
-  resolve(@Param('id') id: string) {
+  async resolve(
+    @Param('id') id: string,
+    @Req() req: { user?: { id?: string } },
+  ) {
+    const actorId = req.user?.id;
+    await this.assertNotIncidentRider(id, actorId);
     return this.service.resolveIncident(id);
   }
 
@@ -82,19 +93,22 @@ export class RouteDeviationController {
 
   @Post('incidents/:id/override-severity')
   @RequirePermissions(Permission.DISPATCH_OVERRIDE)
-  overrideSeverity(
+  async overrideSeverity(
     @Param('id') id: string,
     @Body()
     body: {
       newSeverity: DeviationSeverity;
-      operatorId: string;
+      operatorId?: string;
       rationale: string;
     },
+    @Req() req: { user?: { id?: string } },
   ) {
+    const actorId = req.user?.id;
+    await this.assertNotIncidentRider(id, actorId);
     return this.service.overrideSeverity(
       id,
       body.newSeverity,
-      body.operatorId,
+      actorId,
       body.rationale,
     );
   }
@@ -118,5 +132,26 @@ export class RouteDeviationController {
       startDate: startDate ? new Date(startDate) : undefined,
       endDate: endDate ? new Date(endDate) : undefined,
     });
+  }
+
+  /**
+   * Forbid a caller from acting on an incident where they are the rider on
+   * the incident. The actor identity is taken from the JWT (req.user.id),
+   * never from the request body, so it cannot be spoofed.
+   */
+  private async assertNotIncidentRider(
+    incidentId: string,
+    actorId?: string,
+  ): Promise<void> {
+    if (!actorId) {
+      throw new ForbiddenException('Authenticated actor is required');
+    }
+    const incident = await this.service.findIncidentById(incidentId);
+    const riderId = incident?.riderId ?? incident?.rider?.id;
+    if (riderId && riderId === actorId) {
+      throw new ForbiddenException(
+        'Riders cannot act on their own deviation incidents',
+      );
+    }
   }
 }
