@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, vec, Address, Bytes, Env,
-    Map, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, vec, Address, Bytes,
+    BytesN, Env, Map, String, Symbol, Vec,
 };
 
 pub mod constants;
@@ -79,6 +79,8 @@ pub enum Error {
     PageNotFound = 35,
     /// No stored health record exists for this patient.
     RecordNotFound = 36,
+    /// Contract has already been initialized.
+    AlreadyInitialized = 37,
 }
 
 // Alias for issue/docs terminology.
@@ -563,6 +565,19 @@ pub enum DataKey {
 pub struct TrailMetadata {
     pub total_events: u32,
     pub total_pages: u32,
+}
+
+/// Metadata for a stored health record reference.
+///
+/// Only a cryptographic hash of the encrypted record reference is stored on-chain;
+/// raw health data never touches the ledger.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RecordMetadata {
+    /// Cryptographic hash (e.g., SHA-256) of the encrypted record reference.
+    pub record_hash: BytesN<32>,
+    /// Ledger timestamp when the record was stored.
+    pub stored_at: u64,
 }
 
 // Re-export storage lifecycle types for external consumers
@@ -4160,43 +4175,90 @@ impl HealthChainContract {
         Ok(())
     }
 
-    /// Store a health record hash. Only the patient themselves (as an authenticated
-    /// caller) may write their own record; a signature from `patient` is required.
+    /// Store a health record reference. Only the patient themselves (as an
+    /// authenticated caller) may write their own record; a signature from
+    /// `patient` is required.
+    ///
+    /// Only a cryptographic hash of the encrypted record reference is stored
+    /// on-chain — raw health data never touches the ledger. Emits a
+    /// `record_stored` event for audit purposes.
     pub fn store_record(
         env: Env,
         patient: Address,
-        record_hash: Symbol,
-    ) -> Result<Symbol, Error> {
+        record_hash: BytesN<32>,
+    ) -> Result<BytesN<32>, Error> {
         patient.require_auth();
+
+        let metadata = RecordMetadata {
+            record_hash: record_hash.clone(),
+            stored_at: env.ledger().timestamp(),
+        };
 
         env.storage()
             .persistent()
-            .set(&DataKey::HealthRecord(patient.clone()), &record_hash);
+            .set(&DataKey::HealthRecord(patient.clone()), &metadata);
 
         // The patient always retains access to their own record.
         env.storage().persistent().set(
-            &DataKey::HealthRecordAccess(patient.clone(), patient),
+            &DataKey::HealthRecordAccess(patient.clone(), patient.clone()),
             &true,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("health"),
+                Symbol::new(&env, "record_stored"),
+                symbol_short!("v1"),
+            ),
+            (patient, metadata.stored_at),
         );
 
         Ok(record_hash)
     }
 
-    /// Retrieve a stored record. `caller` must authenticate and must either be the
-    /// patient or a provider who has been explicitly granted access via
-    /// `grant_access`.
-    pub fn get_record(env: Env, patient: Address, caller: Address) -> Result<Symbol, Error> {
+    /// Retrieve a stored record reference. `caller` must authenticate and must
+    /// either be the patient or a provider who has been explicitly granted access
+    /// via `grant_access`.
+    ///
+    /// Returns `Error::RecordNotFound` if no record exists for the patient.
+    /// Emits a `record_accessed` event for audit purposes.
+    pub fn get_record(
+        env: Env,
+        patient: Address,
+        caller: Address,
+    ) -> Result<BytesN<32>, Error> {
         caller.require_auth();
 
-        if !Self::verify_access(env.clone(), patient.clone(), caller) {
+        // Check existence first so a missing record returns RecordNotFound
+        // rather than leaking access-control state to unauthorized callers.
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::HealthRecord(patient.clone()))
+        {
+            return Err(Error::RecordNotFound);
+        }
+
+        if !Self::verify_access(env.clone(), patient.clone(), caller.clone()) {
             return Err(Error::Unauthorized);
         }
 
-        Ok(env
+        let metadata: RecordMetadata = env
             .storage()
             .persistent()
-            .get(&DataKey::HealthRecord(patient))
-            .unwrap_or_else(|| symbol_short!("missing")))
+            .get(&DataKey::HealthRecord(patient.clone()))
+            .ok_or(Error::RecordNotFound)?;
+
+        env.events().publish(
+            (
+                symbol_short!("health"),
+                Symbol::new(&env, "record_accessed"),
+                symbol_short!("v1"),
+            ),
+            (patient, caller),
+        );
+
+        Ok(metadata.record_hash)
     }
 
     /// Verify whether `provider` currently has access to `patient`'s health record.
@@ -4210,6 +4272,7 @@ impl HealthChainContract {
 
     /// Grant `provider` access to `patient`'s health record. Only the patient may
     /// grant access to their own record, and only once a record has been stored.
+    /// Emits an `access_granted` event for audit purposes.
     pub fn grant_access(env: Env, patient: Address, provider: Address) -> Result<(), Error> {
         patient.require_auth();
 
@@ -4223,13 +4286,23 @@ impl HealthChainContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::HealthRecordAccess(patient, provider), &true);
+            .set(&DataKey::HealthRecordAccess(patient.clone(), provider.clone()), &true);
+
+        env.events().publish(
+            (
+                symbol_short!("health"),
+                Symbol::new(&env, "access_granted"),
+                symbol_short!("v1"),
+            ),
+            (patient, provider),
+        );
 
         Ok(())
     }
 
     /// Revoke a previously granted access for `provider` to `patient`'s health
     /// record. Only the patient may revoke access to their own record.
+    /// Emits an `access_revoked` event for audit purposes.
     pub fn revoke_access(env: Env, patient: Address, provider: Address) -> Result<(), Error> {
         patient.require_auth();
 
@@ -4243,7 +4316,16 @@ impl HealthChainContract {
 
         env.storage()
             .persistent()
-            .remove(&DataKey::HealthRecordAccess(patient, provider));
+            .remove(&DataKey::HealthRecordAccess(patient.clone(), provider.clone()));
+
+        env.events().publish(
+            (
+                symbol_short!("health"),
+                Symbol::new(&env, "access_revoked"),
+                symbol_short!("v1"),
+            ),
+            (patient, provider),
+        );
 
         Ok(())
     }
@@ -4954,7 +5036,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #36)")]
+    #[should_panic(expected = "Error(Contract, #37)")] // AlreadyInitialized
     fn test_initialize_twice_fails() {
         let env = Env::default();
         let admin = Address::generate(&env);
@@ -5360,7 +5442,7 @@ mod test {
         let client = HealthChainContractClient::new(&env, &contract_id);
 
         let patient = Address::generate(&env);
-        let hash = symbol_short!("hash123");
+        let hash = BytesN::from_array(&env, &[7u8; 32]);
 
         env.mock_all_auths();
         let result = client.store_record(&patient, &hash);
@@ -5396,7 +5478,7 @@ mod test {
         let client = HealthChainContractClient::new(&env, &contract_id);
 
         let patient = Address::generate(&env);
-        let hash = symbol_short!("hash123");
+        let hash = BytesN::from_array(&env, &[7u8; 32]);
 
         // No `mock_all_auths()` call: patient.require_auth() must fail because
         // nobody authorized this invocation as the patient.
@@ -5412,7 +5494,7 @@ mod test {
 
         let patient = Address::generate(&env);
         let provider = Address::generate(&env);
-        let hash = symbol_short!("hash123");
+        let hash = BytesN::from_array(&env, &[7u8; 32]);
 
         env.mock_all_auths();
         client.store_record(&patient, &hash);
@@ -5431,7 +5513,7 @@ mod test {
 
         let patient = Address::generate(&env);
         let provider = Address::generate(&env);
-        let hash = symbol_short!("hash123");
+        let hash = BytesN::from_array(&env, &[7u8; 32]);
 
         env.mock_all_auths();
         client.store_record(&patient, &hash);
@@ -5454,7 +5536,7 @@ mod test {
 
         let patient = Address::generate(&env);
         let provider = Address::generate(&env);
-        let hash = symbol_short!("hash123");
+        let hash = BytesN::from_array(&env, &[7u8; 32]);
 
         env.mock_all_auths();
         client.store_record(&patient, &hash);
@@ -5484,6 +5566,20 @@ mod test {
 
         env.mock_all_auths();
         client.grant_access(&patient, &provider);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #36)")] // RecordNotFound
+    fn test_get_record_without_existing_record_fails() {
+        let env = Env::default();
+        let contract_id = env.register(HealthChainContract, ());
+        let client = HealthChainContractClient::new(&env, &contract_id);
+
+        let patient = Address::generate(&env);
+
+        // No record has been stored; even the patient cannot retrieve one.
+        env.mock_all_auths();
+        client.get_record(&patient, &patient);
     }
 
     #[test]
