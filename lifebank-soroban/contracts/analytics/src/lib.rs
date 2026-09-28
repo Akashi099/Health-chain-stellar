@@ -59,9 +59,27 @@ const THIRTY_DAY_WINDOW_SECS: u64 = 2_592_000; // 30 days
 const SNAPSHOT_TTL_MIN: u32 = 290_000;
 const SNAPSHOT_TTL_MAX: u32 = 6_307_200;
 
+// TTL constants for the instance-storage entry that holds AnalyticsConfig
+// (in ledgers; ~5 s each). Mirrors the PERSISTENT_BUMP_THRESHOLD /
+// PERSISTENT_BUMP_TO pair used by the payments contract so both contracts
+// share one bump policy.
+const INSTANCE_BUMP_THRESHOLD: u32 = 518_400; // ~30 days
+const INSTANCE_BUMP_TO: u32 = 1_036_800; // ~60 days
+
 // ── Storage helpers ───────────────────────────────────────────────────────────
 
+/// Extend instance-storage TTL using the same threshold/extend-to as persistent
+/// writes. Instance storage holds the config key; without an explicit bump the
+/// entire contract instance can be archived, which makes every function that
+/// reads config fail even though the contract was correctly initialized.
+fn extend_instance_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_TO);
+}
+
 fn require_initialized(env: &Env) -> Result<AnalyticsConfig, AnalyticsError> {
+    extend_instance_ttl(env);
     env.storage()
         .instance()
         .get(&DataKey::Config)
@@ -194,6 +212,7 @@ impl AnalyticsContract {
         };
 
         env.storage().instance().set(&DataKey::Config, &config);
+        extend_instance_ttl(&env);
 
         // Initialize lifetime counters to zero in persistent storage.
         set_counter_u64(&env, &DataKey::TotalDonations, 0u64);
@@ -234,6 +253,7 @@ impl AnalyticsContract {
         };
 
         env.storage().instance().set(&DataKey::Config, &cfg);
+        extend_instance_ttl(&env);
 
         ReportingPeriodUpdated {
             period_type,
@@ -270,6 +290,119 @@ impl AnalyticsContract {
     /// Record a new blood request. Authorized callers only (admin or domain contracts).
     pub fn record_request(env: Env) -> Result<(), AnalyticsError> {
         let cfg = require_authorized_caller(&env)?;
-        let idx = current_period_index(&env, cfg.reporting_period.duratio
+        let idx = current_period_index(&env, cfg.reporting_period.duration_secs);
+        let mut snap = load_snapshot(&env, cfg.reporting_period.period_type, idx);
+        snap.total_requests += 1;
+        snap.last_updated = env.ledger().timestamp();
+        save_snapshot(&env, cfg.reporting_period.period_type, &snap);
 
-/* … truncated 4421 chars — edit only what you need near the top … */
+        let total = get_counter_u64(&env, &DataKey::TotalRequests) + 1;
+        set_counter_u64(&env, &DataKey::TotalRequests, total);
+        set_last_updated(&env, snap.last_updated);
+
+        RequestRecorded {
+            total_requests: total,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Record a completed delivery. Authorized callers only (admin or domain contracts).
+    pub fn record_delivery(env: Env) -> Result<(), AnalyticsError> {
+        let cfg = require_authorized_caller(&env)?;
+        let idx = current_period_index(&env, cfg.reporting_period.duration_secs);
+        let mut snap = load_snapshot(&env, cfg.reporting_period.period_type, idx);
+        snap.total_deliveries += 1;
+        snap.last_updated = env.ledger().timestamp();
+        save_snapshot(&env, cfg.reporting_period.period_type, &snap);
+
+        let total = get_counter_u64(&env, &DataKey::TotalDeliveries) + 1;
+        set_counter_u64(&env, &DataKey::TotalDeliveries, total);
+        set_last_updated(&env, snap.last_updated);
+
+        DeliveryRecorded {
+            total_deliveries: total,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Record a released payment with its amount. Authorized callers only (admin or domain contracts).
+    pub fn record_payment_released(env: Env, amount: i128) -> Result<(), AnalyticsError> {
+        if amount <= 0 {
+            return Err(AnalyticsError::InvalidAmount);
+        }
+
+        let cfg = require_authorized_caller(&env)?;
+        let idx = current_period_index(&env, cfg.reporting_period.duration_secs);
+        let mut snap = load_snapshot(&env, cfg.reporting_period.period_type, idx);
+        snap.total_payments_released += 1;
+        snap.total_volume = snap.total_volume.saturating_add(amount);
+        snap.last_updated = env.ledger().timestamp();
+        save_snapshot(&env, cfg.reporting_period.period_type, &snap);
+
+        let total_payments = get_counter_u64(&env, &DataKey::TotalPaymentsReleased) + 1;
+        set_counter_u64(&env, &DataKey::TotalPaymentsReleased, total_payments);
+        set_last_updated(&env, snap.last_updated);
+
+        let total_volume = get_counter_i128(&env, &DataKey::TotalVolume).saturating_add(amount);
+        set_counter_i128(&env, &DataKey::TotalVolume, total_volume);
+
+        PaymentReleaseRecorded {
+            amount,
+            total_payments_released: total_payments,
+            total_volume,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    // ── Queries ───────────────────────────────────────────────────────────────
+
+    /// Get the metrics snapshot for the current period.
+    pub fn get_current_snapshot(env: Env) -> Result<MetricsSnapshot, AnalyticsError> {
+        let cfg = require_initialized(&env)?;
+        let idx = current_period_index(&env, cfg.reporting_period.duration_secs);
+        Ok(load_snapshot(&env, cfg.reporting_period.period_type, idx))
+    }
+
+    /// Get the metrics snapshot for a specific period type and period index.
+    pub fn get_snapshot(
+        env: Env,
+        period_type: PeriodType,
+        period_index: u64,
+    ) -> Result<MetricsSnapshot, AnalyticsError> {
+        require_initialized(&env)?;
+        env.storage()
+            .persistent()
+            .get(&DataKey::Snapshot(period_type, period_index))
+            .ok_or(AnalyticsError::PeriodNotFound)
+    }
+
+    /// Get lifetime totals across all periods.
+    pub fn get_lifetime_totals(env: Env) -> Result<MetricsSnapshot, AnalyticsError> {
+        require_initialized(&env)?;
+        Ok(MetricsSnapshot {
+            period_index: u64::MAX,
+            total_donations: get_counter_u64(&env, &DataKey::TotalDonations),
+            total_requests: get_counter_u64(&env, &DataKey::TotalRequests),
+            total_deliveries: get_counter_u64(&env, &DataKey::TotalDeliveries),
+            total_payments_released: get_counter_u64(&env, &DataKey::TotalPaymentsReleased),
+            total_volume: get_counter_i128(&env, &DataKey::TotalVolume),
+            last_updated: get_last_updated(&env),
+        })
+    }
+
+    /// Get the current contract configuration.
+    pub fn get_config(env: Env) -> Result<AnalyticsConfig, AnalyticsError> {
+        require_initialized(&env)
+    }
+
+    pub fn is_initialized(env: Env) -> bool {
+        extend_instance_ttl(&env);
+        env.storage().instance().has(&DataKey::Config)
+    }
+}
