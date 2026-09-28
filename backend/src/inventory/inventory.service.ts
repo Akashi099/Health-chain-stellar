@@ -25,6 +25,8 @@ import { InventoryStockEntity } from './entities/inventory-stock.entity';
 import { InventoryRepository } from './repositories/inventory.repository';
 import { InventoryStockRepository } from './repositories/inventory-stock.repository';
 
+import { BloodComponent } from '../blood-units/enums/blood-component.enum';
+
 export interface ReserveOptions {
   /** Urgency for priority tie-breaking: CRITICAL > URGENT > ROUTINE > SCHEDULED */
   urgency?: 'CRITICAL' | 'URGENT' | 'ROUTINE' | 'SCHEDULED';
@@ -38,7 +40,6 @@ export class InventoryService {
   constructor(
     @InjectRepository(InventoryStockEntity)
     private readonly inventoryRepo: Repository<InventoryStockEntity>,
-    private readonly unitInvariant: ReservedUnitInvariantService,
     private readonly customInventoryRepo: InventoryRepository,
     private readonly stockRepo: InventoryStockRepository,
     @InjectRepository(ReservationAuditEntity)
@@ -70,9 +71,11 @@ export class InventoryService {
   }
 
   async create(dto: any) {
+    const component = dto.component ?? BloodComponent.WHOLE_BLOOD;
     const existing = await this.stockRepo.findByBankAndType(
       dto.bloodBankId,
       dto.bloodType,
+      component,
     );
     const units = Number(
       dto.availableUnits ?? dto.availableUnitsMl ?? dto.quantity ?? 0,
@@ -82,6 +85,7 @@ export class InventoryService {
       : this.stockRepo.create({
           bloodBankId: dto.bloodBankId,
           bloodType: dto.bloodType,
+          component,
           availableUnitsMl: units,
         });
     const data = await this.stockRepo.save(entity);
@@ -135,8 +139,9 @@ export class InventoryService {
   findByBankAndBloodType(
     bloodBankId: string,
     bloodType: string,
+    component: BloodComponent | string = BloodComponent.WHOLE_BLOOD,
   ): Promise<InventoryStockEntity | null> {
-    return this.stockRepo.findByBankAndType(bloodBankId, bloodType);
+    return this.stockRepo.findByBankAndType(bloodBankId, bloodType, component);
   }
 
   async reserveStockOrThrow(
@@ -144,6 +149,7 @@ export class InventoryService {
     bloodType: string,
     quantity: number,
     opts?: ReserveOptions,
+    component: BloodComponent | string = BloodComponent.WHOLE_BLOOD,
   ): Promise<void> {
     if (quantity <= 0) {
       throw new ConflictException(
@@ -154,15 +160,16 @@ export class InventoryService {
       const stock = await this.stockRepo.findByBankAndType(
         bloodBankId,
         bloodType,
+        component,
       );
       if (!stock) {
         throw new ConflictException(
-          `No inventory found for blood type ${bloodType} at blood bank ${bloodBankId}.`,
+          `No inventory found for blood type ${bloodType} (${component}) at blood bank ${bloodBankId}.`,
         );
       }
       if (stock.availableUnitsMl < quantity) {
         throw new ConflictException(
-          `Insufficient stock for ${bloodType} at blood bank ${bloodBankId}. Available: ${stock.availableUnitsMl}, requested: ${quantity}.`,
+          `Insufficient stock for ${bloodType} (${component}) at blood bank ${bloodBankId}. Available: ${stock.availableUnitsMl}, requested: ${quantity}.`,
         );
       }
       const result = await this.stockRepo.atomicDecrement(
@@ -194,6 +201,7 @@ export class InventoryService {
     bloodBankId: string,
     bloodType: string,
     quantity: number,
+    component: BloodComponent | string = BloodComponent.WHOLE_BLOOD,
   ): Promise<void> {
     if (quantity <= 0) {
       throw new ConflictException(
@@ -204,11 +212,13 @@ export class InventoryService {
       const stock = await this.stockRepo.findByBankAndType(
         bloodBankId,
         bloodType,
+        component,
       );
       if (!stock) {
         const created = this.stockRepo.create({
           bloodBankId,
-          bloodType,
+          bloodType: bloodType as any,
+          component: component as any,
           availableUnitsMl: quantity,
         });
         await this.stockRepo.save(created);
@@ -231,14 +241,16 @@ export class InventoryService {
     bloodBankId: string,
     bloodType: string,
     _quantity: number,
+    component: BloodComponent | string = BloodComponent.WHOLE_BLOOD,
   ): Promise<void> {
     const stock = await this.stockRepo.findByBankAndType(
       bloodBankId,
       bloodType,
+      component,
     );
     if (!stock) {
       throw new ConflictException(
-        `No inventory found for blood type ${bloodType} at blood bank ${bloodBankId}.`,
+        `No inventory found for blood type ${bloodType} (${component}) at blood bank ${bloodBankId}.`,
       );
     }
     await this.stockRepo.bumpVersion(stock.id);
@@ -248,8 +260,9 @@ export class InventoryService {
     bloodBankId: string,
     bloodType: string,
     quantity: number,
+    component: BloodComponent | string = BloodComponent.WHOLE_BLOOD,
   ): Promise<void> {
-    return this.restoreStockOrThrow(bloodBankId, bloodType, quantity);
+    return this.restoreStockOrThrow(bloodBankId, bloodType, quantity, component);
   }
 
   // ── Expiration auto-release ──────────────────────────────────────────
