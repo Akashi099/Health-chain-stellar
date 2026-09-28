@@ -110,9 +110,14 @@ export class ResetPasswordDto {
   @IsNotEmpty()
   token: string;
 
-  @ApiProperty({ description: 'New password (min 8 chars)', minLength: 8 })
+  @ApiProperty({
+    description: 'New password (minimum 8 characters, must include uppercase, lowercase, number, and special character)',
+    example: 'NewPassword456!',
+    minLength: 8,
+  })
   @IsString()
   @MinLength(8)
+  @Matches(PASSWORD_REGEX, { message: PASSWORD_MESSAGE })
   newPassword: string;
 }
 
