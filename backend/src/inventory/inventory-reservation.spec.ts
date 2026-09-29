@@ -7,6 +7,7 @@ import { ReservationAuditEntity } from './entities/reservation-audit.entity';
 import { InventoryStockEntity } from './entities/inventory-stock.entity';
 import { InventoryStockRepository } from './repositories/inventory-stock.repository';
 import { InventoryService } from './inventory.service';
+import { InventoryRepository } from './repositories/inventory.repository';
 
 function makeStock(available = 1000, version = 1): InventoryStockEntity {
   return { id: 'stock-1', bloodBankId: 'bank-1', bloodType: 'A+', component: 'WHOLE_BLOOD' as any,
@@ -50,10 +51,23 @@ describe('InventoryService — reservation race conditions (#615)', () => {
       createQueryBuilder: jest.fn(() => qb),
     };
 
+    const rawInventoryStockRepoMock = {
+      find: jest.fn().mockResolvedValue([]),
+      findOne: jest.fn().mockResolvedValue(null),
+      save: jest.fn().mockImplementation((e: any) => Promise.resolve(e)),
+      create: jest.fn().mockImplementation((d: any) => d),
+    };
+    const inventoryRepositoryMock = {
+      getStockAggregationByBloodType: jest.fn().mockResolvedValue([]),
+    };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         InventoryService,
         { provide: InventoryStockRepository, useValue: stockRepo },
+        { provide: getRepositoryToken(InventoryStockEntity), useValue: rawInventoryStockRepoMock },
+
+        { provide: InventoryRepository, useValue: inventoryRepositoryMock },
         { provide: getRepositoryToken(ReservationAuditEntity), useValue: auditRepo },
         { provide: getRepositoryToken(BloodRequestReservationEntity), useValue: reservationRepo },
       ],
@@ -97,6 +111,14 @@ describe('InventoryService — reservation race conditions (#615)', () => {
     it('writes audit record when requestId is provided', async () => {
       await service.reserveStockOrThrow('bank-1', 'A+', 500, { requestId: 'req-1', urgency: 'CRITICAL' });
       expect(auditRepo.save).toHaveBeenCalled();
+    });
+
+    it('queries stock specifying blood component and defaults to WHOLE_BLOOD', async () => {
+      await service.reserveStockOrThrow('bank-1', 'A+', 500, undefined, 'PLASMA' as any);
+      expect(stockRepo.findByBankAndType).toHaveBeenCalledWith('bank-1', 'A+', 'PLASMA');
+
+      await service.reserveStockOrThrow('bank-1', 'A+', 500);
+      expect(stockRepo.findByBankAndType).toHaveBeenCalledWith('bank-1', 'A+', 'WHOLE_BLOOD');
     });
   });
 
