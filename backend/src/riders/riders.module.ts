@@ -27,7 +27,10 @@ import { RiderSearchService } from './services/rider-search.service';
     ReputationModule,
     PolicyCenterModule,
   ],
-  controllers: [RidersController, AssignmentController, RiderSearchController],
+  // RiderSearchController must be registered before RidersController so its
+  // static routes (GET /riders/search, GET /riders/statistics) are matched
+  // before RidersController's GET /riders/:id catch-all.
+  controllers: [RiderSearchController, RidersController, AssignmentController],
   providers: [
     RidersService,
     ReputationAwareAssignmentService,

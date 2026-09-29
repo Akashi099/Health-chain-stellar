@@ -246,7 +246,9 @@ Before opening a PR, ensure:
 
 Given the medical domain of this project, security is critical. **Do not open public issues for security vulnerabilities.**
 
-Instead, please refer to our [Security Policy](SECURITY.md) for responsible disclosure instructions.
+Instead, please refer to our [Security Policy](SECURITY.md) and use the
+[private vulnerability reporting form](https://github.com/Emeka000/Health-chain-stellar/security/advisories/new)
+for responsible disclosure instructions.
 
 ## Finding Good First Issues
 

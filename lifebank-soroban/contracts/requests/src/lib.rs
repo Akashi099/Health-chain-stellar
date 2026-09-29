@@ -125,6 +125,7 @@ impl RequestContract {
         storage::set_metadata(&env, &storage::default_metadata(&env));
         storage::authorize_hospital(&env, &admin);
         storage::set_initialized(&env);
+        storage::bump_instance_ttl(&env);
 
         events::emit_initialized(&env, &admin, &inventory_contract);
 
@@ -342,6 +343,7 @@ impl RequestContract {
             released_reservation,
         );
         storage::set_request(&env, &request);
+        storage::remove_from_hospital_requests(&env, &request.hospital_id, request_id);
 
         events::emit_request_cancelled(&env, request_id, &caller, env.ledger().timestamp());
 
@@ -361,7 +363,12 @@ impl RequestContract {
         storage::require_initialized(&env)?;
 
         let admin = storage::get_admin(&env);
-        if caller != admin {
+        let is_admin = caller == admin;
+        let is_authorized_rider = storage::is_rider_authorized(&env, &caller);
+
+        // Authorized riders may only drive the Approved → InProgress transition (pickup);
+        // all other transitions remain admin-only.
+        if !is_admin && !(new_status == RequestStatus::InProgress && is_authorized_rider) {
             return Err(ContractError::Unauthorized);
         }
 
@@ -382,7 +389,7 @@ impl RequestContract {
         let mut fulfilled_delta_ml = 0;
 
         match new_status {
-            RequestStatus::Approved => {}
+            RequestStatus::Approved | RequestStatus::InProgress => {}
             RequestStatus::Rejected => {
                 Self::ensure_non_empty_reason(&reason)?;
                 released_reservation = Self::release_reservation_if_present(&env, &mut request);
@@ -394,7 +401,7 @@ impl RequestContract {
                 fulfilled_delta_ml = remaining;
                 request.fulfilled_quantity_ml = request.quantity_ml;
             }
-            RequestStatus::InProgress | RequestStatus::Pending | RequestStatus::Cancelled => {
+            RequestStatus::Pending | RequestStatus::Cancelled => {
                 return Err(ContractError::InvalidRequestStatus);
             }
         }
@@ -412,6 +419,9 @@ impl RequestContract {
             released_reservation,
         );
         storage::set_request(&env, &request);
+        if matches!(new_status, RequestStatus::Rejected | RequestStatus::Fulfilled) {
+            storage::remove_from_hospital_requests(&env, &request.hospital_id, request_id);
+        }
 
         events::emit_request_status_updated(
             &env,
@@ -478,6 +488,9 @@ impl RequestContract {
             false,
         );
         storage::set_request(&env, &request);
+        if new_status == RequestStatus::Fulfilled {
+            storage::remove_from_hospital_requests(&env, &request.hospital_id, request_id);
+        }
 
         events::emit_request_status_updated(
             &env,
@@ -572,8 +585,38 @@ impl RequestContract {
 
         let mut request =
             storage::get_request(&env, request_id).ok_or(ContractError::RequestNotFound)?;
-        request.fulfilled_by = Some(org_id);
+
+        match request.status {
+            RequestStatus::Approved | RequestStatus::InProgress => {}
+            _ => return Err(ContractError::InvalidRequestStatus),
+        }
+
+        if request.fulfilled_by.is_some() {
+            return Err(ContractError::FulfillingOrgAlreadySet);
+        }
+
+        request.fulfilled_by = Some(org_id.clone());
+        let status = request.status;
+        Self::append_history(
+            &env,
+            &mut request,
+            &caller,
+            status,
+            false,
+            status,
+            String::from_str(&env, "Fulfilling org set"),
+            0,
+            false,
+        );
         storage::set_request(&env, &request);
+
+        events::emit_fulfilling_org_set(
+            &env,
+            request_id,
+            &caller,
+            &org_id,
+            env.ledger().timestamp(),
+        );
 
         Ok(())
     }
@@ -618,18 +661,17 @@ impl RequestContract {
         page_size: u32,
     ) -> Result<soroban_sdk::Vec<BloodRequest>, ContractError> {
         storage::require_initialized(&env)?;
-        let page_size = page_size.min(50) as usize;
+        let page_size = page_size.min(50);
         let request_ids = storage::get_hospital_request_ids(&env, &hospital_id);
-        let start = (page as usize).saturating_mul(page_size);
-        let end = (start + page_size).min(request_ids.len());
+        let total = request_ids.len();
+        let start = page.saturating_mul(page_size).min(total);
+        let end = start.saturating_add(page_size).min(total);
 
         let mut results: soroban_sdk::Vec<BloodRequest> = soroban_sdk::Vec::new(&env);
-        if start < request_ids.len() {
-            for i in start..end {
-                let id = request_ids.get(i).unwrap();
-                if let Some(req) = storage::get_request(&env, id) {
-                    results.push_back(req);
-                }
+        for i in start..end {
+            let id = request_ids.get(i).unwrap();
+            if let Some(req) = storage::get_request(&env, id) {
+                results.push_back(req);
             }
         }
         Ok(results)

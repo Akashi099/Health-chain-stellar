@@ -39,6 +39,17 @@ const STATUS_TO_EVENT_TYPE: Record<OrderStatus, OrderEventType> = {
   [OrderStatus.CANCELLED]: OrderEventType.ORDER_CANCELLED,
 };
 
+/**
+ * Maps a target status to the action it implies, so that a raw `status`
+ * update is subject to the same role policy as the equivalent `action`.
+ * Statuses without a role-restricted action (e.g. DISPATCHED, IN_TRANSIT)
+ * return undefined and are not role-gated here.
+ */
+const STATUS_TO_IMPLIED_ACTION: Partial<Record<OrderStatus, RequestStatusAction>> = {
+  [OrderStatus.CONFIRMED]: RequestStatusAction.APPROVE,
+  [OrderStatus.DELIVERED]: RequestStatusAction.FULFILL,
+};
+
 @Injectable()
 export class RequestStatusService {
   private readonly logger = new Logger(RequestStatusService.name);
@@ -67,7 +78,9 @@ export class RequestStatusService {
     const previousStatus = order.status;
 
     if (actorRole) {
-      this.enforceActionRole(dto.action, actorRole);
+      const impliedAction =
+        dto.action ?? STATUS_TO_IMPLIED_ACTION[nextStatus];
+      this.enforceActionRole(impliedAction, actorRole);
     }
     this.stateMachine.transition(previousStatus, nextStatus);
 
@@ -102,22 +115,28 @@ export class RequestStatusService {
       });
     }
 
+    // Restore the amount that was actually reserved at creation time, not the
+    // (possibly edited) current order.quantity. Any post-delivery status is
+    // treated as committed and must not restore stock.
     if (
       nextStatus === OrderStatus.CANCELLED &&
-      previousStatus !== OrderStatus.DELIVERED
+      !COMMITTED_STATUSES.has(previousStatus)
     ) {
-      await this.inventoryService.restoreStockOrThrow(
-        order.bloodBankId ?? '',
-        order.bloodType,
-        Number(order.quantity),
-      );
+      const reservedQuantity = this.resolveReservedQuantity(order);
+      if (reservedQuantity > 0) {
+        await this.inventoryService.restoreStockOrThrow(
+          order.bloodBankId ?? '',
+          order.bloodType,
+          reservedQuantity,
+        );
+      }
     }
 
     if (nextStatus === OrderStatus.DELIVERED) {
       await this.inventoryService.commitFulfillmentStockOrThrow(
         order.bloodBankId ?? '',
         order.bloodType,
-        Number(order.quantity),
+        this.resolveReservedQuantity(order),
       );
     }
 
@@ -127,6 +146,8 @@ export class RequestStatusService {
 
     this.ordersGateway.emitOrderStatusUpdated({
       orderId: order.id,
+      hospitalId: order.hospitalId,
+      bloodBankId: order.bloodBankId ?? null,
       previousStatus,
       newStatus: nextStatus,
       eventType,
@@ -153,6 +174,32 @@ export class RequestStatusService {
     );
 
     return { nextStatus, eventType };
+  }
+
+  /**
+   * Cancel an order through the order state machine so that reserved inventory
+   * is released, an ORDER_CANCELLED event-store row is written, and the
+   * order.cancelled domain event / WebSocket update / notification are emitted.
+   *
+   * Used by the org verification lifecycle (suspend/unverify with CANCEL_ALL)
+   * instead of a raw repository UPDATE that bypassed all of the above.
+   */
+  async cancelOrder(
+    order: OrderEntity,
+    reason?: string,
+    actorId?: string,
+    manager?: EntityManager,
+  ): Promise<{ nextStatus: OrderStatus; eventType: OrderEventType }> {
+    return this.applyStatusUpdate(
+      order,
+      {
+        action: RequestStatusAction.CANCEL,
+        reason: reason ?? 'Order cancelled by organization lifecycle policy',
+      },
+      actorId,
+      undefined,
+      manager,
+    );
   }
 
   private resolveNextStatus(dto: UpdateRequestStatusDto): OrderStatus {
@@ -262,7 +309,7 @@ export class RequestStatusService {
       case OrderStatus.DELIVERED:
         this.eventEmitter.emit(
           'order.delivered',
-          new OrderDeliveredEvent(order.id),
+          new OrderDeliveredEvent(order.id, order.hospitalId),
         );
         break;
 
@@ -276,6 +323,9 @@ export class RequestStatusService {
           ),
         );
         break;
+
+      default:
+        break;
     }
   }
 
@@ -285,37 +335,26 @@ export class RequestStatusService {
     nextStatus: OrderStatus,
     actorId?: string,
     reason?: string,
-    manager?: EntityManager,
   ): Promise<void> {
     if (!this.blockchainEventRepo) {
       return;
     }
 
     try {
-      const repo = manager
-        ? manager.getRepository(BlockchainEvent)
-        : this.blockchainEventRepo;
-
-      const txHash = `order-status-${order.id}-${Date.now()}`;
-      const entity = repo.create({
-        eventType: 'ORDER_STATUS_UPDATED',
-        transactionHash: txHash,
-        eventData: {
+      await this.blockchainEventRepo.save(
+        this.blockchainEventRepo.create({
           orderId: order.id,
           previousStatus,
-          nextStatus,
+          newStatus: nextStatus,
           actorId: actorId ?? null,
           reason: reason ?? null,
-        },
-        blockchainTimestamp: new Date(),
-        processed: false,
-      });
-
-      await repo.save(entity);
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : 'Unknown error';
+        }),
+      );
+    } catch (error) {
       this.logger.warn(
-        `Blockchain sync failed for order ${order.id}: ${message}`,
+        `Failed to sync order ${order.id} status change with blockchain: ${
+          (error as Error).message
+        }`,
       );
     }
   }
@@ -326,16 +365,25 @@ export class RequestStatusService {
     nextStatus: OrderStatus,
     reason?: string,
   ): Promise<void> {
-    if (!this.notificationDispatch) return;
-    await this.notificationDispatch.dispatch({
-      recipientId: order.hospitalId,
-      templateKey: 'order.status.updated',
-      variables: {
+    if (!this.notificationDispatch) {
+      return;
+    }
+
+    try {
+      await this.notificationDispatch.dispatchOrderStatusChange({
         orderId: order.id,
+        hospitalId: order.hospitalId,
+        bloodBankId: order.bloodBankId ?? null,
         previousStatus,
         newStatus: nextStatus,
-        reason: reason ?? '',
-      },
-    });
+        reason: reason ?? null,
+      });
+    } catch (error) {
+      this.logger.warn(
+        `Failed to dispatch notification for order ${order.id}: ${
+          (error as Error).message
+        }`,
+      );
+    }
   }
 }

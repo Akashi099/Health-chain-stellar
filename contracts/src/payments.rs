@@ -4,6 +4,15 @@ pub const DEFAULT_DISPUTE_TIMEOUT_SECS: u64 = 72 * 60 * 60;
 pub const MAX_DISPUTE_TIMEOUT_SECS: u64 = 30 * 24 * 60 * 60;
 pub const HIGH_VALUE_THRESHOLD: i128 = 10_000;
 
+/// Maximum total fees expressed in basis points (1 bp = 0.01%).
+///
+/// Caps the sum of service_fee + network_fee + performance_bonus + fixed_fee at
+/// 50% of the gross amount (5000 bp). This closes the fee-structuring attack
+/// described in issue #1400: without this cap an attacker could inflate fees so
+/// that the stored net `payment.amount` falls under `HIGH_VALUE_THRESHOLD` while
+/// the real locked amount is far above it, bypassing the M-of-N multisig guard.
+pub const MAX_FEE_BPS: i128 = 5_000; // 50 %
+
 /// **Dispute evidence (beyond `Symbol` limits).**
 ///
 /// Soroban `Symbol` values are capped (~32 characters) and cannot carry full IPFS CIDs,
@@ -128,10 +137,16 @@ pub struct Payment {
 /// Escrow account holding locked funds
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Bookkeeping record only — `locked_amount` is not backed by any token
+/// transfer. This contract never calls a token contract, so no funds are
+/// ever actually pulled from the payer or paid to the payee; every
+/// status/amount here is cosmetic state until real token custody is wired
+/// in. See the on-chain entrypoints in `lib.rs` (create_payment,
+/// propose_release, resolve_dispute, process_expired_disputes).
 pub struct EscrowAccount {
     /// Associated payment ID
     pub payment_id: u64,
-    /// Amount locked in escrow
+    /// Amount recorded as locked in escrow bookkeeping (no real fund custody — see struct docs)
     pub locked_amount: i128,
     /// Conditions for releasing funds
     pub release_conditions: ReleaseConditions,
@@ -152,6 +167,32 @@ pub struct PendingApproval {
     pub payment_id: u64,
     pub approvals: Vec<Address>,
     pub executed: bool,
+}
+
+impl PendingApproval {
+    /// Creates an empty approval record for `payment_id`.
+    pub fn new(env: &soroban_sdk::Env, payment_id: u64) -> Self {
+        Self {
+            payment_id,
+            approvals: Vec::new(env),
+            executed: false,
+        }
+    }
+
+    /// Records `approver`'s vote. Returns `Err(())` if the approver has
+    /// already voted, so callers can surface `Error::DuplicateApproval`.
+    pub fn register_vote(&mut self, approver: Address) -> Result<(), ()> {
+        if self.approvals.contains(&approver) {
+            return Err(());
+        }
+        self.approvals.push_back(approver);
+        Ok(())
+    }
+
+    /// Returns `true` once the number of distinct approvals meets `threshold`.
+    pub fn has_reached_threshold(&self, threshold: u32) -> bool {
+        self.approvals.len() >= threshold
+    }
 }
 
 /// Fee breakdown for a transaction
@@ -218,179 +259,6 @@ impl Payment {
 
         Ok(())
     }
-    /// Checks if payment can transition to a new status
-    pub fn can_transition_to(&self, new_status: PaymentStatus) -> bool {
-        match (self.status, new_status) {
-            // Pending can go to Escrowed or Cancelled
-            (PaymentStatus::Pending, PaymentStatus::Escrowed) => true,
-            (PaymentStatus::Pending, PaymentStatus::Cancelled) => true,
+    /// Checks if payment can tra
 
-            // Escrowed can go to Completed, Refunded or Disputed
-            (PaymentStatus::Escrowed, PaymentStatus::Completed) => true,
-            (PaymentStatus::Escrowed, PaymentStatus::Refunded) => true,
-            (PaymentStatus::Escrowed, PaymentStatus::Disputed) => true,
-
-            // Disputed can go to Resolved
-            (PaymentStatus::Disputed, PaymentStatus::Resolved) => true,
-
-            // Resolved can go to Completed or Refunded
-            (PaymentStatus::Resolved, PaymentStatus::Completed) => true,
-            (PaymentStatus::Resolved, PaymentStatus::Refunded) => true,
-
-            // Terminal states cannot transition
-            (PaymentStatus::Completed, _) => false,
-            (PaymentStatus::Refunded, _) => false,
-            (PaymentStatus::Cancelled, _) => false,
-
-            // All other transitions are invalid
-            _ => false,
-        }
-    }
-
-    /// Checks if the payment is in a terminal state
-    pub fn is_terminal(&self) -> bool {
-        matches!(
-            self.status,
-            PaymentStatus::Completed | PaymentStatus::Refunded | PaymentStatus::Cancelled
-        )
-    }
-}
-
-impl EscrowAccount {
-    /// Validates escrow account structure
-    pub fn validate(&self) -> Result<(), PaymentError> {
-        if self.locked_amount <= 0 {
-            return Err(PaymentError::InvalidAmount);
-        }
-        Ok(())
-    }
-
-    /// Checks if release conditions are satisfied
-    pub fn can_release(&self, current_timestamp: u64, approver: Option<&Address>) -> bool {
-        // Check timestamp condition
-        if current_timestamp < self.release_conditions.min_timestamp {
-            return false;
-        }
-
-        // Check medical records verification
-        if !self.release_conditions.medical_records_verified {
-            return false;
-        }
-
-        // Check approver if required
-        if let Some(required_approver) = &self.release_conditions.authorized_approver {
-            if let Some(provided_approver) = approver {
-                if required_approver != provided_approver {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-        }
-
-        true
-    }
-}
-
-impl MultiSigConfig {
-    pub fn validate(&self) -> Result<(), PaymentError> {
-        if self.signers.is_empty() || self.threshold == 0 {
-            return Err(PaymentError::InvalidMultiSigConfig);
-        }
-
-        if self.threshold > self.signers.len() {
-            return Err(PaymentError::InvalidMultiSigConfig);
-        }
-
-        for i in 0..self.signers.len() {
-            let signer = self.signers.get(i).unwrap();
-            for j in (i + 1)..self.signers.len() {
-                if signer == self.signers.get(j).unwrap() {
-                    return Err(PaymentError::InvalidMultiSigConfig);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn is_signer(&self, approver: &Address) -> bool {
-        self.signers.contains(approver.clone())
-    }
-}
-
-impl PendingApproval {
-    pub fn new(env: &soroban_sdk::Env, payment_id: u64) -> Self {
-        Self {
-            payment_id,
-            approvals: Vec::new(env),
-            executed: false,
-        }
-    }
-
-    pub fn has_voted(&self, approver: &Address) -> bool {
-        self.approvals.contains(approver.clone())
-    }
-
-    pub fn register_vote(&mut self, approver: Address) -> Result<(), PaymentError> {
-        if self.has_voted(&approver) {
-            return Err(PaymentError::DuplicateApproval);
-        }
-
-        self.approvals.push_back(approver);
-        Ok(())
-    }
-
-    pub fn has_reached_threshold(&self, threshold: u32) -> bool {
-        self.approvals.len() >= threshold
-    }
-}
-
-impl FeeStructure {
-    /// Calculates total fees, returning Err if any intermediate sum overflows i128.
-    pub fn total(&self) -> Result<i128, PaymentError> {
-        self.service_fee
-            .checked_add(self.network_fee)
-            .and_then(|v| v.checked_add(self.performance_bonus))
-            .and_then(|v| v.checked_add(self.fixed_fee))
-            .ok_or(PaymentError::Overflow)
-    }
-
-    /// Validates fee structure
-    pub fn validate(&self) -> Result<(), PaymentError> {
-        if self.service_fee < 0
-            || self.network_fee < 0
-            || self.performance_bonus < 0
-            || self.fixed_fee < 0
-        {
-            return Err(PaymentError::InvalidFee);
-        }
-        Ok(())
-    }
-
-    /// Calculates net amount after deducting fees
-    pub fn calculate_net_amount(&self, gross_amount: i128) -> Result<i128, PaymentError> {
-        self.validate()?;
-        let total_fees = self.total()?;
-        if total_fees > gross_amount {
-            return Err(PaymentError::FeesExceedAmount);
-        }
-        Ok(gross_amount - total_fees)
-    }
-}
-
-/// Error types for payment operations
-#[contracttype]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PaymentError {
-    InvalidAmount,
-    SamePayerPayee,
-    InvalidFee,
-    InvalidAsset,
-    FeesExceedAmount,
-    InvalidTransition,
-    EscrowNotReleasable,
-    InvalidMultiSigConfig,
-    DuplicateApproval,
-    Overflow,
-}
+/* … truncated 7221 chars — edit only what you need near the top … */

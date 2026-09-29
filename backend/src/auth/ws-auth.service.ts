@@ -17,6 +17,8 @@ import { Inject } from '@nestjs/common';
 import { REDIS_CLIENT } from '../redis/redis.constants';
 import { SecurityEventLoggerService } from '../user-activity/security-event-logger.service';
 import { JwtKeyService } from './jwt-key.service';
+import { MFA_TOKEN_AUDIENCE } from './mfa/mfa.constants';
+import { SessionStatusService } from './session-status.service';
 
 /**
  * Authenticated socket with user context attached
@@ -24,7 +26,8 @@ import { JwtKeyService } from './jwt-key.service';
 export interface AuthenticatedSocket extends Socket {
   user?: {
     userId: string;
-    tenantId: string;
+    tenantId?: string | null;
+    organizationId?: string | null;
     email?: string;
     role?: string;
     roles?: string[];
@@ -36,7 +39,8 @@ export interface AuthenticatedSocket extends Socket {
   };
   data: {
     userId?: string;
-    tenantId?: string;
+    tenantId?: string | null;
+    organizationId?: string | null;
     role?: string;
     hospitalIds?: string[];
   };
@@ -75,6 +79,7 @@ export class WsAuthService {
     private readonly jwtKeyService: JwtKeyService,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
     private readonly securityEventLogger: SecurityEventLoggerService,
+    private readonly sessionStatusService: SessionStatusService,
   ) {}
 
   /**
@@ -132,13 +137,15 @@ export class WsAuthService {
         // ─────────────────────────────────────────────────────────────────────
         // 3. VALIDATE CLAIMS STRUCTURE
         // ─────────────────────────────────────────────────────────────────────
-        if (!decoded.userId || !decoded.tenantId) {
+        const requiresTenant = !this.isOrgLessRole(decoded.role);
+        if (!decoded.userId || (!decoded.tenantId && requiresTenant)) {
           const err = new Error('Invalid token claims: missing userId or tenantId');
           await this.auditEvent('WS_INVALID_CLAIMS', {
             socketId: socket.id,
             ip: socket.handshake.address,
             userId: decoded.userId,
-            tenantId: decoded.tenantId,
+            tenantId: decoded.tenantId ?? null,
+            role: decoded.role,
           });
           return next(err);
         }
@@ -172,18 +179,19 @@ export class WsAuthService {
 
         // Also attach to socket.data for compatibility with existing gateway code
         socket.data.userId = decoded.userId;
-        socket.data.tenantId = decoded.tenantId;
+        socket.data.tenantId = decoded.tenantId ?? null;
+        socket.data.organizationId = decoded.organizationId ?? null;
         socket.data.role = decoded.role;
 
         // Log successful authentication
         this.logger.log(
-          `WS authenticated: socketId=${socket.id} userId=${decoded.userId} tenantId=${decoded.tenantId} role=${decoded.role}`,
+          `WS authenticated: socketId=${socket.id} userId=${decoded.userId} tenantId=${decoded.tenantId ?? 'none'} role=${decoded.role}`,
         );
 
         await this.auditEvent('WS_AUTH_SUCCESS', {
           socketId: socket.id,
           userId: decoded.userId,
-          tenantId: decoded.tenantId,
+          tenantId: decoded.tenantId ?? null,
           role: decoded.role,
           ip: socket.handshake.address,
         });
@@ -267,10 +275,24 @@ export class WsAuthService {
       throw new Error('Token expired');
     }
 
+    // MFA challenge tokens are not access tokens
+    const aud = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+    if (payload.purpose === 'mfa' || aud.includes(MFA_TOKEN_AUDIENCE)) {
+      throw new Error('Invalid access token');
+    }
+
+    // Reject tokens whose session was logged out or revoked (HTTP parity)
+    if (!(await this.sessionStatusService.isSessionActive(payload.sid))) {
+      throw new Error('Session has been revoked');
+    }
+
+    const tenantId = payload.organizationId ?? payload.hospitalId ?? payload.tenantId ?? null;
+
     // Map HTTP JWT claims to WS user object
     return {
       userId: payload.sub || payload.userId,
-      tenantId: payload.hospitalId || payload.tenantId,
+      tenantId,
+      organizationId: payload.organizationId ?? null,
       email: payload.email,
       role: payload.role,
       roles: payload.roles || (payload.role ? [payload.role] : []),
@@ -280,6 +302,14 @@ export class WsAuthService {
       sid: payload.sid,
       keyid: kid,
     };
+  }
+
+  private isOrgLessRole(role?: string): boolean {
+    if (!role) {
+      return false;
+    }
+
+    return ['donor', 'rider'].includes(role.toLowerCase());
   }
 
   /**

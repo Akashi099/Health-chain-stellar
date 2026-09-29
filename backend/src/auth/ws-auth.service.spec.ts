@@ -14,6 +14,7 @@ import Redis from 'ioredis';
 
 import { WsAuthService, AuthenticatedSocket } from './ws-auth.service';
 import { JwtKeyService } from './jwt-key.service';
+import { SessionStatusService } from './session-status.service';
 import { SecurityEventLoggerService, SecurityEventType } from '../user-activity/security-event-logger.service';
 import { REDIS_CLIENT } from '../redis/redis.constants';
 
@@ -44,6 +45,7 @@ describe('WsAuthService', () => {
   const validPayload = {
     sub: 'user123',
     userId: 'user123',
+    organizationId: 'org-1',
     hospitalId: 'hospital1',
     tenantId: 'hospital1',
     email: 'doctor@hospital.com',
@@ -85,6 +87,10 @@ describe('WsAuthService', () => {
         { provide: JwtKeyService, useValue: jwtKeyService },
         { provide: REDIS_CLIENT, useValue: redis },
         { provide: SecurityEventLoggerService, useValue: securityEventLogger },
+        {
+          provide: SessionStatusService,
+          useValue: { isSessionActive: jest.fn().mockResolvedValue(true) },
+        },
       ],
     }).compile();
 
@@ -163,25 +169,24 @@ describe('WsAuthService', () => {
       });
     });
 
-    it('✓ Test 5: Invalid claims (missing tenantId) should audit WS_INVALID_CLAIMS', async (done) => {
-      const invalidPayload = {
+    it('✓ Test 5: Org-less donor tokens without tenantId should still authenticate', async (done) => {
+      const donorPayload = {
         ...validPayload,
+        role: 'donor',
+        organizationId: undefined,
         tenantId: undefined,
       };
 
       jwtService.decode.mockReturnValue({ header: { kid: 'key-1' } });
-      jwtService.verify.mockReturnValue(invalidPayload as any);
+      jwtService.verify.mockReturnValue(donorPayload as any);
 
       const socket = { ...mockSocket, handshake: { ...mockSocket.handshake, auth: { token: validToken } } };
 
       const middleware = service.authenticate();
       middleware(socket as any, (err?: Error) => {
-        expect(err).toBeDefined();
-        expect(securityEventLogger.logEvent).toHaveBeenCalledWith(
-          expect.objectContaining({
-            eventType: 'WS_INVALID_CLAIMS',
-          }),
-        );
+        expect(err).toBeUndefined();
+        expect(socket.user?.userId).toBe('user123');
+        expect(socket.user?.tenantId).toBeNull();
         done();
       });
     });

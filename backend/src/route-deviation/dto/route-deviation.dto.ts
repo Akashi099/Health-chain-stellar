@@ -58,6 +58,12 @@ export class LocationUpdateDto {
 }
 
 export class AcknowledgeDeviationDto {
+  /**
+   * @deprecated Actor identity is taken from the authenticated JWT (`req.user.id`).
+   * This field is ignored by the controller and retained only for backward
+   * compatibility with existing clients.
+   */
+  @IsOptional()
   @IsString()
-  userId: string;
+  userId?: string;
 }

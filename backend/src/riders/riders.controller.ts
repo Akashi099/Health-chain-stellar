@@ -2,6 +2,7 @@ import {
   Body,
   Controller,
   Delete,
+  ForbiddenException,
   Get,
   HttpCode,
   HttpStatus,
@@ -106,6 +107,27 @@ export class RidersController {
   }
 
   @RequirePermissions(Permission.VIEW_RIDERS)
+  @ApiOperation({ summary: 'Get search' })
+  @ApiResponse({ status: 200, description: 'Resource retrieved successfully' })
+  @Get('search')
+  search(
+    @Query(
+      new ValidationPipe({ transform: true, whitelist: true }),
+    )
+    query: PaginationQueryDto,
+  ) {
+    return this.ridersService.search(query);
+  }
+
+  @RequirePermissions(Permission.VIEW_RIDERS)
+  @ApiOperation({ summary: 'Get statistics' })
+  @ApiResponse({ status: 200, description: 'Resource retrieved successfully' })
+  @Get('statistics')
+  getStatistics() {
+    return this.ridersService.getStatistics();
+  }
+
+  @RequirePermissions(Permission.VIEW_RIDERS)
   @ApiOperation({ summary: 'Get :id' })
   @ApiResponse({ status: 200, description: 'Resource retrieved successfully' })
   @Get(':id')
@@ -143,7 +165,12 @@ export class RidersController {
   @ApiOperation({ summary: 'Patch :id' })
   @ApiResponse({ status: 200, description: 'Resource updated successfully' })
   @Patch(':id')
-  update(@Param('id') id: string, @Body() updateRiderDto: UpdateRiderDto) {
+  async update(
+    @Param('id') id: string,
+    @Body() updateRiderDto: UpdateRiderDto,
+    @User() user: { id: string; permissions?: Permission[] },
+  ) {
+    await this.assertRiderAccess(id, user);
     return this.ridersService.update(id, updateRiderDto);
   }
 
@@ -159,10 +186,12 @@ export class RidersController {
   @ApiOperation({ summary: 'Patch :id status' })
   @ApiResponse({ status: 200, description: 'Resource updated successfully' })
   @Patch(':id/status')
-  updateStatus(
+  async updateStatus(
     @Param('id') id: string,
     @Body(new ValidationPipe({ whitelist: true })) dto: UpdateRiderStatusDto,
+    @User() user: { id: string; permissions?: Permission[] },
   ) {
+    await this.assertRiderAccess(id, user);
     return this.ridersService.updateStatus(id, dto);
   }
 
@@ -170,10 +199,12 @@ export class RidersController {
   @ApiOperation({ summary: 'Patch :id location' })
   @ApiResponse({ status: 200, description: 'Resource updated successfully' })
   @Patch(':id/location')
-  updateLocation(
+  async updateLocation(
     @Param('id') id: string,
     @Body(new ValidationPipe({ whitelist: true })) dto: UpdateRiderLocationDto,
+    @User() user: { id: string; permissions?: Permission[] },
   ) {
+    await this.assertRiderAccess(id, user);
     return this.ridersService.updateLocation(id, dto);
   }
 
@@ -181,10 +212,12 @@ export class RidersController {
   @ApiOperation({ summary: 'Patch :id working hours' })
   @ApiResponse({ status: 200, description: 'Resource updated successfully' })
   @Patch(':id/working-hours')
-  setWorkingHours(
+  async setWorkingHours(
     @Param('id') id: string,
     @Body(new ValidationPipe({ whitelist: true })) dto: WorkingHoursDto,
+    @User() user: { id: string; permissions?: Permission[] },
   ) {
+    await this.assertRiderAccess(id, user);
     return this.ridersService.setWorkingHours(id, dto);
   }
 
@@ -192,10 +225,12 @@ export class RidersController {
   @ApiOperation({ summary: 'Patch :id preferred areas' })
   @ApiResponse({ status: 200, description: 'Resource updated successfully' })
   @Patch(':id/preferred-areas')
-  setPreferredAreas(
+  async setPreferredAreas(
     @Param('id') id: string,
     @Body('areas') areas: string[],
+    @User() user: { id: string; permissions?: Permission[] },
   ) {
+    await this.assertRiderAccess(id, user);
     return this.ridersService.setPreferredAreas(id, areas);
   }
 
@@ -206,5 +241,25 @@ export class RidersController {
   @HttpCode(HttpStatus.NO_CONTENT)
   remove(@Param('id') id: string) {
     return this.ridersService.remove(id);
+  }
+
+  /**
+   * Ensures the caller may act on the given rider id. Admins (MANAGE_RIDERS)
+   * keep full access; everyone else may only act on their own rider record.
+   */
+  private async assertRiderAccess(
+    id: string,
+    user: { id: string; permissions?: Permission[] },
+  ): Promise<void> {
+    if (user?.permissions?.includes(Permission.MANAGE_RIDERS)) {
+      return;
+    }
+
+    const rider = await this.ridersService.findByUserId(user.id);
+    if (!rider || rider.id !== id) {
+      throw new ForbiddenException(
+        'You are not allowed to modify another rider\'s record',
+      );
+    }
   }
 }

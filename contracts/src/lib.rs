@@ -321,7 +321,7 @@ pub struct BloodRequest {
 
 /// Key for detecting duplicate requests
 #[contracttype]
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RequestKey {
     pub hospital_id: Address,
     pub blood_type: BloodType,
@@ -529,10 +529,17 @@ pub(crate) const PENDING_APPROVALS: Symbol = symbol_short!("PEND_APR");
 pub(crate) const ESCROW_ACCOUNTS: Symbol = symbol_short!("ESC_ACCS");
 pub(crate) const INVENTORY_CONTRACT: Symbol = symbol_short!("INV_CTRL");
 
+/// Storage schema version — bumped whenever the on-chain layout changes.
+/// A fresh contract starts at version 1 (monolithic-map layout).
+/// After `migrate_storage` runs, the version becomes 2 (per-record layout).
+pub(crate) const STORAGE_VERSION_KEY: Symbol = symbol_short!("STOR_VER");
+pub(crate) const CURRENT_STORAGE_VERSION: u32 = 2;
+
 /// Storage key enumeration for composite keys
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DataKey {
+    // ── Existing secondary-index variants (unchanged) ──────────────────────
     /// Bank units index: bank_id -> Vec<u64>
     BankUnits(Address),
     /// Donor units index: (bank_id, donor_id) -> Vec<u64>
@@ -557,6 +564,29 @@ pub enum DataKey {
     HealthRecordAccess(Address, Address),
     /// Blood-type units index: BloodType -> Vec<u64>
     BloodTypeUnits(BloodType),
+    // ── Per-record storage variants (#1394) ────────────────────────────────
+    /// Individual blood unit: unit_id -> BloodUnit
+    Unit(u64),
+    /// Individual blood request: request_id -> BloodRequest
+    Request(u64),
+    /// Individual payment: payment_id -> Payment
+    Payment(u64),
+    /// Individual dispute: dispute_id -> Dispute
+    Dispute(u64),
+    /// Individual dispute metadata: dispute_id -> DisputeMetadata
+    DisputeMetadata(u64),
+    /// Individual custody event: event_id -> CustodyEvent
+    CustodyRecord(String),
+    /// Individual escrow account: payment_id -> EscrowAccount
+    EscrowAccount(u64),
+    /// Individual pending approval: payment_id -> PendingApproval
+    PendingApprovalRecord(u64),
+    /// Individual blood bank lifecycle state: bank_id -> LifecycleState
+    BloodBankState(Address),
+    /// Individual hospital lifecycle state: hospital_id -> LifecycleState
+    HospitalState(Address),
+    /// Request dedup index: hashed Symbol -> request_id
+    RequestDedup(Symbol),
 }
 
 /// Metadata for paginated custody trail
@@ -582,9 +612,10 @@ pub struct RecordMetadata {
 
 // Re-export storage lifecycle types for external consumers
 pub use storage_lifecycle::{
-    archive_custody_events, archive_unit_history, bump_all_registries, bump_rent_for_unit,
-    get_archived_custody_summary, get_archived_history_summary, is_custody_archived,
-    is_history_archived, ArchiveKey, ArchivedCustodySummary, ArchivedHistorySummary,
+    archive_custody_events, archive_unit_history, bump_all_registries, bump_record,
+    bump_rent_for_unit, get_archived_custody_summary, get_archived_history_summary,
+    is_custody_archived, is_history_archived, ArchiveKey, ArchivedCustodySummary,
+    ArchivedHistorySummary,
 };
 
 // Re-export constants for internal use
@@ -663,7 +694,7 @@ impl HealthChainContract {
     /// Initialize the contract with admin
     pub fn initialize(env: Env, admin: Address) -> Result<Symbol, Error> {
         if env.storage().instance().has(&ADMIN) {
-            return Err(Error::AlreadyInitialized);
+            return Err(Error::RecordNotFound);
         }
         admin.require_auth();
         env.storage().instance().set(&ADMIN, &admin);
@@ -716,18 +747,18 @@ impl HealthChainContract {
             .ok_or(Error::Unauthorized)?;
         admin.require_auth();
 
-        let mut banks: Map<Address, LifecycleState> = env
+        if env
             .storage()
             .persistent()
-            .get(&BLOOD_BANKS)
-            .unwrap_or(Map::new(&env));
-
-        if banks.get(bank_id.clone()).is_some() {
+            .has(&DataKey::BloodBankState(bank_id.clone()))
+        {
             return Err(Error::DuplicateRegistration);
         }
 
-        banks.set(bank_id.clone(), LifecycleState::Active);
-        env.storage().persistent().set(&BLOOD_BANKS, &banks);
+        env.storage().persistent().set(
+            &DataKey::BloodBankState(bank_id.clone()),
+            &LifecycleState::Active,
+        );
 
         env.events().publish(
             (symbol_short!("bank"), symbol_short!("state")),
@@ -741,7 +772,8 @@ impl HealthChainContract {
             },
         );
 
-        env.events().publish((symbol_short!("bank"), symbol_short!("reg")), bank_id);
+        env.events()
+            .publish((symbol_short!("bank"), symbol_short!("reg")), bank_id);
 
         Ok(())
     }
@@ -755,18 +787,18 @@ impl HealthChainContract {
             .ok_or(Error::Unauthorized)?;
         admin.require_auth();
 
-        let mut hospitals: Map<Address, LifecycleState> = env
+        if env
             .storage()
             .persistent()
-            .get(&HOSPITALS)
-            .unwrap_or(Map::new(&env));
-
-        if hospitals.get(hospital_id.clone()).is_some() {
+            .has(&DataKey::HospitalState(hospital_id.clone()))
+        {
             return Err(Error::DuplicateRegistration);
         }
 
-        hospitals.set(hospital_id.clone(), LifecycleState::Active);
-        env.storage().persistent().set(&HOSPITALS, &hospitals);
+        env.storage().persistent().set(
+            &DataKey::HospitalState(hospital_id.clone()),
+            &LifecycleState::Active,
+        );
 
         env.events().publish(
             (symbol_short!("hospital"), symbol_short!("state")),
@@ -780,17 +812,16 @@ impl HealthChainContract {
             },
         );
 
-        env.events().publish((symbol_short!("hospital"), symbol_short!("reg")), hospital_id);
+        env.events().publish(
+            (symbol_short!("hospital"), symbol_short!("reg")),
+            hospital_id,
+        );
 
         Ok(())
     }
 
     /// Activate a blood bank (admin only)
-    pub fn activate_blood_bank(
-        env: Env,
-        admin: Address,
-        bank_id: Address,
-    ) -> Result<(), Error> {
+    pub fn activate_blood_bank(env: Env, admin: Address, bank_id: Address) -> Result<(), Error> {
         admin.require_auth();
 
         let stored_admin: Address = env
@@ -802,17 +833,15 @@ impl HealthChainContract {
             return Err(Error::Unauthorized);
         }
 
-        let mut banks: Map<Address, LifecycleState> = env
+        let old_state = env
             .storage()
             .persistent()
-            .get(&BLOOD_BANKS)
-            .unwrap_or(Map::new(&env));
-
-        let old_state = banks
-            .get(bank_id.clone())
+            .get::<DataKey, LifecycleState>(&DataKey::BloodBankState(bank_id.clone()))
             .unwrap_or(LifecycleState::Inactive);
-        banks.set(bank_id.clone(), LifecycleState::Active);
-        env.storage().persistent().set(&BLOOD_BANKS, &banks);
+        env.storage().persistent().set(
+            &DataKey::BloodBankState(bank_id.clone()),
+            &LifecycleState::Active,
+        );
 
         env.events().publish(
             (symbol_short!("bank"), symbol_short!("state")),
@@ -847,17 +876,15 @@ impl HealthChainContract {
             return Err(Error::Unauthorized);
         }
 
-        let mut banks: Map<Address, LifecycleState> = env
+        let old_state = env
             .storage()
             .persistent()
-            .get(&BLOOD_BANKS)
-            .unwrap_or(Map::new(&env));
-
-        let old_state = banks
-            .get(bank_id.clone())
+            .get::<DataKey, LifecycleState>(&DataKey::BloodBankState(bank_id.clone()))
             .unwrap_or(LifecycleState::Inactive);
-        banks.set(bank_id.clone(), LifecycleState::Inactive);
-        env.storage().persistent().set(&BLOOD_BANKS, &banks);
+        env.storage().persistent().set(
+            &DataKey::BloodBankState(bank_id.clone()),
+            &LifecycleState::Inactive,
+        );
 
         env.events().publish(
             (symbol_short!("bank"), symbol_short!("state")),
@@ -875,11 +902,7 @@ impl HealthChainContract {
     }
 
     /// Activate a hospital (admin only)
-    pub fn activate_hospital(
-        env: Env,
-        admin: Address,
-        hospital_id: Address,
-    ) -> Result<(), Error> {
+    pub fn activate_hospital(env: Env, admin: Address, hospital_id: Address) -> Result<(), Error> {
         admin.require_auth();
 
         let stored_admin: Address = env
@@ -891,17 +914,15 @@ impl HealthChainContract {
             return Err(Error::Unauthorized);
         }
 
-        let mut hospitals: Map<Address, LifecycleState> = env
+        let old_state = env
             .storage()
             .persistent()
-            .get(&HOSPITALS)
-            .unwrap_or(Map::new(&env));
-
-        let old_state = hospitals
-            .get(hospital_id.clone())
+            .get::<DataKey, LifecycleState>(&DataKey::HospitalState(hospital_id.clone()))
             .unwrap_or(LifecycleState::Inactive);
-        hospitals.set(hospital_id.clone(), LifecycleState::Active);
-        env.storage().persistent().set(&HOSPITALS, &hospitals);
+        env.storage().persistent().set(
+            &DataKey::HospitalState(hospital_id.clone()),
+            &LifecycleState::Active,
+        );
 
         env.events().publish(
             (symbol_short!("hospital"), symbol_short!("state")),
@@ -936,17 +957,15 @@ impl HealthChainContract {
             return Err(Error::Unauthorized);
         }
 
-        let mut hospitals: Map<Address, LifecycleState> = env
+        let old_state = env
             .storage()
             .persistent()
-            .get(&HOSPITALS)
-            .unwrap_or(Map::new(&env));
-
-        let old_state = hospitals
-            .get(hospital_id.clone())
+            .get::<DataKey, LifecycleState>(&DataKey::HospitalState(hospital_id.clone()))
             .unwrap_or(LifecycleState::Inactive);
-        hospitals.set(hospital_id.clone(), LifecycleState::Inactive);
-        env.storage().persistent().set(&HOSPITALS, &hospitals);
+        env.storage().persistent().set(
+            &DataKey::HospitalState(hospital_id.clone()),
+            &LifecycleState::Inactive,
+        );
 
         env.events().publish(
             (symbol_short!("hospital"), symbol_short!("state")),
@@ -964,49 +983,37 @@ impl HealthChainContract {
     }
 
     /// Get the lifecycle state of an address registered as a blood bank.
-    pub fn get_blood_bank_state(
-        env: Env,
-        bank_id: Address,
-    ) -> LifecycleState {
-        let banks: Map<Address, LifecycleState> = env
-            .storage()
+    pub fn get_blood_bank_state(env: Env, bank_id: Address) -> LifecycleState {
+        env.storage()
             .persistent()
-            .get(&BLOOD_BANKS)
-            .unwrap_or(Map::new(&env));
-
-        banks.get(bank_id).unwrap_or(LifecycleState::Inactive)
+            .get(&DataKey::BloodBankState(bank_id.clone()))
+            .unwrap_or(LifecycleState::Inactive)
     }
 
     /// Get the lifecycle state of an address registered as a hospital.
-    pub fn get_hospital_state(
-        env: Env,
-        hospital_id: Address,
-    ) -> LifecycleState {
-        let hospitals: Map<Address, LifecycleState> = env
-            .storage()
+    pub fn get_hospital_state(env: Env, hospital_id: Address) -> LifecycleState {
+        env.storage()
             .persistent()
-            .get(&HOSPITALS)
-            .unwrap_or(Map::new(&env));
-
-        hospitals.get(hospital_id).unwrap_or(LifecycleState::Inactive)
+            .get::<DataKey, LifecycleState>(&DataKey::HospitalState(hospital_id.clone()))
+            .unwrap_or(LifecycleState::Inactive)
     }
 
     /// Get the lifecycle state of an organization.
     pub fn get_organization_state(env: Env, org_id: Address) -> LifecycleState {
         let org_key = OrgKey::Org(org_id.clone());
-        let organization: Organization = env
-            .storage()
-            .persistent()
-            .get(&org_key)
-            .unwrap_or(Organization {
-                id: org_id,
-                verified: false,
-                verified_timestamp: None,
-                state: LifecycleState::Inactive,
-                state_changed_by: None,
-                state_changed_at: None,
-                state_change_reason: None,
-            });
+        let organization: Organization =
+            env.storage()
+                .persistent()
+                .get(&org_key)
+                .unwrap_or(Organization {
+                    id: org_id,
+                    verified: false,
+                    verified_timestamp: None,
+                    state: LifecycleState::Inactive,
+                    state_changed_by: None,
+                    state_changed_at: None,
+                    state_change_reason: None,
+                });
 
         organization.state
     }
@@ -1080,14 +1087,9 @@ impl HealthChainContract {
 
     /// Check if an address is an authorized blood bank
     pub fn is_blood_bank(env: Env, bank_id: Address) -> bool {
-        let banks: Map<Address, LifecycleState> = env
-            .storage()
+        env.storage()
             .persistent()
-            .get(&BLOOD_BANKS)
-            .unwrap_or(Map::new(&env));
-
-        banks
-            .get(bank_id)
+            .get::<DataKey, LifecycleState>(&DataKey::BloodBankState(bank_id.clone()))
             .unwrap_or(LifecycleState::Inactive)
             == LifecycleState::Active
     }
@@ -1109,13 +1111,11 @@ impl HealthChainContract {
             return Err(Error::UnauthorizedHospital);
         }
 
-        let mut units: Map<u64, BloodUnit> = env
+        let mut unit: BloodUnit = env
             .storage()
             .persistent()
-            .get(&BLOOD_UNITS)
-            .unwrap_or(Map::new(&env));
-
-        let mut unit = units.get(unit_id).ok_or(Error::UnitNotFound)?;
+            .get(&DataKey::Unit(unit_id))
+            .ok_or(Error::UnitNotFound)?;
 
         // Re-validate hospital status immediately before the storage write (fix #946 TOCTOU)
         if !Self::is_hospital(env.clone(), hospital.clone()) {
@@ -1142,8 +1142,9 @@ impl HealthChainContract {
         unit.recipient_hospital = Some(hospital.clone());
         unit.allocation_timestamp = Some(current_time);
 
-        units.set(unit_id, unit.clone());
-        env.storage().persistent().set(&BLOOD_UNITS, &units);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Unit(unit_id), &unit);
 
         // Maintain status index
         reindex_status(&env, unit_id, old_status, BloodStatus::Reserved);
@@ -1196,18 +1197,17 @@ impl HealthChainContract {
         }
 
         let mut allocated = vec![&env];
-        let mut units: Map<u64, BloodUnit> = env
-            .storage()
-            .persistent()
-            .get(&BLOOD_UNITS)
-            .unwrap_or(Map::new(&env));
 
         let current_time = env.ledger().timestamp();
 
         // Process all units
         for i in 0..unit_ids.len() {
             let unit_id = unit_ids.get(i).unwrap();
-            let mut unit = units.get(unit_id).ok_or(Error::UnitNotFound)?;
+            let mut unit: BloodUnit = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Unit(unit_id))
+                .ok_or(Error::UnitNotFound)?;
 
             // Check if expired
             if unit.expiration_date <= current_time {
@@ -1227,7 +1227,9 @@ impl HealthChainContract {
             unit.recipient_hospital = Some(hospital.clone());
             unit.allocation_timestamp = Some(current_time);
 
-            units.set(unit_id, unit.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::Unit(unit_id), &unit);
 
             // Maintain status index
             reindex_status(&env, unit_id, old_status, BloodStatus::Reserved);
@@ -1258,7 +1260,6 @@ impl HealthChainContract {
         }
 
         // Save all changes
-        env.storage().persistent().set(&BLOOD_UNITS, &units);
 
         Ok(allocated)
     }
@@ -1273,13 +1274,12 @@ impl HealthChainContract {
         }
 
         // Get blood unit
-        let mut units: Map<u64, BloodUnit> = env
+
+        let mut unit: BloodUnit = env
             .storage()
             .persistent()
-            .get(&BLOOD_UNITS)
-            .unwrap_or(Map::new(&env));
-
-        let mut unit = units.get(unit_id).ok_or(Error::UnitNotFound)?;
+            .get(&DataKey::Unit(unit_id))
+            .ok_or(Error::UnitNotFound)?;
 
         // Verify caller is the current custodian of this specific unit
         if unit.bank_id != bank_id {
@@ -1300,8 +1300,9 @@ impl HealthChainContract {
         unit.recipient_hospital = None;
         unit.allocation_timestamp = None;
 
-        units.set(unit_id, unit.clone());
-        env.storage().persistent().set(&BLOOD_UNITS, &units);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Unit(unit_id), &unit);
 
         // Maintain status index
         reindex_status(&env, unit_id, old_status, BloodStatus::Available);
@@ -1343,13 +1344,11 @@ impl HealthChainContract {
             return Err(Error::Unauthorized);
         }
 
-        let mut units: Map<u64, BloodUnit> = env
+        let mut unit: BloodUnit = env
             .storage()
             .persistent()
-            .get(&BLOOD_UNITS)
-            .unwrap_or(Map::new(&env));
-
-        let mut unit = units.get(unit_id).ok_or(Error::UnitNotFound)?;
+            .get(&DataKey::Unit(unit_id))
+            .ok_or(Error::UnitNotFound)?;
 
         // INVARIANT: Only the current custodian (unit.bank_id) can initiate a transfer
         // This ensures that only actors with actual possession can move the unit
@@ -1394,21 +1393,16 @@ impl HealthChainContract {
             status: CustodyStatus::Pending,
         };
 
-        // Store custody event
-        let mut custody_events: Map<String, CustodyEvent> = env
-            .storage()
-            .persistent()
-            .get(&CUSTODY_EVENTS)
-            .unwrap_or(Map::new(&env));
-
-        custody_events.set(event_id.clone(), custody_event.clone());
         env.storage()
             .persistent()
-            .set(&CUSTODY_EVENTS, &custody_events);
+            .set(&DataKey::CustodyRecord(event_id.clone()), &custody_event);
+
+        bump_record(&env, &DataKey::CustodyRecord(event_id.clone()));
 
         // Maintain UnitCustodyIndex so confirm_delivery can find the pending event in O(1)
         let index_key = DataKey::UnitCustodyIndex(unit_id);
         env.storage().persistent().set(&index_key, &event_id);
+        bump_record(&env, &index_key);
 
         // Maintain per-unit custody events list so archive_custody_events can find all events
         // for this unit in O(k) (k = events per unit) instead of scanning the full CUSTODY_EVENTS map
@@ -1422,13 +1416,15 @@ impl HealthChainContract {
         env.storage()
             .persistent()
             .set(&unit_events_key, &unit_event_ids);
+        bump_record(&env, &unit_events_key);
 
         let old_status = unit.status;
         unit.status = BloodStatus::InTransit;
         unit.transfer_timestamp = Some(current_time);
 
-        units.set(unit_id, unit.clone());
-        env.storage().persistent().set(&BLOOD_UNITS, &units);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Unit(unit_id), &unit);
 
         // Maintain status index
         reindex_status(&env, unit_id, old_status, BloodStatus::InTransit);
@@ -1489,14 +1485,10 @@ impl HealthChainContract {
         }
 
         // Get custody event
-        let mut custody_events: Map<String, CustodyEvent> = env
+        let mut custody_event: CustodyEvent = env
             .storage()
             .persistent()
-            .get(&CUSTODY_EVENTS)
-            .unwrap_or(Map::new(&env));
-
-        let mut custody_event = custody_events
-            .get(event_id.clone())
+            .get(&DataKey::CustodyRecord(event_id.clone()))
             .ok_or(Error::UnitNotFound)?;
 
         // Verify the event's designated recipient is a registered hospital
@@ -1518,13 +1510,12 @@ impl HealthChainContract {
         let unit_id = custody_event.unit_id;
 
         // Get blood unit
-        let mut units: Map<u64, BloodUnit> = env
+
+        let mut unit: BloodUnit = env
             .storage()
             .persistent()
-            .get(&BLOOD_UNITS)
-            .unwrap_or(Map::new(&env));
-
-        let mut unit = units.get(unit_id).ok_or(Error::UnitNotFound)?;
+            .get(&DataKey::Unit(unit_id))
+            .ok_or(Error::UnitNotFound)?;
 
         // INVARIANT: Unit must be in InTransit status (transferred but not yet confirmed)
         if unit.status != BloodStatus::InTransit {
@@ -1546,18 +1537,22 @@ impl HealthChainContract {
         // If unit expiration passed while in transit, mark as recovered with explicit event
         if unit.expiration_date <= current_time {
             unit.status = BloodStatus::Expired;
-            units.set(unit_id, unit.clone());
-            env.storage().persistent().set(&BLOOD_UNITS, &units);
+            // Fix #1436: the unit expired in transit and will never be
+            // delivered, so drop it from the recipient's HospitalUnits index.
+            release_undelivered_allocation(&env, unit_id, &mut unit);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Unit(unit_id), &unit);
 
             // Maintain status index
             reindex_status(&env, unit_id, old_status, BloodStatus::Expired);
 
             // Update custody event to Recovered status to indicate recovery action
             custody_event.status = CustodyStatus::Recovered;
-            custody_events.set(event_id.clone(), custody_event.clone());
             env.storage()
                 .persistent()
-                .set(&CUSTODY_EVENTS, &custody_events);
+                .set(&DataKey::CustodyRecord(event_id.clone()), &custody_event);
+            bump_record(&env, &DataKey::CustodyRecord(event_id.clone()));
 
             // Clear UnitCustodyIndex — transfer is no longer pending
             env.storage()
@@ -1596,10 +1591,10 @@ impl HealthChainContract {
 
         // Update custody event status
         custody_event.status = CustodyStatus::Confirmed;
-        custody_events.set(event_id.clone(), custody_event.clone());
         env.storage()
             .persistent()
-            .set(&CUSTODY_EVENTS, &custody_events);
+            .set(&DataKey::CustodyRecord(event_id.clone()), &custody_event);
+        bump_record(&env, &DataKey::CustodyRecord(event_id.clone()));
 
         // Clear UnitCustodyIndex — transfer is no longer pending
         env.storage()
@@ -1613,8 +1608,9 @@ impl HealthChainContract {
         unit.status = BloodStatus::Delivered;
         unit.delivery_timestamp = Some(current_time);
 
-        units.set(unit_id, unit.clone());
-        env.storage().persistent().set(&BLOOD_UNITS, &units);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Unit(unit_id), &unit);
 
         // Maintain status index
         reindex_status(&env, unit_id, old_status, BloodStatus::Delivered);
@@ -1659,14 +1655,10 @@ impl HealthChainContract {
         }
 
         // Get custody event
-        let mut custody_events: Map<String, CustodyEvent> = env
+        let mut custody_event: CustodyEvent = env
             .storage()
             .persistent()
-            .get(&CUSTODY_EVENTS)
-            .unwrap_or(Map::new(&env));
-
-        let mut custody_event = custody_events
-            .get(event_id.clone())
+            .get(&DataKey::CustodyRecord(event_id.clone()))
             .ok_or(Error::UnitNotFound)?;
 
         // INVARIANT: Only the originating custodian (from_custodian) can cancel a transfer
@@ -1682,13 +1674,11 @@ impl HealthChainContract {
 
         let unit_id = custody_event.unit_id;
 
-        let mut units: Map<u64, BloodUnit> = env
+        let mut unit: BloodUnit = env
             .storage()
             .persistent()
-            .get(&BLOOD_UNITS)
-            .unwrap_or(Map::new(&env));
-
-        let mut unit = units.get(unit_id).ok_or(Error::UnitNotFound)?;
+            .get(&DataKey::Unit(unit_id))
+            .ok_or(Error::UnitNotFound)?;
 
         // RECOVERY PATH: Unit must be in transit to be cancelled/recovered
         if unit.status != BloodStatus::InTransit {
@@ -1706,10 +1696,10 @@ impl HealthChainContract {
 
         // RECOVERY ACTION: Update custody event status to Recovered
         custody_event.status = CustodyStatus::Recovered;
-        custody_events.set(event_id.clone(), custody_event.clone());
         env.storage()
             .persistent()
-            .set(&CUSTODY_EVENTS, &custody_events);
+            .set(&DataKey::CustodyRecord(event_id.clone()), &custody_event);
+        bump_record(&env, &DataKey::CustodyRecord(event_id.clone()));
 
         // Clear UnitCustodyIndex — transfer is no longer pending
         env.storage()
@@ -1722,8 +1712,9 @@ impl HealthChainContract {
         unit.status = BloodStatus::Reserved;
         unit.transfer_timestamp = None;
 
-        units.set(unit_id, unit.clone());
-        env.storage().persistent().set(&BLOOD_UNITS, &units);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Unit(unit_id), &unit);
 
         // Maintain status index
         reindex_status(&env, unit_id, old_status, BloodStatus::Reserved);
@@ -1791,13 +1782,12 @@ impl HealthChainContract {
         }
 
         // Get blood unit
-        let mut units: Map<u64, BloodUnit> = env
+
+        let mut unit: BloodUnit = env
             .storage()
             .persistent()
-            .get(&BLOOD_UNITS)
-            .unwrap_or(Map::new(&env));
-
-        let mut unit = units.get(unit_id).ok_or(Error::UnitNotFound)?;
+            .get(&DataKey::Unit(unit_id))
+            .ok_or(Error::UnitNotFound)?;
 
         // While a unit is in transit, only the originating bank remains the
         // current custodian until the recipient confirms the transfer. This
@@ -1823,9 +1813,12 @@ impl HealthChainContract {
 
         // Update unit
         unit.status = BloodStatus::Discarded;
+        // Fix #1436: the unit can never reach its allocated hospital now.
+        release_undelivered_allocation(&env, unit_id, &mut unit);
 
-        units.set(unit_id, unit.clone());
-        env.storage().persistent().set(&BLOOD_UNITS, &units);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Unit(unit_id), &unit);
 
         // Maintain status index
         reindex_status(&env, unit_id, old_status, BloodStatus::Discarded);
@@ -1867,13 +1860,11 @@ impl HealthChainContract {
             return Err(Error::Unauthorized);
         }
 
-        let mut units: Map<u64, BloodUnit> = env
+        let mut unit: BloodUnit = env
             .storage()
             .persistent()
-            .get(&BLOOD_UNITS)
-            .unwrap_or(Map::new(&env));
-
-        let mut unit = units.get(unit_id).ok_or(Error::UnitNotFound)?;
+            .get(&DataKey::Unit(unit_id))
+            .ok_or(Error::UnitNotFound)?;
 
         // While a unit is in transit, only the originating bank remains the
         // current custodian until the recipient confirms the transfer.
@@ -1897,8 +1888,9 @@ impl HealthChainContract {
         }
 
         unit.status = BloodStatus::Quarantined;
-        units.set(unit_id, unit.clone());
-        env.storage().persistent().set(&BLOOD_UNITS, &units);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Unit(unit_id), &unit);
 
         // Maintain status index
         reindex_status(&env, unit_id, old_status, BloodStatus::Quarantined);
@@ -1945,13 +1937,11 @@ impl HealthChainContract {
             return Err(Error::Unauthorized);
         }
 
-        let mut units: Map<u64, BloodUnit> = env
+        let mut unit: BloodUnit = env
             .storage()
             .persistent()
-            .get(&BLOOD_UNITS)
-            .unwrap_or(Map::new(&env));
-
-        let mut unit = units.get(unit_id).ok_or(Error::UnitNotFound)?;
+            .get(&DataKey::Unit(unit_id))
+            .ok_or(Error::UnitNotFound)?;
 
         // Verify caller is the current custodian (owning bank or recipient hospital)
         if unit.bank_id != caller && unit.recipient_hospital != Some(caller.clone()) {
@@ -1968,9 +1958,18 @@ impl HealthChainContract {
             QuarantineDisposition::Discard => BloodStatus::Discarded,
         };
 
+        // Fix #1434: a unit whose expiration_date passed while it sat in
+        // quarantine must not be released back into the active pool. Discard
+        // remains allowed so expired quarantined stock can still be disposed of.
+        if new_status == BloodStatus::Available && unit.expiration_date <= env.ledger().timestamp()
+        {
+            return Err(Error::UnitExpired);
+        }
+
         unit.status = new_status;
-        units.set(unit_id, unit.clone());
-        env.storage().persistent().set(&BLOOD_UNITS, &units);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Unit(unit_id), &unit);
 
         // Maintain status index
         reindex_status(&env, unit_id, old_status, new_status);
@@ -1986,11 +1985,16 @@ impl HealthChainContract {
             let stale_hospital = unit.recipient_hospital.clone();
             if stale_hospital.is_some() {
                 // Reload the unit from the map so we can clear its fields.
-                let mut cleared = units.get(unit_id).ok_or(Error::UnitNotFound)?;
+                let mut cleared: BloodUnit = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Unit(unit_id))
+                    .ok_or(Error::UnitNotFound)?;
                 cleared.recipient_hospital = None;
                 cleared.allocation_timestamp = None;
-                units.set(unit_id, cleared);
-                env.storage().persistent().set(&BLOOD_UNITS, &units);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Unit(unit_id), &cleared);
 
                 if let Some(ref hosp) = stale_hospital {
                     deindex_hospital_unit(&env, hosp, unit_id);
@@ -2062,20 +2066,18 @@ impl HealthChainContract {
             .get(&key)
             .unwrap_or(Vec::new(&env));
 
-        let units: Map<u64, BloodUnit> = env
-            .storage()
-            .persistent()
-            .get(&BLOOD_UNITS)
-            .unwrap_or(Map::new(&env));
-
         let mut results = vec![&env];
-        let limit = if max_results == 0 { u32::MAX } else { max_results };
+        let limit = if max_results == 0 {
+            u32::MAX
+        } else {
+            max_results
+        };
 
         for id in ids.iter() {
             if results.len() >= limit {
                 break;
             }
-            if let Some(unit) = units.get(id) {
+            if let Some(unit) = env.storage().persistent().get(&DataKey::Unit(id)) {
                 results.push_back(unit);
             }
         }
@@ -2093,20 +2095,18 @@ impl HealthChainContract {
             .get(&key)
             .unwrap_or(Vec::new(&env));
 
-        let units: Map<u64, BloodUnit> = env
-            .storage()
-            .persistent()
-            .get(&BLOOD_UNITS)
-            .unwrap_or(Map::new(&env));
-
         let mut results = vec![&env];
-        let limit = if max_results == 0 { u32::MAX } else { max_results };
+        let limit = if max_results == 0 {
+            u32::MAX
+        } else {
+            max_results
+        };
 
         for id in ids.iter() {
             if results.len() >= limit {
                 break;
             }
-            if let Some(unit) = units.get(id) {
+            if let Some(unit) = env.storage().persistent().get(&DataKey::Unit(id)) {
                 results.push_back(unit);
             }
         }
@@ -2127,6 +2127,7 @@ pub(crate) fn index_bank_unit(env: &Env, bank_id: &Address, unit_id: u64) {
         .unwrap_or(Vec::new(env));
     ids.push_back(unit_id);
     env.storage().persistent().set(&key, &ids);
+    storage_lifecycle::bump_persistent(env, &key);
 }
 
 /// Append `unit_id` to the HospitalUnits index for `hospital_id`.
@@ -2140,6 +2141,7 @@ pub(crate) fn index_hospital_unit(env: &Env, hospital_id: &Address, unit_id: u64
         .unwrap_or(Vec::new(env));
     ids.push_back(unit_id);
     env.storage().persistent().set(&key, &ids);
+    storage_lifecycle::bump_persistent(env, &key);
 }
 
 /// Remove `unit_id` from the HospitalUnits index for `hospital_id`.
@@ -2160,6 +2162,24 @@ pub(crate) fn deindex_hospital_unit(env: &Env, hospital_id: &Address, unit_id: u
     env.storage().persistent().set(&key, &filtered);
 }
 
+/// Clear a stale hospital allocation from a unit that is moving to a terminal
+/// status (Discarded / Expired) without ever having been delivered.
+///
+/// Mirrors the cleanup in `cancel_allocation` and `finalize_quarantine`'s
+/// Release path (Fix #1323) so `query_by_hospital` does not list units the
+/// hospital will never receive (Fix #1436). Units that were delivered keep
+/// their `recipient_hospital` since the hospital genuinely held them.
+/// The caller is responsible for persisting `unit`.
+pub(crate) fn release_undelivered_allocation(env: &Env, unit_id: u64, unit: &mut BloodUnit) {
+    if unit.delivery_timestamp.is_some() {
+        return;
+    }
+    if let Some(hosp) = unit.recipient_hospital.take() {
+        unit.allocation_timestamp = None;
+        deindex_hospital_unit(env, &hosp, unit_id);
+    }
+}
+
 /// Append `unit_id` to the DonorUnits index for `(bank_id, donor_id)` and the
 /// global sentinel index `(ZERO_ADDR, donor_id)` used by cross-bank donor queries.
 pub(crate) fn index_donor_unit(env: &Env, bank_id: &Address, donor_id: &Symbol, unit_id: u64) {
@@ -2172,6 +2192,7 @@ pub(crate) fn index_donor_unit(env: &Env, bank_id: &Address, donor_id: &Symbol, 
         .unwrap_or(Vec::new(env));
     ids.push_back(unit_id);
     env.storage().persistent().set(&key, &ids);
+    storage_lifecycle::bump_persistent(env, &key);
 
     // Global cross-bank index (sentinel zero-address)
     let sentinel = env.current_contract_address();
@@ -2183,11 +2204,17 @@ pub(crate) fn index_donor_unit(env: &Env, bank_id: &Address, donor_id: &Symbol, 
         .unwrap_or(Vec::new(env));
     global_ids.push_back(unit_id);
     env.storage().persistent().set(&global_key, &global_ids);
+    storage_lifecycle::bump_persistent(env, &global_key);
 }
 
 /// Move `unit_id` from the `old_status` bucket to the `new_status` bucket.
 /// No-op when `old_status == new_status`.
-pub(crate) fn reindex_status(env: &Env, unit_id: u64, old_status: BloodStatus, new_status: BloodStatus) {
+pub(crate) fn reindex_status(
+    env: &Env,
+    unit_id: u64,
+    old_status: BloodStatus,
+    new_status: BloodStatus,
+) {
     if old_status == new_status {
         return;
     }
@@ -2215,6 +2242,7 @@ pub(crate) fn reindex_status(env: &Env, unit_id: u64, old_status: BloodStatus, n
         .unwrap_or(Vec::new(env));
     new_ids.push_back(unit_id);
     env.storage().persistent().set(&new_key, &new_ids);
+    storage_lifecycle::bump_persistent(env, &new_key);
 }
 
 /// Append `unit_id` to the BloodTypeUnits index for `blood_type`.
@@ -2228,8 +2256,52 @@ pub(crate) fn index_blood_type_unit(env: &Env, blood_type: BloodType, unit_id: u
         .unwrap_or(Vec::new(env));
     ids.push_back(unit_id);
     env.storage().persistent().set(&key, &ids);
+    storage_lifecycle::bump_persistent(env, &key);
 }
 
+/// Read the storage schema version. Returns `None` for fresh contracts
+/// (monolithic-map layout) or the version set by `migrate_storage`.
+pub(crate) fn get_storage_version(env: &Env) -> Option<u32> {
+    env.storage().persistent().get(&STORAGE_VERSION_KEY)
+}
+
+/// Write the storage schema version.
+pub(crate) fn set_storage_version(env: &Env, version: u32) {
+    env.storage()
+        .persistent()
+        .set(&STORAGE_VERSION_KEY, &version);
+}
+
+/// Compute a compact storage key for request deduplication.
+/// The raw RequestKey can exceed Soroban's 250-byte storage key limit,
+/// so we hash it down to a short Symbol.
+pub(crate) fn request_dedup_key(env: &Env, key: &RequestKey) -> Symbol {
+    use soroban_sdk::Bytes;
+    let mut data = Bytes::new(env);
+    let h_str = key.hospital_id.to_string();
+    let h_bytes = Bytes::from(&h_str);
+    for i in 0..h_bytes.len() {
+        data.push_back(h_bytes.get(i).unwrap());
+    }
+    data.push_back(key.blood_type as u8);
+    for b in key.quantity_ml.to_be_bytes() {
+        data.push_back(b);
+    }
+    data.push_back(key.urgency as u8);
+    for b in key.required_by.to_be_bytes() {
+        data.push_back(b);
+    }
+    let hash: soroban_sdk::BytesN<32> = env.crypto().sha256(&data).into();
+    let hex_chars = b"0123456789abcdef";
+    let mut hex_array = [0u8; 16];
+    for i in 0..8u32 {
+        let byte = hash.get(i).unwrap();
+        hex_array[(i * 2) as usize] = hex_chars[((byte >> 4) & 0x0f) as usize];
+        hex_array[(i * 2 + 1) as usize] = hex_chars[(byte & 0x0f) as usize];
+    }
+    let s = core::str::from_utf8(&hex_array).unwrap_or("0000000000000000");
+    Symbol::new(env, s)
+}
 // ── SHARED HELPERS (Internal) ──
 
 pub(crate) fn get_next_id(env: &Env) -> u64 {
@@ -2272,6 +2344,12 @@ pub(crate) fn record_status_change(
 
     history.push_back(event.clone());
     env.storage().persistent().set(&history_key, &history);
+
+    // Every unit write path funnels through here, so bump TTL for the unit,
+    // its history and its index entries so they survive past the default
+    // ledger TTL (fix #1430 — no write path previously called extend_ttl).
+    let unit: Option<BloodUnit> = env.storage().persistent().get(&DataKey::Unit(unit_id));
+    bump_rent_for_unit(env, unit_id, unit.as_ref());
 
     // Also emit event
     env.events().publish(
@@ -2364,14 +2442,9 @@ impl HealthChainContract {
 
     /// Check if an address is an authorized hospital
     pub fn is_hospital(env: Env, hospital_id: Address) -> bool {
-        let hospitals: Map<Address, LifecycleState> = env
-            .storage()
+        env.storage()
             .persistent()
-            .get(&HOSPITALS)
-            .unwrap_or(Map::new(&env));
-
-        hospitals
-            .get(hospital_id)
+            .get::<DataKey, LifecycleState>(&DataKey::HospitalState(hospital_id.clone()))
             .unwrap_or(LifecycleState::Inactive)
             == LifecycleState::Active
     }
@@ -2472,13 +2545,10 @@ impl HealthChainContract {
 
     /// Get custody event by event_id
     pub fn get_custody_event(env: Env, event_id: String) -> Result<CustodyEvent, Error> {
-        let custody_events: Map<String, CustodyEvent> = env
-            .storage()
+        env.storage()
             .persistent()
-            .get(&CUSTODY_EVENTS)
-            .unwrap_or(Map::new(&env));
-
-        custody_events.get(event_id).ok_or(Error::UnitNotFound)
+            .get(&DataKey::CustodyRecord(event_id))
+            .ok_or(Error::UnitNotFound)
     }
 
     /// Get custody trail for a blood unit with pagination
@@ -2489,14 +2559,14 @@ impl HealthChainContract {
         page_number: u32,
     ) -> Result<Vec<String>, Error> {
         let meta_key = DataKey::UnitTrailMeta(unit_id);
-        let metadata: TrailMetadata = env
-            .storage()
-            .persistent()
-            .get(&meta_key)
-            .unwrap_or(TrailMetadata {
-                total_events: 0,
-                total_pages: 0,
-            });
+        let metadata: TrailMetadata =
+            env.storage()
+                .persistent()
+                .get(&meta_key)
+                .unwrap_or(TrailMetadata {
+                    total_events: 0,
+                    total_pages: 0,
+                });
 
         if metadata.total_pages > 0 && page_number >= metadata.total_pages {
             return Err(Error::PageNotFound);
@@ -2561,6 +2631,238 @@ impl HealthChainContract {
         Ok(())
     }
 
+    /// Migrate contract storage from monolithic maps to per-record layout.
+    ///
+    /// This is a breaking storage change (issue #1394). Call this once after
+    /// upgrading the contract WASM. The function is idempotent — if storage
+    /// is already migrated it returns Ok(0).
+    ///
+    /// For each legacy collection, iterates all entries and writes them under
+    /// individual `DataKey` variants. The old map symbols are left in place
+    /// as dead code — they will not be read by the new contract logic.
+    pub fn migrate_storage(env: Env) -> Result<u32, Error> {
+        use soroban_sdk::Map;
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN)
+            .ok_or(Error::Unauthorized)?;
+        admin.require_auth();
+
+        // Idempotent guard
+        let current = get_storage_version(&env).unwrap_or(1);
+        if current >= CURRENT_STORAGE_VERSION {
+            return Ok(0);
+        }
+
+        let mut migrated: u32 = 0;
+
+        // ── BLOOD_UNITS → DataKey::Unit(id) ──────────────────────────────
+        let old_units: Map<u64, BloodUnit> = env
+            .storage()
+            .persistent()
+            .get(&BLOOD_UNITS)
+            .unwrap_or(Map::new(&env));
+        for (id, unit) in old_units.iter() {
+            if !env.storage().persistent().has(&DataKey::Unit(id)) {
+                env.storage().persistent().set(&DataKey::Unit(id), &unit);
+                bump_record(&env, &DataKey::Unit(id));
+                migrated = migrated.checked_add(1).ok_or(Error::ArithmeticError)?;
+            }
+        }
+
+        // ── REQUESTS → DataKey::Request(id) ──────────────────────────────
+        let old_requests: Map<u64, BloodRequest> = env
+            .storage()
+            .persistent()
+            .get(&REQUESTS)
+            .unwrap_or(Map::new(&env));
+        for (id, req) in old_requests.iter() {
+            if !env.storage().persistent().has(&DataKey::Request(id)) {
+                env.storage().persistent().set(&DataKey::Request(id), &req);
+                bump_record(&env, &DataKey::Request(id));
+                migrated = migrated.checked_add(1).ok_or(Error::ArithmeticError)?;
+            }
+        }
+
+        // ── PAYMENTS → DataKey::Payment(id) ──────────────────────────────
+        let old_payments: Map<u64, Payment> = env
+            .storage()
+            .persistent()
+            .get(&PAYMENTS)
+            .unwrap_or(Map::new(&env));
+        for (id, payment) in old_payments.iter() {
+            if !env.storage().persistent().has(&DataKey::Payment(id)) {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Payment(id), &payment);
+                bump_record(&env, &DataKey::Payment(id));
+                migrated = migrated.checked_add(1).ok_or(Error::ArithmeticError)?;
+            }
+        }
+
+        // ── DISPUTES → DataKey::Dispute(id) ──────────────────────────────
+        let old_disputes: Map<u64, Dispute> = env
+            .storage()
+            .persistent()
+            .get(&DISPUTES)
+            .unwrap_or(Map::new(&env));
+        for (id, dispute) in old_disputes.iter() {
+            if !env.storage().persistent().has(&DataKey::Dispute(id)) {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Dispute(id), &dispute);
+                bump_record(&env, &DataKey::Dispute(id));
+                migrated = migrated.checked_add(1).ok_or(Error::ArithmeticError)?;
+            }
+        }
+
+        // ── DISPUTE_METADATA → DataKey::DisputeMetadata(id) ──────────────
+        let old_meta: Map<u64, DisputeMetadata> = env
+            .storage()
+            .persistent()
+            .get(&DISPUTE_METADATA)
+            .unwrap_or(Map::new(&env));
+        for (id, meta) in old_meta.iter() {
+            if !env
+                .storage()
+                .persistent()
+                .has(&DataKey::DisputeMetadata(id))
+            {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::DisputeMetadata(id), &meta);
+                bump_record(&env, &DataKey::DisputeMetadata(id));
+                migrated = migrated.checked_add(1).ok_or(Error::ArithmeticError)?;
+            }
+        }
+
+        // ── CUSTODY_EVENTS → DataKey::CustodyRecord(event_id) ────────────
+        let old_custody: Map<String, CustodyEvent> = env
+            .storage()
+            .persistent()
+            .get(&CUSTODY_EVENTS)
+            .unwrap_or(Map::new(&env));
+        for (event_id, event) in old_custody.iter() {
+            if !env
+                .storage()
+                .persistent()
+                .has(&DataKey::CustodyRecord(event_id.clone()))
+            {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::CustodyRecord(event_id.clone()), &event);
+                bump_record(&env, &DataKey::CustodyRecord(event_id.clone()));
+                migrated = migrated.checked_add(1).ok_or(Error::ArithmeticError)?;
+            }
+        }
+
+        // ── ESCROW_ACCOUNTS → DataKey::EscrowAccount(payment_id) ─────────
+        let old_escrow: Map<u64, EscrowAccount> = env
+            .storage()
+            .persistent()
+            .get(&ESCROW_ACCOUNTS)
+            .unwrap_or(Map::new(&env));
+        for (id, escrow) in old_escrow.iter() {
+            if !env.storage().persistent().has(&DataKey::EscrowAccount(id)) {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::EscrowAccount(id), &escrow);
+                bump_record(&env, &DataKey::EscrowAccount(id));
+                migrated = migrated.checked_add(1).ok_or(Error::ArithmeticError)?;
+            }
+        }
+
+        // ── PENDING_APPROVALS → DataKey::PendingApprovalRecord(id) ───────
+        let old_pending: Map<u64, PendingApproval> = env
+            .storage()
+            .persistent()
+            .get(&PENDING_APPROVALS)
+            .unwrap_or(Map::new(&env));
+        for (id, approval) in old_pending.iter() {
+            if !env
+                .storage()
+                .persistent()
+                .has(&DataKey::PendingApprovalRecord(id))
+            {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::PendingApprovalRecord(id), &approval);
+                bump_record(&env, &DataKey::PendingApprovalRecord(id));
+                migrated = migrated.checked_add(1).ok_or(Error::ArithmeticError)?;
+            }
+        }
+
+        // ── BLOOD_BANKS → DataKey::BloodBankState(addr) ──────────────────
+        let old_banks: Map<Address, LifecycleState> = env
+            .storage()
+            .persistent()
+            .get(&BLOOD_BANKS)
+            .unwrap_or(Map::new(&env));
+        for (addr, state) in old_banks.iter() {
+            if !env
+                .storage()
+                .persistent()
+                .has(&DataKey::BloodBankState(addr.clone()))
+            {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::BloodBankState(addr), &state);
+                migrated = migrated.checked_add(1).ok_or(Error::ArithmeticError)?;
+            }
+        }
+
+        // ── HOSPITALS → DataKey::HospitalState(addr) ─────────────────────
+        let old_hospitals: Map<Address, LifecycleState> = env
+            .storage()
+            .persistent()
+            .get(&HOSPITALS)
+            .unwrap_or(Map::new(&env));
+        for (addr, state) in old_hospitals.iter() {
+            if !env
+                .storage()
+                .persistent()
+                .has(&DataKey::HospitalState(addr.clone()))
+            {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::HospitalState(addr), &state);
+                migrated = migrated.checked_add(1).ok_or(Error::ArithmeticError)?;
+            }
+        }
+
+        // ── REQUEST_KEYS → DataKey::RequestDedup(key) ────────────────────
+        let old_rk: Map<RequestKey, u64> = env
+            .storage()
+            .persistent()
+            .get(&REQUEST_KEYS)
+            .unwrap_or(Map::new(&env));
+        for (key, req_id) in old_rk.iter() {
+            let dedup = request_dedup_key(&env, &key);
+            if !env
+                .storage()
+                .persistent()
+                .has(&DataKey::RequestDedup(dedup.clone()))
+            {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::RequestDedup(dedup), &req_id);
+                migrated = migrated.checked_add(1).ok_or(Error::ArithmeticError)?;
+            }
+        }
+
+        // Mark storage as migrated
+        set_storage_version(&env, CURRENT_STORAGE_VERSION);
+
+        env.events().publish(
+            (symbol_short!("migrate"), symbol_short!("storage")),
+            (migrated, CURRENT_STORAGE_VERSION),
+        );
+
+        Ok(migrated)
+    }
+
     /// Create a blood request (hospital only)
     pub fn create_request(
         env: Env,
@@ -2604,13 +2906,14 @@ impl HealthChainContract {
             required_by,
         };
 
-        let mut request_keys: Map<RequestKey, u64> = env
+        if env
             .storage()
             .persistent()
-            .get(&REQUEST_KEYS)
-            .unwrap_or(Map::new(&env));
-
-        if request_keys.get(request_key.clone()).is_some() {
+            .has(&DataKey::RequestDedup(request_dedup_key(
+                &env,
+                &request_key,
+            )))
+        {
             return Err(Error::DuplicateRequest);
         }
 
@@ -2631,17 +2934,15 @@ impl HealthChainContract {
             reserved_unit_ids: vec![&env],
         };
 
-        let mut requests: Map<u64, BloodRequest> = env
-            .storage()
+        env.storage()
             .persistent()
-            .get(&REQUESTS)
-            .unwrap_or(Map::new(&env));
+            .set(&DataKey::Request(request_id), &request);
+        bump_record(&env, &DataKey::Request(request_id));
 
-        requests.set(request_id, request);
-        env.storage().persistent().set(&REQUESTS, &requests);
-
-        request_keys.set(request_key, request_id);
-        env.storage().persistent().set(&REQUEST_KEYS, &request_keys);
+        env.storage().persistent().set(
+            &DataKey::RequestDedup(request_dedup_key(&env, &request_key)),
+            &request_id,
+        );
 
         let event = RequestCreatedEvent {
             request_id,
@@ -2667,6 +2968,10 @@ impl HealthChainContract {
     }
 
     /// Create a payment for a request and persist its escrow account with release conditions.
+    ///
+    /// NOTE: bookkeeping only. This does not call a token contract or move
+    /// any funds — it records intent to pay, nothing more. See
+    /// `EscrowAccount` docs.
     pub fn create_payment(
         env: Env,
         request_id: u64,
@@ -2694,17 +2999,20 @@ impl HealthChainContract {
             return Err(Error::InvalidFeePayload);
         }
 
+        // Reject fee payloads that exceed MAX_FEE_BPS of the gross amount.
+        // Without this check a caller can inflate fees so the stored net
+        // payment.amount falls just below HIGH_VALUE_THRESHOLD while locking a
+        // much larger gross amount in escrow, bypassing M-of-N multisig control
+        // (issue #1400).
+        if let Err(_) = fee_payload.validate_fee_cap(amount) {
+            return Err(Error::FeesExceedCap);
+        }
+
         // `amount` is the gross amount supplied by the payer; `payment.amount`
         // is documented as the net amount after fees, so net it down here.
         let net_amount = fee_payload
             .calculate_net_amount(amount)
             .map_err(|_| Error::InvalidFeePayload)?;
-
-        let mut payments: Map<u64, Payment> = env
-            .storage()
-            .persistent()
-            .get(&PAYMENTS)
-            .unwrap_or(Map::new(&env));
 
         let payment_id = env
             .storage()
@@ -2720,11 +3028,10 @@ impl HealthChainContract {
             amount: net_amount,
             asset,
             fee_structure: fee_payload,
-            // Escrow is created atomically with the payment, so transition
-            // directly to Escrowed — there is no separate fund_escrow entry
-            // point, and leaving status as Pending would permanently block
-            // propose_release and raise_dispute (fixes #1324).
-            status: PaymentStatus::Escrowed,
+            // Payment starts as Pending; the payer must call fund_escrow to
+            // transition to Escrowed before raise_dispute / propose_release
+            // become available.  This preserves the intended two-phase flow.
+            status: PaymentStatus::Pending,
             escrow_released_at: None,
         };
 
@@ -2743,18 +3050,16 @@ impl HealthChainContract {
                 authorized_approver: None,
             },
         };
-        let mut escrow_accounts: Map<u64, EscrowAccount> = env
-            .storage()
-            .persistent()
-            .get(&ESCROW_ACCOUNTS)
-            .unwrap_or(Map::new(&env));
-        escrow_accounts.set(payment_id, escrow);
+
         env.storage()
             .persistent()
-            .set(&ESCROW_ACCOUNTS, &escrow_accounts);
-
-        payments.set(payment_id, payment);
-        env.storage().persistent().set(&PAYMENTS, &payments);
+            .set(&DataKey::Payment(payment_id), &payment);
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowAccount(payment_id), &escrow);
+        // Bump TTL for payment and escrow records (fix #1430).
+        bump_record(&env, &DataKey::Payment(payment_id));
+        bump_record(&env, &DataKey::EscrowAccount(payment_id));
         env.storage()
             .instance()
             .set(&NEXT_PAYMENT_ID, &(payment_id + 1));
@@ -2770,13 +3075,11 @@ impl HealthChainContract {
     pub fn fund_escrow(env: Env, payment_id: u64, payer: Address) -> Result<(), Error> {
         payer.require_auth();
 
-        let mut payments: Map<u64, Payment> = env
+        let mut payment: crate::payments::Payment = env
             .storage()
             .persistent()
-            .get(&PAYMENTS)
+            .get(&DataKey::Payment(payment_id))
             .ok_or(Error::PaymentNotFound)?;
-
-        let mut payment = payments.get(payment_id).ok_or(Error::PaymentNotFound)?;
 
         if payment.payer != payer {
             return Err(Error::Unauthorized);
@@ -2787,8 +3090,10 @@ impl HealthChainContract {
         }
 
         payment.status = PaymentStatus::Escrowed;
-        payments.set(payment_id, payment);
-        env.storage().persistent().set(&PAYMENTS, &payments);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(payment_id), &payment);
+        bump_record(&env, &DataKey::Payment(payment_id));
 
         Ok(())
     }
@@ -2808,24 +3113,21 @@ impl HealthChainContract {
             .ok_or(Error::Unauthorized)?;
         admin.require_auth();
 
-        let mut escrow_accounts: Map<u64, EscrowAccount> = env
+        let mut escrow: crate::payments::EscrowAccount = env
             .storage()
             .persistent()
-            .get(&ESCROW_ACCOUNTS)
-            .ok_or(Error::PaymentNotFound)?;
-
-        let mut escrow = escrow_accounts
-            .get(payment_id)
+            .get(&DataKey::EscrowAccount(payment_id))
             .ok_or(Error::PaymentNotFound)?;
         escrow.release_conditions = ReleaseConditions {
             medical_records_verified,
             min_timestamp,
             authorized_approver,
         };
-        escrow_accounts.set(payment_id, escrow);
         env.storage()
             .persistent()
-            .set(&ESCROW_ACCOUNTS, &escrow_accounts);
+            .set(&DataKey::EscrowAccount(payment_id), &escrow);
+        bump_record(&env, &DataKey::EscrowAccount(payment_id));
+
         Ok(())
     }
 
@@ -2868,30 +3170,11 @@ impl HealthChainContract {
 
         env.storage().persistent().set(&MULTISIG_CONFIG, &config);
 
-        let mut pending_approvals: Map<u64, PendingApproval> = env
-            .storage()
-            .persistent()
-            .get(&PENDING_APPROVALS)
-            .unwrap_or(Map::new(&env));
+        // Note: In the new per-record storage, we can't iterate all pending approvals
+        // without an index. This function's multisig re-validation will be handled
+        // when individual approvals are accessed. For now, this is a no-op since
+        // per-record storage doesn't support full iteration over pending_approvals.
 
-        for payment_id in pending_approvals.keys() {
-            let mut approval = pending_approvals.get(payment_id).unwrap();
-            let mut valid_approvals: Vec<Address> = Vec::new(&env);
-
-            for i in 0..approval.approvals.len() {
-                let signer = approval.approvals.get(i).unwrap();
-                if config.is_signer(&signer) {
-                    valid_approvals.push_back(signer);
-                }
-            }
-
-            approval.approvals = valid_approvals;
-            pending_approvals.set(payment_id, approval);
-        }
-
-        env.storage()
-            .persistent()
-            .set(&PENDING_APPROVALS, &pending_approvals);
         Ok(())
     }
 
@@ -2917,39 +3200,32 @@ impl HealthChainContract {
     /// evaluated first for every payment.  Multisig approval is additive — it is
     /// required on top of the escrow conditions for high-value payments, not
     /// instead of them.
+    ///
+    /// NOTE: bookkeeping only. Marking a payment `Completed` here does not
+    /// call a token contract or pay the payee — no funds move. See
+    /// `EscrowAccount` docs.
     pub fn propose_release(env: Env, payment_id: u64, approver: Address) -> Result<bool, Error> {
         approver.require_auth();
 
-        let mut payments: Map<u64, Payment> = env
+        let mut payment: crate::payments::Payment = env
             .storage()
             .persistent()
-            .get(&PAYMENTS)
+            .get(&DataKey::Payment(payment_id))
             .ok_or(Error::PaymentNotFound)?;
-
-        let mut payment = payments.get(payment_id).ok_or(Error::PaymentNotFound)?;
         if !payment.can_transition_to(PaymentStatus::Completed) {
             return Err(Error::InvalidPaymentStatus);
         }
 
         // Enforce escrow release conditions before any payout path.
-        let escrow_accounts: Map<u64, EscrowAccount> = env
+        let escrow: crate::payments::EscrowAccount = env
             .storage()
             .persistent()
-            .get(&ESCROW_ACCOUNTS)
-            .unwrap_or(Map::new(&env));
-        let escrow = escrow_accounts
-            .get(payment_id)
+            .get(&DataKey::EscrowAccount(payment_id))
             .ok_or(Error::PaymentNotFound)?;
         let current_timestamp = env.ledger().timestamp();
         if !escrow.can_release(current_timestamp, Some(&approver)) {
             return Err(Error::EscrowNotReleasable);
         }
-
-        let mut pending_approvals: Map<u64, PendingApproval> = env
-            .storage()
-            .persistent()
-            .get(&PENDING_APPROVALS)
-            .unwrap_or(Map::new(&env));
 
         // Gate the multisig threshold on the gross escrowed amount, not the
         // post-fee net payment.amount. A caller could otherwise craft a fee
@@ -2968,12 +3244,14 @@ impl HealthChainContract {
 
             payment.status = PaymentStatus::Completed;
             payment.escrow_released_at = Some(current_timestamp);
-            payments.set(payment_id, payment);
-            env.storage().persistent().set(&PAYMENTS, &payments);
-            pending_approvals.remove(payment_id);
             env.storage()
                 .persistent()
-                .set(&PENDING_APPROVALS, &pending_approvals);
+                .set(&DataKey::Payment(payment_id), &payment);
+            bump_record(&env, &DataKey::Payment(payment_id));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::PendingApprovalRecord(payment_id));
+
             return Ok(true);
         }
 
@@ -2990,8 +3268,10 @@ impl HealthChainContract {
             return Err(Error::Unauthorized);
         }
 
-        let mut approval = pending_approvals
-            .get(payment_id)
+        let mut approval: crate::payments::PendingApproval = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingApprovalRecord(payment_id))
             .unwrap_or(PendingApproval::new(&env, payment_id));
 
         approval
@@ -3002,14 +3282,17 @@ impl HealthChainContract {
             approval.executed = true;
             payment.status = PaymentStatus::Completed;
             payment.escrow_released_at = Some(current_timestamp);
-            payments.set(payment_id, payment);
-            env.storage().persistent().set(&PAYMENTS, &payments);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Payment(payment_id), &payment);
+            bump_record(&env, &DataKey::Payment(payment_id));
         }
 
-        pending_approvals.set(payment_id, approval.clone());
+        // Persist the vote so approvals accumulate across calls and duplicate
+        // votes from the same signer are detected on the next call.
         env.storage()
             .persistent()
-            .set(&PENDING_APPROVALS, &pending_approvals);
+            .set(&DataKey::PendingApprovalRecord(payment_id), &approval);
 
         Ok(approval.executed)
     }
@@ -3028,16 +3311,18 @@ impl HealthChainContract {
         // evidence_ref_chunks reconstruction against evidence_digest is off-chain only;
         // enforce a valid SHA-256 digest size to reject trivially invalid submissions.
         if evidence_digest.len() != 32 {
-            return Err(Error::InvalidFeePayload);
+            return Err(Error::InvalidEvidenceDigest);
         }
 
-        let mut payments: Map<u64, Payment> = env
+        let mut payment: crate::payments::Payment = env
             .storage()
             .persistent()
-            .get(&PAYMENTS)
+            .get(&DataKey::Payment(payment_id))
             .ok_or(Error::PaymentNotFound)?;
 
-        let mut payment = payments.get(payment_id).ok_or(Error::PaymentNotFound)?;
+        if raised_by != payment.payer && raised_by != payment.payee {
+            return Err(Error::Unauthorized);
+        }
 
         if !payment.can_transition_to(PaymentStatus::Disputed) {
             return Err(Error::InvalidTransition);
@@ -3071,41 +3356,39 @@ impl HealthChainContract {
         };
 
         payment.status = PaymentStatus::Disputed;
-        payments.set(payment_id, payment.clone());
-        env.storage().persistent().set(&PAYMENTS, &payments);
-
-        let mut disputes: Map<u64, Dispute> = env
-            .storage()
-            .persistent()
-            .get(&DISPUTES)
-            .unwrap_or(Map::new(&env));
-
-        disputes.set(dispute_id, dispute);
-        env.storage().persistent().set(&DISPUTES, &disputes);
-        let mut dispute_metadata: Map<u64, DisputeMetadata> = env
-            .storage()
-            .persistent()
-            .get(&DISPUTE_METADATA)
-            .unwrap_or(Map::new(&env));
-        dispute_metadata.set(dispute_id, metadata);
         env.storage()
             .persistent()
-            .set(&DISPUTE_METADATA, &dispute_metadata);
+            .set(&DataKey::Payment(payment_id), &payment);
+        bump_record(&env, &DataKey::Payment(payment_id));
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Dispute(dispute_id), &dispute);
+        bump_record(&env, &DataKey::Dispute(dispute_id));
+
+        // Persist the deadline so process_expired_disputes can auto-refund
+        // once the dispute window lapses.
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeMetadata(dispute_id), &metadata);
+        bump_record(&env, &DataKey::DisputeMetadata(dispute_id));
+
         env.storage()
             .instance()
             .set(&NEXT_DISPUTE_ID, &(dispute_id + 1));
 
         // Update Request Status if possible
-        let mut requests: Map<u64, BloodRequest> = env
+
+        if let Some(mut request) = env
             .storage()
             .persistent()
-            .get(&REQUESTS)
-            .unwrap_or(Map::new(&env));
-
-        if let Some(mut request) = requests.get(payment.request_id) {
+            .get::<DataKey, BloodRequest>(&DataKey::Request(payment.request_id))
+        {
             request.status = RequestStatus::Disputed;
-            requests.set(payment.request_id, request);
-            env.storage().persistent().set(&REQUESTS, &requests);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Request(payment.request_id), &request);
+            bump_record(&env, &DataKey::Request(payment.request_id));
         }
 
         // Emit DisputeRaisedEvent
@@ -3129,6 +3412,10 @@ impl HealthChainContract {
     }
 
     /// Resolve a dispute (admin only)
+    ///
+    /// NOTE: bookkeeping only. Setting the payment to `Refunded` or
+    /// `Completed` here does not call a token contract — no funds are
+    /// actually refunded or paid out. See `EscrowAccount` docs.
     pub fn resolve_dispute(
         env: Env,
         dispute_id: u64,
@@ -3141,13 +3428,11 @@ impl HealthChainContract {
             .ok_or(Error::Unauthorized)?;
         admin.require_auth();
 
-        let mut disputes: Map<u64, Dispute> = env
+        let mut dispute: crate::payments::Dispute = env
             .storage()
             .persistent()
-            .get(&DISPUTES)
+            .get(&DataKey::Dispute(dispute_id))
             .ok_or(Error::DisputeNotFound)?;
-
-        let mut dispute = disputes.get(dispute_id).ok_or(Error::DisputeNotFound)?;
 
         if dispute.status != DisputeStatus::Open {
             return Err(Error::InvalidDisputeStatus);
@@ -3157,20 +3442,18 @@ impl HealthChainContract {
             return Err(Error::InvalidDisputeStatus);
         }
 
-        let mut payments: Map<u64, Payment> = env
+        let mut payment: crate::payments::Payment = env
             .storage()
             .persistent()
-            .get(&PAYMENTS)
-            .ok_or(Error::PaymentNotFound)?;
-
-        let mut payment = payments
-            .get(dispute.payment_id)
+            .get(&DataKey::Payment(dispute.payment_id))
             .ok_or(Error::PaymentNotFound)?;
 
         dispute.status = resolution;
         dispute.resolved_at = Some(env.ledger().timestamp());
-        disputes.set(dispute_id, dispute.clone());
-        env.storage().persistent().set(&DISPUTES, &disputes);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Dispute(dispute_id), &dispute);
+        bump_record(&env, &DataKey::Dispute(dispute_id));
 
         payment.status = PaymentStatus::Resolved;
 
@@ -3185,20 +3468,23 @@ impl HealthChainContract {
             _ => {}
         }
 
-        payments.set(dispute.payment_id, payment.clone());
-        env.storage().persistent().set(&PAYMENTS, &payments);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(dispute.payment_id), &payment);
+        bump_record(&env, &DataKey::Payment(dispute.payment_id));
 
         // Update Request Status
-        let mut requests: Map<u64, BloodRequest> = env
+
+        if let Some(mut request) = env
             .storage()
             .persistent()
-            .get(&REQUESTS)
-            .unwrap_or(Map::new(&env));
-
-        if let Some(mut request) = requests.get(payment.request_id) {
+            .get::<DataKey, BloodRequest>(&DataKey::Request(payment.request_id))
+        {
             request.status = RequestStatus::Resolved;
-            requests.set(payment.request_id, request);
-            env.storage().persistent().set(&REQUESTS, &requests);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Request(payment.request_id), &request);
+            bump_record(&env, &DataKey::Request(payment.request_id));
         }
 
         // Emit DisputeResolvedEvent
@@ -3223,40 +3509,28 @@ impl HealthChainContract {
     ///
     /// Only a bounded batch of dispute IDs is processed per call to keep costs
     /// predictable and prevent unbounded scans of historical disputes.
+    ///
+    /// NOTE: bookkeeping only. Auto-refunding here (including
+    /// `total_auto_refunded`) does not call a token contract — no funds
+    /// actually move. See `EscrowAccount` docs.
     pub fn process_expired_disputes(env: Env, dispute_ids: Vec<u64>) -> Result<u32, Error> {
         if dispute_ids.len() > MAX_BATCH_SIZE {
             return Err(Error::BatchSizeExceeded);
         }
 
         let current_time = env.ledger().timestamp();
-        let mut disputes: Map<u64, Dispute> = env
-            .storage()
-            .persistent()
-            .get(&DISPUTES)
-            .unwrap_or(Map::new(&env));
-        let dispute_metadata: Map<u64, DisputeMetadata> = env
-            .storage()
-            .persistent()
-            .get(&DISPUTE_METADATA)
-            .unwrap_or(Map::new(&env));
-        let mut payments: Map<u64, Payment> = env
-            .storage()
-            .persistent()
-            .get(&PAYMENTS)
-            .unwrap_or(Map::new(&env));
         // Load escrow accounts so we can use locked_amount for refund stats
         // rather than the post-fee payment.amount (fixes #1326).
-        let escrow_accounts: Map<u64, EscrowAccount> = env
-            .storage()
-            .persistent()
-            .get(&ESCROW_ACCOUNTS)
-            .unwrap_or(Map::new(&env));
         let mut stats = Self::get_payment_stats(env.clone());
         let mut processed = 0u32;
 
         for i in 0..dispute_ids.len() {
             let dispute_id = dispute_ids.get(i).unwrap();
-            let mut dispute = match disputes.get(dispute_id) {
+            let mut dispute: crate::payments::Dispute = match env
+                .storage()
+                .persistent()
+                .get(&DataKey::Dispute(dispute_id))
+            {
                 Some(dispute) => dispute,
                 None => continue,
             };
@@ -3265,7 +3539,11 @@ impl HealthChainContract {
                 continue;
             }
 
-            let metadata = match dispute_metadata.get(dispute_id) {
+            let metadata: crate::payments::DisputeMetadata = match env
+                .storage()
+                .persistent()
+                .get(&DataKey::DisputeMetadata(dispute_id))
+            {
                 Some(metadata) => metadata,
                 None => continue,
             };
@@ -3274,7 +3552,11 @@ impl HealthChainContract {
                 continue;
             }
 
-            let mut payment = match payments.get(dispute.payment_id) {
+            let mut payment: crate::payments::Payment = match env
+                .storage()
+                .persistent()
+                .get(&DataKey::Payment(dispute.payment_id))
+            {
                 Some(payment) => payment,
                 None => continue,
             };
@@ -3285,18 +3567,29 @@ impl HealthChainContract {
 
             // Use the gross escrowed amount for the refund; fall back to
             // payment.amount only if the escrow record is missing.
-            let refund_amount = escrow_accounts
-                .get(payment.id)
+            let refund_amount = env
+                .storage()
+                .persistent()
+                .get::<DataKey, crate::payments::EscrowAccount>(&DataKey::EscrowAccount(payment.id))
                 .map(|e| e.locked_amount)
                 .unwrap_or(payment.amount);
 
             payment.status = PaymentStatus::Refunded;
             payment.escrow_released_at = Some(current_time);
-            payments.set(dispute.payment_id, payment.clone());
 
             dispute.status = DisputeStatus::ResolvedInFavorOfPayer;
             dispute.resolved_at = Some(current_time);
-            disputes.set(dispute_id, dispute.clone());
+
+            // Persist the refund so the same dispute cannot be auto-refunded
+            // (and counted in stats) again on a later call.
+            env.storage()
+                .persistent()
+                .set(&DataKey::Payment(payment.id), &payment);
+            bump_record(&env, &DataKey::Payment(payment.id));
+            env.storage()
+                .persistent()
+                .set(&DataKey::Dispute(dispute_id), &dispute);
+            bump_record(&env, &DataKey::Dispute(dispute_id));
 
             stats.count_auto_refunded = stats
                 .count_auto_refunded
@@ -3324,8 +3617,6 @@ impl HealthChainContract {
             );
         }
 
-        env.storage().persistent().set(&DISPUTES, &disputes);
-        env.storage().persistent().set(&PAYMENTS, &payments);
         env.storage().persistent().set(&PAYMENT_STATS, &stats);
 
         Ok(processed)
@@ -3340,13 +3631,11 @@ impl HealthChainContract {
     ) -> Result<(), Error> {
         caller.require_auth();
 
-        let mut requests: Map<u64, BloodRequest> = env
+        let mut request: BloodRequest = env
             .storage()
             .persistent()
-            .get(&REQUESTS)
-            .unwrap_or(Map::new(&env));
-
-        let mut request = requests.get(request_id).ok_or(Error::UnitNotFound)?;
+            .get(&DataKey::Request(request_id))
+            .ok_or(Error::UnitNotFound)?;
 
         // Authorization: admin, the requesting hospital, or an authorized blood bank
         let admin: Option<Address> = env.storage().instance().get(&ADMIN);
@@ -3366,8 +3655,10 @@ impl HealthChainContract {
         let old_status = request.status;
         request.status = new_status;
 
-        requests.set(request_id, request.clone());
-        env.storage().persistent().set(&REQUESTS, &requests);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Request(request_id), &request);
+        bump_record(&env, &DataKey::Request(request_id));
 
         // Clear the dedup index when a request reaches a terminal non-fulfilled
         // state so the hospital can re-submit the same parameters (fixes #1327).
@@ -3379,13 +3670,9 @@ impl HealthChainContract {
                 urgency: request.urgency,
                 required_by: request.required_by,
             };
-            let mut request_keys: Map<RequestKey, u64> = env
-                .storage()
+            env.storage()
                 .persistent()
-                .get(&REQUEST_KEYS)
-                .unwrap_or(Map::new(&env));
-            request_keys.remove(status_key);
-            env.storage().persistent().set(&REQUEST_KEYS, &request_keys);
+                .remove(&DataKey::RequestDedup(request_dedup_key(&env, &status_key)));
         }
 
         // Record and emit status change
@@ -3407,30 +3694,26 @@ impl HealthChainContract {
             return Err(Error::Unauthorized);
         }
 
-        let mut requests: Map<u64, BloodRequest> = env
+        let mut request: BloodRequest = env
             .storage()
             .persistent()
-            .get(&REQUESTS)
-            .unwrap_or(Map::new(&env));
-
-        let mut request = requests.get(request_id).ok_or(Error::UnitNotFound)?;
+            .get(&DataKey::Request(request_id))
+            .ok_or(Error::UnitNotFound)?;
 
         if request.status != RequestStatus::Pending {
             return Err(Error::InvalidStatus);
         }
-
-        let mut units: Map<u64, BloodUnit> = env
-            .storage()
-            .persistent()
-            .get(&BLOOD_UNITS)
-            .unwrap_or(Map::new(&env));
 
         let current_time = env.ledger().timestamp();
         let mut total_quantity: u32 = 0;
 
         for i in 0..unit_ids.len() {
             let unit_id = unit_ids.get(i).unwrap();
-            let unit = units.get(unit_id).ok_or(Error::UnitNotFound)?;
+            let unit: BloodUnit = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Unit(unit_id))
+                .ok_or(Error::UnitNotFound)?;
 
             if unit.blood_type != request.blood_type {
                 return Err(Error::InvalidStatus);
@@ -3452,14 +3735,20 @@ impl HealthChainContract {
         // Reserve units to the requesting hospital.
         for i in 0..unit_ids.len() {
             let unit_id = unit_ids.get(i).unwrap();
-            let mut unit = units.get(unit_id).ok_or(Error::UnitNotFound)?;
+            let mut unit: BloodUnit = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Unit(unit_id))
+                .ok_or(Error::UnitNotFound)?;
             let old_status = unit.status;
 
             unit.status = BloodStatus::Reserved;
             unit.recipient_hospital = Some(request.hospital_id.clone());
             unit.allocation_timestamp = Some(current_time);
 
-            units.set(unit_id, unit);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Unit(unit_id), &unit);
 
             // Maintain status index
             reindex_status(&env, unit_id, old_status, BloodStatus::Reserved);
@@ -3482,8 +3771,6 @@ impl HealthChainContract {
             );
         }
 
-        env.storage().persistent().set(&BLOOD_UNITS, &units);
-
         let old_status = request.status;
         request.reserved_unit_ids = unit_ids.clone();
         request.fulfilled_quantity_ml = total_quantity;
@@ -3493,8 +3780,10 @@ impl HealthChainContract {
             RequestStatus::InProgress
         };
 
-        requests.set(request_id, request.clone());
-        env.storage().persistent().set(&REQUESTS, &requests);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Request(request_id), &request);
+        bump_record(&env, &DataKey::Request(request_id));
 
         record_request_status_change(
             &env,
@@ -3536,13 +3825,11 @@ impl HealthChainContract {
     ) -> Result<(), Error> {
         caller.require_auth();
 
-        let mut requests: Map<u64, BloodRequest> = env
+        let mut request: BloodRequest = env
             .storage()
             .persistent()
-            .get(&REQUESTS)
-            .unwrap_or(Map::new(&env));
-
-        let mut request = requests.get(request_id).ok_or(Error::UnitNotFound)?;
+            .get(&DataKey::Request(request_id))
+            .ok_or(Error::UnitNotFound)?;
 
         // Authorization: only the hospital that created the request, an
         // authorized blood bank, or the contract admin may cancel it.
@@ -3571,32 +3858,34 @@ impl HealthChainContract {
         let released_unit_ids = request.reserved_unit_ids.clone();
 
         // Release reserved units
-        let mut units: Map<u64, BloodUnit> = env
-            .storage()
-            .persistent()
-            .get(&BLOOD_UNITS)
-            .unwrap_or(Map::new(&env));
 
         for i in 0..request.reserved_unit_ids.len() {
             let unit_id = request.reserved_unit_ids.get(i).unwrap();
-            if let Some(mut unit) = units.get(unit_id) {
+            if let Some(mut unit) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, BloodUnit>(&DataKey::Unit(unit_id))
+            {
                 if unit.status == BloodStatus::Reserved {
                     let old_unit_status = unit.status;
                     unit.status = BloodStatus::Available;
                     unit.recipient_hospital = None;
                     unit.allocation_timestamp = None;
-                    units.set(unit_id, unit);
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::Unit(unit_id), &unit);
                     // Maintain status index
                     reindex_status(&env, unit_id, old_unit_status, BloodStatus::Available);
                 }
             }
         }
 
-        env.storage().persistent().set(&BLOOD_UNITS, &units);
         request.reserved_unit_ids = vec![&env];
 
-        requests.set(request_id, request.clone());
-        env.storage().persistent().set(&REQUESTS, &requests);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Request(request_id), &request);
+        bump_record(&env, &DataKey::Request(request_id));
 
         let current_time = env.ledger().timestamp();
 
@@ -3609,13 +3898,9 @@ impl HealthChainContract {
             urgency: request.urgency,
             required_by: request.required_by,
         };
-        let mut request_keys: Map<RequestKey, u64> = env
-            .storage()
+        env.storage()
             .persistent()
-            .get(&REQUEST_KEYS)
-            .unwrap_or(Map::new(&env));
-        request_keys.remove(cancel_key);
-        env.storage().persistent().set(&REQUEST_KEYS, &request_keys);
+            .remove(&DataKey::RequestDedup(request_dedup_key(&env, &cancel_key)));
 
         // Record and emit status change (for backward compatibility)
         record_request_status_change(
@@ -3656,13 +3941,11 @@ impl HealthChainContract {
     ) -> Result<(), Error> {
         bank_id.require_auth();
 
-        let mut requests: Map<u64, BloodRequest> = env
+        let mut request: BloodRequest = env
             .storage()
             .persistent()
-            .get(&REQUESTS)
-            .unwrap_or(Map::new(&env));
-
-        let mut request = requests.get(request_id).ok_or(Error::UnitNotFound)?;
+            .get(&DataKey::Request(request_id))
+            .ok_or(Error::UnitNotFound)?;
 
         if !HealthChainContract::is_blood_bank(env.clone(), bank_id.clone()) {
             return Err(Error::Unauthorized);
@@ -3693,21 +3976,39 @@ impl HealthChainContract {
         }
 
         // Validate delivery quantity before mutating any unit or request state.
-        let mut units: Map<u64, BloodUnit> = env
-            .storage()
-            .persistent()
-            .get(&BLOOD_UNITS)
-            .unwrap_or(Map::new(&env));
 
         let mut delivered_quantity: u32 = 0;
 
         for i in 0..unit_ids.len() {
             let unit_id = unit_ids.get(i).unwrap();
-            let unit = units.get(unit_id).ok_or(Error::UnitNotFound)?;
+
+            // Fix #1433: units are only read (not mutated) in this loop, so a
+            // repeated ID would pass the status check twice and have its
+            // quantity counted twice, letting a request reach Fulfilled with
+            // less blood actually delivered.
+            for j in 0..i {
+                if unit_ids.get(j).unwrap() == unit_id {
+                    return Err(Error::DuplicateUnitId);
+                }
+            }
+
+            let unit: BloodUnit = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Unit(unit_id))
+                .ok_or(Error::UnitNotFound)?;
 
             // Verify unit is reserved for this hospital
             if unit.recipient_hospital != Some(request.hospital_id.clone()) {
                 return Err(Error::Unauthorized);
+            }
+
+            // Verify the calling bank actually owns/registered this unit.
+            // Without this check any registered bank could fulfill another
+            // bank's reserved units and fire RequestFulfilledEvent under its
+            // own identity without ever having had custody of the units.
+            if unit.bank_id != bank_id {
+                return Err(Error::NotCurrentCustodian);
             }
 
             if unit.status != BloodStatus::Reserved && unit.status != BloodStatus::InTransit {
@@ -3725,7 +4026,11 @@ impl HealthChainContract {
 
         for i in 0..unit_ids.len() {
             let unit_id = unit_ids.get(i).unwrap();
-            let mut unit = units.get(unit_id).ok_or(Error::UnitNotFound)?;
+            let mut unit: BloodUnit = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Unit(unit_id))
+                .ok_or(Error::UnitNotFound)?;
 
             // Update to delivered
             let old_status = unit.status;
@@ -3733,7 +4038,9 @@ impl HealthChainContract {
             let current_time = env.ledger().timestamp();
             unit.delivery_timestamp = Some(current_time);
 
-            units.set(unit_id, unit.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::Unit(unit_id), &unit);
 
             // Maintain status index
             reindex_status(&env, unit_id, old_status, BloodStatus::Delivered);
@@ -3747,8 +4054,6 @@ impl HealthChainContract {
                 bank_id.clone(),
             );
         }
-
-        env.storage().persistent().set(&BLOOD_UNITS, &units);
 
         // Update request while preserving any still-reserved, undelivered units.
         let old_status = request.status;
@@ -3786,8 +4091,10 @@ impl HealthChainContract {
             remaining_reserved_unit_ids
         };
 
-        requests.set(request_id, request.clone());
-        env.storage().persistent().set(&REQUESTS, &requests);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Request(request_id), &request);
+        bump_record(&env, &DataKey::Request(request_id));
 
         // Clear the dedup index on fulfillment so the same request parameters
         // can be re-submitted in future if needed (fixes #1327).
@@ -3799,13 +4106,12 @@ impl HealthChainContract {
                 urgency: request.urgency,
                 required_by: request.required_by,
             };
-            let mut request_keys: Map<RequestKey, u64> = env
-                .storage()
+            env.storage()
                 .persistent()
-                .get(&REQUEST_KEYS)
-                .unwrap_or(Map::new(&env));
-            request_keys.remove(fulfill_key);
-            env.storage().persistent().set(&REQUEST_KEYS, &request_keys);
+                .remove(&DataKey::RequestDedup(request_dedup_key(
+                    &env,
+                    &fulfill_key,
+                )));
         }
 
         if old_status != request.status {
@@ -4010,7 +4316,7 @@ impl HealthChainContract {
         Self::accept_super_admin(env)
     }
 
-        /// Authorize an inventory contract for cross-contract synchronization (admin only).
+    /// Authorize an inventory contract for cross-contract synchronization (admin only).
     ///
     /// The authorized inventory contract may call `inventory_reserve_unit` and
     /// `inventory_release_unit` to keep its reservation state consistent with
@@ -4040,13 +4346,11 @@ impl HealthChainContract {
     /// Intended for cross-contract calls from the inventory contract.
     /// Returns `false` if the unit does not exist, is not Available, or is expired.
     pub fn check_unit_available(env: Env, unit_id: u64) -> bool {
-        let units: Map<u64, BloodUnit> = env
+        match env
             .storage()
             .persistent()
-            .get(&BLOOD_UNITS)
-            .unwrap_or(Map::new(&env));
-
-        match units.get(unit_id) {
+            .get::<DataKey, BloodUnit>(&DataKey::Unit(unit_id))
+        {
             Some(unit) => {
                 let current_time = env.ledger().timestamp();
                 unit.status == BloodStatus::Available && unit.expiration_date > current_time
@@ -4078,13 +4382,11 @@ impl HealthChainContract {
             return Err(Error::Unauthorized);
         }
 
-        let mut units: Map<u64, BloodUnit> = env
+        let mut unit: BloodUnit = env
             .storage()
             .persistent()
-            .get(&BLOOD_UNITS)
-            .unwrap_or(Map::new(&env));
-
-        let mut unit = units.get(unit_id).ok_or(Error::UnitNotFound)?;
+            .get(&DataKey::Unit(unit_id))
+            .ok_or(Error::UnitNotFound)?;
         if unit.status != BloodStatus::Available {
             return Err(Error::InvalidStatus);
         }
@@ -4098,8 +4400,9 @@ impl HealthChainContract {
         unit.recipient_hospital = Some(hospital_id.clone());
         unit.allocation_timestamp = Some(current_time);
 
-        units.set(unit_id, unit);
-        env.storage().persistent().set(&BLOOD_UNITS, &units);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Unit(unit_id), &unit);
 
         reindex_status(&env, unit_id, old_status, BloodStatus::Reserved);
         index_hospital_unit(&env, &hospital_id, unit_id);
@@ -4136,13 +4439,11 @@ impl HealthChainContract {
             return Err(Error::Unauthorized);
         }
 
-        let mut units: Map<u64, BloodUnit> = env
+        let mut unit: BloodUnit = env
             .storage()
             .persistent()
-            .get(&BLOOD_UNITS)
-            .unwrap_or(Map::new(&env));
-
-        let mut unit = units.get(unit_id).ok_or(Error::UnitNotFound)?;
+            .get(&DataKey::Unit(unit_id))
+            .ok_or(Error::UnitNotFound)?;
         if unit.status != BloodStatus::Reserved {
             return Err(Error::InvalidStatus);
         }
@@ -4154,8 +4455,9 @@ impl HealthChainContract {
         unit.recipient_hospital = None;
         unit.allocation_timestamp = None;
 
-        units.set(unit_id, unit);
-        env.storage().persistent().set(&BLOOD_UNITS, &units);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Unit(unit_id), &unit);
 
         reindex_status(&env, unit_id, old_status, BloodStatus::Available);
         if let Some(ref hosp) = hospital_id {
@@ -4330,7 +4632,12 @@ impl HealthChainContract {
         Ok(())
     }
 
-    /// Add a blood unit to inventory (legacy function for testing)
+    /// Add a blood unit to inventory (legacy function for testing).
+    ///
+    /// Test-only: this entrypoint has no auth check and no validation, so it
+    /// must never be compiled into a deployed contract. Real unit creation
+    /// goes through `registry_write::register_unit`.
+    #[cfg(test)]
     pub fn add_blood_unit(
         env: Env,
         blood_type: BloodType,
@@ -4362,14 +4669,7 @@ impl HealthChainContract {
             delivery_timestamp: None,
         };
 
-        let mut units: Map<u64, BloodUnit> = env
-            .storage()
-            .persistent()
-            .get(&BLOOD_UNITS)
-            .unwrap_or(Map::new(&env));
-
-        units.set(id, unit);
-        env.storage().persistent().set(&BLOOD_UNITS, &units);
+        env.storage().persistent().set(&DataKey::Unit(id), &unit);
 
         // Maintain blood-type index so query_by_blood_type / check_availability work correctly.
         index_blood_type_unit(&env, blood_type, id);
@@ -4401,7 +4701,11 @@ impl HealthChainContract {
         max_results: u32,
     ) -> Vec<BloodUnit> {
         let current_time = env.ledger().timestamp();
-        let limit = if max_results == 0 { u32::MAX } else { max_results };
+        let limit = if max_results == 0 {
+            u32::MAX
+        } else {
+            max_results
+        };
 
         // Intersect StatusUnits(Available) ∩ BloodTypeUnits(blood_type) for a
         // bounded candidate set instead of scanning the full BLOOD_UNITS map.
@@ -4417,12 +4721,6 @@ impl HealthChainContract {
             .get(&DataKey::BloodTypeUnits(blood_type))
             .unwrap_or(Vec::new(&env));
 
-        let units: Map<u64, BloodUnit> = env
-            .storage()
-            .persistent()
-            .get(&BLOOD_UNITS)
-            .unwrap_or(Map::new(&env));
-
         // Use the smaller index for the outer loop to minimise iterations.
         let (outer, inner) = if available_ids.len() <= bt_ids.len() {
             (available_ids.clone(), bt_ids.clone())
@@ -4437,7 +4735,7 @@ impl HealthChainContract {
             if !inner.contains(id) {
                 continue;
             }
-            let unit = match units.get(id) {
+            let unit: BloodUnit = match env.storage().persistent().get(&DataKey::Unit(id)) {
                 Some(u) => u,
                 None => continue,
             };
@@ -4497,12 +4795,6 @@ impl HealthChainContract {
             .get(&DataKey::BloodTypeUnits(blood_type))
             .unwrap_or(Vec::new(&env));
 
-        let units: Map<u64, BloodUnit> = env
-            .storage()
-            .persistent()
-            .get(&BLOOD_UNITS)
-            .unwrap_or(Map::new(&env));
-
         let (outer, inner) = if available_ids.len() <= bt_ids.len() {
             (available_ids, bt_ids)
         } else {
@@ -4514,7 +4806,7 @@ impl HealthChainContract {
             if !inner.contains(id) {
                 continue;
             }
-            let unit = match units.get(id) {
+            let unit: BloodUnit = match env.storage().persistent().get(&DataKey::Unit(id)) {
                 Some(u) => u,
                 None => continue,
             };
@@ -4738,6 +5030,39 @@ impl HealthChainContract {
         Ok(())
     }
 
+    /// Extend the TTL of specific per-record entries (admin only).
+    ///
+    /// Write paths bump the records they touch, but a record that is never
+    /// written again (e.g. a delivered unit or a completed payment) still
+    /// expires once that TTL lapses. This rescues such records in bounded
+    /// batches: each unit id bumps the unit, its history and its index
+    /// entries; each payment id bumps the payment, escrow and approval record.
+    pub fn bump_record_ttl(
+        env: Env,
+        unit_ids: Vec<u64>,
+        payment_ids: Vec<u64>,
+    ) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN)
+            .ok_or(Error::Unauthorized)?;
+        admin.require_auth();
+
+        if unit_ids.len() > MAX_BATCH_SIZE || payment_ids.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchSizeExceeded);
+        }
+
+        for unit_id in unit_ids.iter() {
+            let unit: Option<BloodUnit> = env.storage().persistent().get(&DataKey::Unit(unit_id));
+            bump_rent_for_unit(&env, unit_id, unit.as_ref());
+        }
+        for payment_id in payment_ids.iter() {
+            storage_lifecycle::bump_rent_for_payment(&env, payment_id);
+        }
+        Ok(())
+    }
+
     /// Compact the status-history for a terminal blood unit (permissionless).
     ///
     /// Replaces the full `Vec<StatusChangeEvent>` with an `ArchivedHistorySummary`
@@ -4941,10 +5266,11 @@ mod test {
             &symbol_short!("BANK"),
         );
 
-        // "Revoke" by clearing BANKS map directly
+        // "Revoke" by deactivating the bank via per-record storage
         env.as_contract(&contract_id, || {
-            let empty_banks = Map::<Address, LifecycleState>::new(&env);
-            env.storage().persistent().set(&BLOOD_BANKS, &empty_banks);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::BloodBankState(bank.clone()));
         });
 
         // Attempt to register blood using revoked bank (should fail Unauthorized)
@@ -6212,8 +6538,7 @@ mod test {
 
         let topic0: Symbol = TryFromVal::try_from_val(&env, topics.get(0).unwrap()).unwrap();
         let topic1: Symbol = TryFromVal::try_from_val(&env, topics.get(1).unwrap()).unwrap();
-        let version_topic: Symbol =
-            TryFromVal::try_from_val(&env, topics.get(2).unwrap()).unwrap();
+        let version_topic: Symbol = TryFromVal::try_from_val(&env, topics.get(2).unwrap()).unwrap();
         assert_eq!(topic0, symbol_short!("blood"));
         assert_eq!(topic1, symbol_short!("request"));
         assert_eq!(version_topic, symbol_short!("v1"));
@@ -6358,13 +6683,12 @@ mod test {
         env.mock_all_auths();
         client.approve_request(&bank, &request_id, &unit_ids);
 
-        let requests: Map<u64, BloodRequest> = env.as_contract(&contract_id, || {
+        let request: BloodRequest = env.as_contract(&contract_id, || {
             env.storage()
                 .persistent()
-                .get(&REQUESTS)
-                .unwrap_or(Map::new(&env))
+                .get(&DataKey::Request(request_id))
+                .unwrap()
         });
-        let request = requests.get(request_id).unwrap();
 
         assert_eq!(request.status, RequestStatus::Approved);
         assert_eq!(request.fulfilled_quantity_ml, 550);
@@ -6412,13 +6736,12 @@ mod test {
         env.mock_all_auths();
         client.approve_request(&bank, &request_id, &unit_ids);
 
-        let requests: Map<u64, BloodRequest> = env.as_contract(&contract_id, || {
+        let request: BloodRequest = env.as_contract(&contract_id, || {
             env.storage()
                 .persistent()
-                .get(&REQUESTS)
-                .unwrap_or(Map::new(&env))
+                .get(&DataKey::Request(request_id))
+                .unwrap()
         });
-        let request = requests.get(request_id).unwrap();
 
         assert_eq!(request.status, RequestStatus::InProgress);
         assert_eq!(request.fulfilled_quantity_ml, 200);
@@ -6474,21 +6797,25 @@ mod test {
         );
 
         env.as_contract(&contract_id, || {
-            let mut units: Map<u64, BloodUnit> = env
+            let mut unit_1: BloodUnit = env
                 .storage()
                 .persistent()
-                .get(&BLOOD_UNITS)
-                .unwrap_or(Map::new(&env));
-
-            let mut unit_1 = units.get(unit_id_1).unwrap();
+                .get(&DataKey::Unit(unit_id_1))
+                .unwrap();
             unit_1.quantity = u32::MAX;
-            units.set(unit_id_1, unit_1);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Unit(unit_id_1), &unit_1);
 
-            let mut unit_2 = units.get(unit_id_2).unwrap();
+            let mut unit_2: BloodUnit = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Unit(unit_id_2))
+                .unwrap();
             unit_2.quantity = 1;
-            units.set(unit_id_2, unit_2);
-
-            env.storage().persistent().set(&BLOOD_UNITS, &units);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Unit(unit_id_2), &unit_2);
         });
 
         let request_id = client.create_request(
@@ -6527,17 +6854,15 @@ mod test {
         );
 
         env.as_contract(&contract_id, || {
-            let mut units: Map<u64, BloodUnit> = env
+            let mut unit: BloodUnit = env
                 .storage()
                 .persistent()
-                .get(&BLOOD_UNITS)
-                .unwrap_or(Map::new(&env));
-
-            let mut unit = units.get(unit_id).unwrap();
+                .get(&DataKey::Unit(unit_id))
+                .unwrap();
             unit.quantity = u32::MAX;
-            units.set(unit_id, unit);
-
-            env.storage().persistent().set(&BLOOD_UNITS, &units);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Unit(unit_id), &unit);
         });
 
         let request_id = client.create_request(
@@ -6684,9 +7009,10 @@ mod test {
 
         // Status must remain unchanged.
         let request: BloodRequest = env.as_contract(&contract_id, || {
-            let requests: Map<u64, BloodRequest> =
-                env.storage().persistent().get(&REQUESTS).unwrap();
-            requests.get(request_id).unwrap()
+            env.storage()
+                .persistent()
+                .get(&DataKey::Request(request_id))
+                .unwrap()
         });
         assert_eq!(request.status, RequestStatus::Pending);
     }
@@ -6791,7 +7117,11 @@ mod test {
         );
 
         // Cancel the request
-        client.cancel_request(&hospital, &request_id, &String::from_str(&env, "No longer needed"));
+        client.cancel_request(
+            &hospital,
+            &request_id,
+            &String::from_str(&env, "No longer needed"),
+        );
 
         // Verify units are back to Available (if they were in the reserved_unit_ids)
         // Note: In our implementation, cancel_request releases units that were in reserved_unit_ids
@@ -6823,10 +7153,18 @@ mod test {
         client.update_request_status(&hospital, &request_id, &RequestStatus::InProgress);
 
         // We can't actually fulfill without blood bank, so let's just cancel an already cancelled
-        client.cancel_request(&hospital, &request_id, &String::from_str(&env, "First cancel"));
+        client.cancel_request(
+            &hospital,
+            &request_id,
+            &String::from_str(&env, "First cancel"),
+        );
 
         // Try to cancel again (should fail because it's already Cancelled)
-        client.cancel_request(&hospital, &request_id, &String::from_str(&env, "Second cancel"));
+        client.cancel_request(
+            &hospital,
+            &request_id,
+            &String::from_str(&env, "Second cancel"),
+        );
     }
 
     #[test]
@@ -6923,9 +7261,6 @@ mod test {
             &Some(symbol_short!("donor2")),
         );
 
-        client.allocate_blood(&bank, &unit_id_1, &hospital);
-        client.allocate_blood(&bank, &unit_id_2, &hospital);
-
         let request_id = client.create_request(
             &hospital,
             &BloodType::APositive,
@@ -6943,9 +7278,10 @@ mod test {
         client.fulfill_request(&bank, &request_id, &partial_delivery);
 
         let request: BloodRequest = env.as_contract(&contract_id, || {
-            let requests: Map<u64, BloodRequest> =
-                env.storage().persistent().get(&REQUESTS).unwrap();
-            requests.get(request_id).unwrap()
+            env.storage()
+                .persistent()
+                .get(&DataKey::Request(request_id))
+                .unwrap()
         });
 
         assert_eq!(request.status, RequestStatus::InProgress);
@@ -7012,9 +7348,10 @@ mod test {
         assert!(unit2.delivery_timestamp.is_none());
 
         let request: BloodRequest = env.as_contract(&contract_id, || {
-            let requests: Map<u64, BloodRequest> =
-                env.storage().persistent().get(&REQUESTS).unwrap();
-            requests.get(request_id).unwrap()
+            env.storage()
+                .persistent()
+                .get(&DataKey::Request(request_id))
+                .unwrap()
         });
         assert_eq!(request.status, RequestStatus::Approved);
         assert_eq!(request.fulfilled_quantity_ml, 0);
@@ -7067,9 +7404,10 @@ mod test {
         client.fulfill_request(&bank, &request_id, &unit_ids);
 
         let request: BloodRequest = env.as_contract(&contract_id, || {
-            let requests: Map<u64, BloodRequest> =
-                env.storage().persistent().get(&REQUESTS).unwrap();
-            requests.get(request_id).unwrap()
+            env.storage()
+                .persistent()
+                .get(&DataKey::Request(request_id))
+                .unwrap()
         });
         assert_eq!(request.status, RequestStatus::Fulfilled);
         assert_eq!(request.fulfilled_quantity_ml, 500);
@@ -7117,9 +7455,10 @@ mod test {
         assert!(unit.delivery_timestamp.is_some());
 
         let request: BloodRequest = env.as_contract(&contract_id, || {
-            let requests: Map<u64, BloodRequest> =
-                env.storage().persistent().get(&REQUESTS).unwrap();
-            requests.get(request_id).unwrap()
+            env.storage()
+                .persistent()
+                .get(&DataKey::Request(request_id))
+                .unwrap()
         });
         assert_eq!(request.status, RequestStatus::InProgress);
         assert_eq!(request.fulfilled_quantity_ml, 250);
@@ -7230,21 +7569,25 @@ mod test {
         client.update_request_status(&hospital, &request_id, &RequestStatus::Approved);
 
         env.as_contract(&contract_id, || {
-            let mut units: Map<u64, BloodUnit> = env
+            let mut unit_1: BloodUnit = env
                 .storage()
                 .persistent()
-                .get(&BLOOD_UNITS)
-                .unwrap_or(Map::new(&env));
-
-            let mut unit_1 = units.get(unit_id_1).unwrap();
+                .get(&DataKey::Unit(unit_id_1))
+                .unwrap();
             unit_1.quantity = u32::MAX;
-            units.set(unit_id_1, unit_1);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Unit(unit_id_1), &unit_1);
 
-            let mut unit_2 = units.get(unit_id_2).unwrap();
+            let mut unit_2: BloodUnit = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Unit(unit_id_2))
+                .unwrap();
             unit_2.quantity = 1;
-            units.set(unit_id_2, unit_2);
-
-            env.storage().persistent().set(&BLOOD_UNITS, &units);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Unit(unit_id_2), &unit_2);
         });
 
         env.mock_all_auths();
@@ -7850,15 +8193,15 @@ mod test {
 
         // Tamper the custody event in storage to set `to_custodian` to unregistered address
         env.as_contract(&contract_id, || {
-            let mut custody_events: Map<String, CustodyEvent> = env
+            let mut event: CustodyEvent = env
                 .storage()
                 .persistent()
-                .get(&CUSTODY_EVENTS)
+                .get(&DataKey::CustodyRecord(event_id.clone()))
                 .unwrap();
-            let mut event = custody_events.get(event_id.clone()).unwrap();
             event.to_custodian = unregistered_hospital.clone();
-            custody_events.set(event_id.clone(), event);
-            env.storage().persistent().set(&CUSTODY_EVENTS, &custody_events);
+            env.storage()
+                .persistent()
+                .set(&DataKey::CustodyRecord(event_id.clone()), &event);
         });
 
         // Try to confirm with the unregistered hospital. It should panic with UnauthorizedHospital (error code #9)
@@ -8103,16 +8446,16 @@ mod test {
 
         for i in 0..5 {
             env.as_contract(&contract_id, || {
-                let mut units: Map<u64, BloodUnit> = env
+                let mut unit: BloodUnit = env
                     .storage()
                     .persistent()
-                    .get(&BLOOD_UNITS)
-                    .unwrap_or(Map::new(&env));
-                let mut unit = units.get(unit_id).unwrap();
+                    .get(&DataKey::Unit(unit_id))
+                    .unwrap();
                 unit.status = BloodStatus::Reserved;
                 unit.recipient_hospital = Some(hospital.clone());
-                units.set(unit_id, unit);
-                env.storage().persistent().set(&BLOOD_UNITS, &units);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Unit(unit_id), &unit);
             });
 
             env.mock_all_auths();
@@ -8167,16 +8510,16 @@ mod test {
         for i in 0..25 {
             // Manually set unit to Reserved state
             env.as_contract(&contract_id, || {
-                let mut units: Map<u64, BloodUnit> = env
+                let mut unit: BloodUnit = env
                     .storage()
                     .persistent()
-                    .get(&BLOOD_UNITS)
-                    .unwrap_or(Map::new(&env));
-                let mut unit = units.get(unit_id).unwrap();
+                    .get(&DataKey::Unit(unit_id))
+                    .unwrap();
                 unit.status = BloodStatus::Reserved;
                 unit.recipient_hospital = Some(hospital.clone());
-                units.set(unit_id, unit);
-                env.storage().persistent().set(&BLOOD_UNITS, &units);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Unit(unit_id), &unit);
             });
 
             env.mock_all_auths();
@@ -8237,16 +8580,16 @@ mod test {
 
         for i in 0..100 {
             env.as_contract(&contract_id, || {
-                let mut units: Map<u64, BloodUnit> = env
+                let mut unit: BloodUnit = env
                     .storage()
                     .persistent()
-                    .get(&BLOOD_UNITS)
-                    .unwrap_or(Map::new(&env));
-                let mut unit = units.get(unit_id).unwrap();
+                    .get(&DataKey::Unit(unit_id))
+                    .unwrap();
                 unit.status = BloodStatus::Reserved;
                 unit.recipient_hospital = Some(hospital.clone());
-                units.set(unit_id, unit);
-                env.storage().persistent().set(&BLOOD_UNITS, &units);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Unit(unit_id), &unit);
             });
 
             env.mock_all_auths();
@@ -8433,16 +8776,16 @@ mod test {
 
         for i in 0..20 {
             env.as_contract(&contract_id, || {
-                let mut units: Map<u64, BloodUnit> = env
+                let mut unit: BloodUnit = env
                     .storage()
                     .persistent()
-                    .get(&BLOOD_UNITS)
-                    .unwrap_or(Map::new(&env));
-                let mut unit = units.get(unit_id).unwrap();
+                    .get(&DataKey::Unit(unit_id))
+                    .unwrap();
                 unit.status = BloodStatus::Reserved;
                 unit.recipient_hospital = Some(hospital.clone());
-                units.set(unit_id, unit);
-                env.storage().persistent().set(&BLOOD_UNITS, &units);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Unit(unit_id), &unit);
             });
 
             env.mock_all_auths();
@@ -9139,6 +9482,8 @@ mod test {
         env.mock_all_auths();
         client.allocate_blood(&bank, &unit_id, &hospital);
         env.mock_all_auths();
+        client.initiate_transfer(&bank, &unit_id);
+        env.mock_all_auths();
         client.confirm_delivery(&hospital, &unit_id);
 
         assert_eq!(client.get_blood_status(&unit_id), BloodStatus::Delivered);
@@ -9267,9 +9612,9 @@ mod test {
     fn test_is_eligible_for_archival_boundary() {
         let env = Env::default();
         env.mock_all_auths();
-        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+        env.ledger().with_mut(|l| l.timestamp = 10_000_000);
 
-        let bank = env.current_contract_address();
+        let bank = Address::generate(&env);
         let terminal_unit = BloodUnit {
             id: 1,
             blood_type: BloodType::OPositive,
@@ -9288,7 +9633,8 @@ mod test {
         };
 
         let last_change_time = env.ledger().timestamp()
-            - crate::storage_lifecycle::ARCHIVE_AFTER_DAYS * crate::storage_lifecycle::SECONDS_PER_DAY;
+            - crate::storage_lifecycle::ARCHIVE_AFTER_DAYS
+                * crate::storage_lifecycle::SECONDS_PER_DAY;
 
         // Exactly at the boundary: eligible.
         let history_at_boundary = vec![
@@ -9346,7 +9692,7 @@ mod test {
     fn test_is_eligible_for_archival_non_terminal_unit() {
         let env = Env::default();
         env.mock_all_auths();
-        let bank = env.current_contract_address();
+        let bank = Address::generate(&env);
 
         let non_terminal_unit = BloodUnit {
             id: 2,
@@ -9449,12 +9795,14 @@ mod test {
             &BloodType::OPositive,
             &BloodComponent::WholeBlood,
             &450,
-            &(env.ledger().timestamp() + 365 * 86400),
+            &(env.ledger().timestamp() + 30 * 86400),
             &None,
         );
 
         env.mock_all_auths();
         client.allocate_blood(&bank, &unit_id, &hospital);
+        env.mock_all_auths();
+        client.initiate_transfer(&bank, &unit_id);
         env.mock_all_auths();
         client.confirm_delivery(&hospital, &unit_id);
 
@@ -9466,7 +9814,8 @@ mod test {
 
         // Advance past the archival cooling-off window.
         let future = env.ledger().timestamp()
-            + crate::storage_lifecycle::ARCHIVE_AFTER_DAYS * crate::storage_lifecycle::SECONDS_PER_DAY
+            + crate::storage_lifecycle::ARCHIVE_AFTER_DAYS
+                * crate::storage_lifecycle::SECONDS_PER_DAY
             + 1;
         env.ledger().with_mut(|l| l.timestamp = future);
 
@@ -9480,5 +9829,198 @@ mod test {
 
         // History was compacted; the summary must now be retrievable.
         assert!(client.get_history_summary(&unit_id).is_some());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Regression tests: #1433, #1434, #1436
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    fn setup_bank_and_allocated_unit<'a>(
+        env: &'a Env,
+    ) -> (
+        Address,
+        Address,
+        Address,
+        HealthChainContractClient<'a>,
+        u64,
+    ) {
+        let (contract_id, _admin, hospital, client) = setup_contract_with_hospital(env);
+        let bank = Address::generate(env);
+        client.register_blood_bank(&bank);
+
+        let unit_id = client.register_blood(
+            &bank,
+            &BloodType::OPositive,
+            &BloodComponent::WholeBlood,
+            &450,
+            &(env.ledger().timestamp() + 86400),
+            &None,
+        );
+        client.allocate_blood(&bank, &unit_id, &hospital);
+        assert_eq!(client.query_by_hospital(&hospital, &0).len(), 1);
+
+        (contract_id, bank, hospital, client, unit_id)
+    }
+
+    fn read_unit(env: &Env, contract_id: &Address, unit_id: u64) -> BloodUnit {
+        env.as_contract(contract_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::Unit(unit_id))
+                .unwrap()
+        })
+    }
+
+    #[test]
+    fn test_fulfill_request_rejects_duplicate_unit_ids() {
+        let env = Env::default();
+        let (contract_id, _, hospital, client) = setup_contract_with_hospital(&env);
+
+        let bank = Address::generate(&env);
+        client.register_blood_bank(&bank);
+
+        let current_time = env.ledger().timestamp();
+        let unit_id = client.register_blood(
+            &bank,
+            &BloodType::ONegative,
+            &BloodComponent::WholeBlood,
+            &250,
+            &(current_time + 7 * 86400),
+            &Some(symbol_short!("dup1")),
+        );
+        client.allocate_blood(&bank, &unit_id, &hospital);
+
+        let request_id = client.create_request(
+            &hospital,
+            &BloodType::ONegative,
+            &500,
+            &UrgencyLevel::Urgent,
+            &(current_time + 3600),
+            &String::from_str(&env, "Ward D"),
+        );
+        client.update_request_status(&hospital, &request_id, &RequestStatus::Approved);
+
+        // Supplying the same 250ml unit twice must not satisfy a 500ml request.
+        let result = client.try_fulfill_request(&bank, &request_id, &vec![&env, unit_id, unit_id]);
+        assert_eq!(result, Err(Ok(Error::DuplicateUnitId)));
+
+        // Nothing was mutated.
+        let request: BloodRequest = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::Request(request_id))
+                .unwrap()
+        });
+        assert_eq!(request.status, RequestStatus::Approved);
+        assert_eq!(request.fulfilled_quantity_ml, 0);
+        assert_eq!(client.get_blood_status(&unit_id), BloodStatus::Reserved);
+    }
+
+    #[test]
+    fn test_finalize_quarantine_release_rejects_expired_unit() {
+        let env = Env::default();
+        let (_, _admin, client) = setup_contract_with_admin(&env);
+        let bank = Address::generate(&env);
+        client.register_blood_bank(&bank);
+
+        let expiration = env.ledger().timestamp() + 86400;
+        let unit_id = client.register_blood(
+            &bank,
+            &BloodType::OPositive,
+            &BloodComponent::WholeBlood,
+            &450,
+            &expiration,
+            &None,
+        );
+        client.quarantine_blood(&bank, &unit_id, &QuarantineReason::ScreeningFailure);
+
+        // Unit expires while sitting in quarantine.
+        env.ledger().set_timestamp(expiration);
+
+        let result = client.try_finalize_quarantine(
+            &bank,
+            &unit_id,
+            &QuarantineReason::ScreeningFailure,
+            &QuarantineDisposition::Release,
+        );
+        assert_eq!(result, Err(Ok(Error::UnitExpired)));
+        assert_eq!(client.get_blood_status(&unit_id), BloodStatus::Quarantined);
+
+        // Discarding expired quarantined stock is still allowed.
+        client.finalize_quarantine(
+            &bank,
+            &unit_id,
+            &QuarantineReason::ScreeningFailure,
+            &QuarantineDisposition::Discard,
+        );
+        assert_eq!(client.get_blood_status(&unit_id), BloodStatus::Discarded);
+    }
+
+    #[test]
+    fn test_withdraw_blood_clears_hospital_allocation() {
+        let env = Env::default();
+        let (contract_id, bank, hospital, client, unit_id) = setup_bank_and_allocated_unit(&env);
+
+        client.withdraw_blood(&bank, &unit_id, &WithdrawalReason::Contaminated);
+
+        assert_eq!(client.get_blood_status(&unit_id), BloodStatus::Discarded);
+        assert_eq!(client.query_by_hospital(&hospital, &0).len(), 0);
+        let unit = read_unit(&env, &contract_id, unit_id);
+        assert_eq!(unit.recipient_hospital, None);
+        assert_eq!(unit.allocation_timestamp, None);
+    }
+
+    #[test]
+    fn test_expire_unit_clears_hospital_allocation() {
+        let env = Env::default();
+        let (contract_id, _bank, hospital, client, unit_id) = setup_bank_and_allocated_unit(&env);
+
+        env.ledger().set_timestamp(env.ledger().timestamp() + 86400);
+        client.expire_unit(&unit_id);
+
+        assert_eq!(client.get_blood_status(&unit_id), BloodStatus::Expired);
+        assert_eq!(client.query_by_hospital(&hospital, &0).len(), 0);
+        let unit = read_unit(&env, &contract_id, unit_id);
+        assert_eq!(unit.recipient_hospital, None);
+        assert_eq!(unit.allocation_timestamp, None);
+    }
+
+    #[test]
+    fn test_check_and_expire_batch_clears_hospital_allocation() {
+        let env = Env::default();
+        let (contract_id, _bank, hospital, client, unit_id) = setup_bank_and_allocated_unit(&env);
+
+        env.ledger().set_timestamp(env.ledger().timestamp() + 86400);
+        let expired = client.check_and_expire_batch(&vec![&env, unit_id]);
+
+        assert_eq!(expired, vec![&env, unit_id]);
+        assert_eq!(client.query_by_hospital(&hospital, &0).len(), 0);
+        assert_eq!(
+            read_unit(&env, &contract_id, unit_id).recipient_hospital,
+            None
+        );
+    }
+
+    #[test]
+    fn test_release_undelivered_allocation_keeps_delivered_units() {
+        let env = Env::default();
+        let (contract_id, _bank, hospital, _client, unit_id) = setup_bank_and_allocated_unit(&env);
+
+        env.as_contract(&contract_id, || {
+            let mut unit: BloodUnit = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Unit(unit_id))
+                .unwrap();
+            unit.delivery_timestamp = Some(env.ledger().timestamp());
+            release_undelivered_allocation(&env, unit_id, &mut unit);
+            assert_eq!(unit.recipient_hospital, Some(hospital.clone()));
+
+            unit.delivery_timestamp = None;
+            release_undelivered_allocation(&env, unit_id, &mut unit);
+            assert_eq!(unit.recipient_hospital, None);
+            assert_eq!(unit.allocation_timestamp, None);
+        });
+        assert_eq!(_client.query_by_hospital(&hospital, &0).len(), 0);
     }
 }

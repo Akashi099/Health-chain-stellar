@@ -1,9 +1,13 @@
 import { ConflictException, NotFoundException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
+import { getRepositoryToken } from '@nestjs/typeorm';
 
 import { InventoryService } from './inventory.service';
 import { InventoryStockRepository } from './repositories/inventory-stock.repository';
 import { InventoryStockEntity } from './entities/inventory-stock.entity';
+import { ReservationAuditEntity } from './entities/reservation-audit.entity';
+import { BloodRequestReservationEntity } from '../blood-requests/entities/blood-request-reservation.entity';
+import { InventoryRepository } from './repositories/inventory.repository';
 
 // ── Factory ───────────────────────────────────────────────────────────────────
 
@@ -47,10 +51,38 @@ describe('InventoryService', () => {
   beforeEach(async () => {
     stockRepo = makeStockRepo();
 
+    const rawInventoryStockRepoMock = {
+      find: jest.fn().mockResolvedValue([]),
+      findOne: jest.fn().mockResolvedValue(null),
+      save: jest.fn().mockImplementation((e: any) => Promise.resolve(e)),
+      create: jest.fn().mockImplementation((d: any) => d),
+    };
+    const inventoryRepositoryMock = {
+      getStockAggregationByBloodType: jest.fn().mockResolvedValue([]),
+    };
+    const auditRepoMock = {
+      create: jest.fn((d: any) => d),
+      save: jest.fn((e: any) => Promise.resolve(e)),
+    };
+    const reservationRepoMock = {
+      find: jest.fn().mockResolvedValue([]),
+      createQueryBuilder: jest.fn().mockReturnValue({
+        update: jest.fn().mockReturnThis(),
+        set: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue({ affected: 1 }),
+      }),
+    };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         InventoryService,
         { provide: InventoryStockRepository, useValue: stockRepo },
+        { provide: getRepositoryToken(InventoryStockEntity), useValue: rawInventoryStockRepoMock },
+        { provide: InventoryRepository, useValue: inventoryRepositoryMock },
+        { provide: getRepositoryToken(ReservationAuditEntity), useValue: auditRepoMock },
+        { provide: getRepositoryToken(BloodRequestReservationEntity), useValue: reservationRepoMock },
       ],
     }).compile();
 
@@ -236,11 +268,11 @@ describe('InventoryService', () => {
       );
     });
 
-    it('creates a new stock record when none exists', async () => {
+    it('creates a new stock record with component when none exists', async () => {
       stockRepo.findByBankAndType.mockResolvedValue(null);
-      await service.restoreStockOrThrow('bank-1', 'O+', 200);
+      await service.restoreStockOrThrow('bank-1', 'O+', 200, 'PLATELETS' as any);
       expect(stockRepo.create).toHaveBeenCalledWith(
-        expect.objectContaining({ bloodBankId: 'bank-1', bloodType: 'O+', availableUnitsMl: 200 }),
+        expect.objectContaining({ bloodBankId: 'bank-1', bloodType: 'O+', component: 'PLATELETS', availableUnitsMl: 200 }),
       );
       expect(stockRepo.save).toHaveBeenCalled();
     });
