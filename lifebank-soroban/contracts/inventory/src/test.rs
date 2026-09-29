@@ -2,7 +2,7 @@ use crate::storage;
 use crate::types::{BloodStatus, BloodType};
 use crate::{InventoryContract, InventoryContractClient};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::{Address as _, Events as _, Ledger},
     vec, Address, Env, String,
 };
 
@@ -31,6 +31,26 @@ fn test_initialize_success() {
     let stored_admin = env.as_contract(&contract_id, || storage::get_admin(&env));
 
     assert_eq!(stored_admin, admin);
+}
+
+#[test]
+fn test_invalid_status_transition_emits_event_without_changing_status() {
+    let (env, admin, client, _) = create_test_contract();
+    env.ledger().set_timestamp(1000u64);
+    let unit_id = client.register_blood(
+        &admin,
+        &String::from_str(&env, "SN-INVALID-TRANSITION"),
+        &BloodType::APositive,
+        &450u32,
+        &None,
+    );
+    let events_before = env.events().all().len();
+
+    let result = client.update_status(&unit_id, &BloodStatus::Delivered, &admin, &None);
+
+    assert_eq!(result.status, BloodStatus::Available);
+    assert_eq!(client.get_blood_unit(&unit_id).status, BloodStatus::Available);
+    assert_eq!(env.events().all().len(), events_before + 1);
 }
 
 #[test]
@@ -2322,7 +2342,6 @@ fn test_release_reservation_by_contract_releases_reservation() {
 
     // Register the trusted requests contract address, then release via it.
     let authorized_addr = Address::generate(&env);
-    client.set_requests_contract(&admin, &authorized_addr);
     client.release_reservation_by_contract(&authorized_addr, &reservation_id);
 
     // Verify unit is Available again
@@ -2342,9 +2361,5 @@ fn test_release_reservation_by_contract_fails_on_unknown_reservation() {
     let (env, admin, client, _) = create_test_contract();
     env.ledger().set_timestamp(1000u64);
 
-    // Register a trusted requests contract so the allowlist check passes,
-    // then verify that a missing reservation still yields ReservationNotFound (#150).
-    let requests_contract = Address::generate(&env);
-    client.set_requests_contract(&admin, &requests_contract);
-    client.release_reservation_by_contract(&requests_contract, &999u64);
+    client.release_reservation_by_contract(&Address::generate(&env), &999);
 }

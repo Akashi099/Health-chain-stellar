@@ -1,5 +1,7 @@
 #![cfg(test)]
 
+extern crate std;
+
 use super::*;
 use soroban_sdk::{testutils::Address as _, testutils::Events as _, testutils::Ledger as _, Env};
 
@@ -966,6 +968,25 @@ fn test_record_assignment_rejects_future_timestamp() {
 }
 
 #[test]
+fn test_record_assignment_saturates_response_seconds() {
+    let (env, cid) = setup();
+    let c = client(&env, &cid);
+    let admin = Address::generate(&env);
+    c.initialize(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    let huge = u64::MAX;
+    let first = c.try_record_assignment(&admin, &ENTITY, &true, &huge, &1000u64);
+    assert!(first.is_ok(), "first record_assignment should not panic or overflow");
+
+    let second = c.try_record_assignment(&admin, &ENTITY, &false, &1u64, &1000u64);
+    assert!(second.is_ok(), "subsequent record_assignment should also saturate safely");
+
+    let input = c.get_input(&ENTITY).unwrap();
+    assert_eq!(input.total_response_secs, u64::MAX);
+}
+
+#[test]
 fn test_flag_fraud_rejects_future_timestamp() {
     let (env, cid) = setup();
     let c = client(&env, &cid);
@@ -1001,22 +1022,23 @@ fn test_penalty_ids_remain_unique_after_trim_cycles() {
     c.initialize(&admin);
 
     // Seed entity
+    env.ledger().with_mut(|l| l.timestamp = 1000);
     c.record_assignment(&admin, &ENTITY, &true, &300u64, &1000u64);
 
     // Apply penalties until we trigger multiple trim cycles (> 100 penalties)
-    let mut penalty_ids = Vec::new();
+    let mut penalty_ids = std::vec::Vec::new();
     for i in 0..150u32 {
         env.ledger().with_mut(|l| l.timestamp = 1000 + i as u64);
-        let score = c.apply_penalty(&admin, &ENTITY, &ViolationType::Minor);
+        c.apply_penalty(&ENTITY, &ViolationType::Minor);
         let input = c.get_input(&ENTITY).unwrap();
-        // Track the ID of the last penalty applied
-        if let Some(p) = input.penalties.back() {
+        if input.penalties.len() > 0 {
+            let p = input.penalties.get(input.penalties.len() - 1).unwrap();
             penalty_ids.push(p.id);
         }
     }
 
     // Verify all penalty IDs are unique
-    let mut id_set = Vec::new();
+    let mut id_set = std::vec::Vec::new();
     for id in penalty_ids.iter() {
         assert!(
             !id_set.contains(id),
@@ -1068,7 +1090,7 @@ fn test_ttl_extends_on_persistent_access() {
 
     // Apply penalty should extend TTL
     env.ledger().with_mut(|l| l.timestamp = 3000);
-    c.apply_penalty(&admin, &ENTITY, &ViolationType::Minor);
+    c.apply_penalty(&ENTITY, &ViolationType::Minor);
     let input = c.get_input(&ENTITY);
     assert!(
         input.is_some(),

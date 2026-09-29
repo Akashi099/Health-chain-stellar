@@ -109,6 +109,7 @@ impl InventoryContract {
             return Err(ContractError::Unauthorized);
         }
         env.storage().instance().set(&DataKey::Paused, &true);
+        storage::extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -120,15 +121,18 @@ impl InventoryContract {
             return Err(ContractError::Unauthorized);
         }
         env.storage().instance().set(&DataKey::Paused, &false);
+        storage::extend_instance_ttl(&env);
         Ok(())
     }
 
     /// Returns whether the contract is currently paused.
     pub fn is_paused(env: Env) -> bool {
-        env.storage()
+        let paused = env.storage()
             .instance()
             .get(&DataKey::Paused)
-            .unwrap_or(false)
+            .unwrap_or(false);
+        storage::extend_instance_ttl(&env);
+        paused
     }
 
     /// Authorize or revoke a blood bank. Only admin can call this.
@@ -218,6 +222,7 @@ impl InventoryContract {
         {
             return Err(ContractError::ContractPaused);
         }
+        storage::extend_instance_ttl(env);
         Ok(())
     }
 
@@ -543,6 +548,7 @@ impl InventoryContract {
 
         if !is_valid_transition(&old_status, &new_status) {
             events::emit_invalid_transition(&env, unit_id, old_status, new_status);
+            return Ok(blood_unit);
         }
         validation::validate_status_transition(old_status, new_status)?;
 
@@ -1126,12 +1132,15 @@ impl InventoryContract {
         env.storage()
             .instance()
             .set(&DataKey::RegistryContractId, &registry_contract_id);
+        storage::extend_instance_ttl(&env);
         Ok(())
     }
 
     /// Get the configured registry contract address, if any.
     pub fn get_registry_contract(env: Env) -> Option<Address> {
-        env.storage().instance().get(&DataKey::RegistryContractId)
+        let registry_contract = env.storage().instance().get(&DataKey::RegistryContractId);
+        storage::extend_instance_ttl(&env);
+        registry_contract
     }
 
     /// Set the trusted requests contract address. Only admin can call this.
