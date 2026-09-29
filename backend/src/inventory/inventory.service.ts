@@ -281,33 +281,60 @@ export class InventoryService {
 
     for (const res of expired) {
       try {
-        // Mark expired first to prevent double-release
-        const result = await this.reservationRepo
-          .createQueryBuilder()
-          .update(BloodRequestReservationEntity)
-          .set({ status: ReservationStatus.EXPIRED })
-          .where('id = :id', { id: res.id })
-          .andWhere('status = :status', { status: ReservationStatus.RESERVED })
-          .execute();
+        await this.reservationRepo.manager.transaction(async (manager) => {
+          // Mark expired first to prevent double-release
+          const result = await manager
+            .createQueryBuilder()
+            .update(BloodRequestReservationEntity)
+            .set({ status: ReservationStatus.EXPIRED })
+            .where('id = :id', { id: res.id })
+            .andWhere('status = :status', { status: ReservationStatus.RESERVED })
+            .execute();
 
-        if (!result.affected) continue; // already handled by another worker
+          if (!result.affected) return; // already handled by another worker
 
-        await this.restoreStockOrThrow(
-          res.bloodBankId,
-          res.bloodType,
-          res.quantityMl,
-        );
+          // Restore stock
+          const bloodType = (res as any).bloodType;
+          const component = BloodComponent.WHOLE_BLOOD;
+          let stock = await manager.findOne(InventoryStockEntity, {
+            where: {
+              bloodBankId: res.bloodBankId,
+              bloodType: bloodType,
+              component: component as any,
+            },
+          });
 
-        await this.auditRepo.save(
-          this.auditRepo.create({
-            requestId: res.requestId,
-            bloodBankId: res.bloodBankId,
-            bloodType: res.bloodType,
-            quantityMl: res.quantityMl,
-            action: ReservationAuditAction.EXPIRED_RELEASED,
-            notes: `Reservation ${res.id} expired at ${res.expiresAt}`,
-          }),
-        );
+          if (!stock) {
+            const created = manager.create(InventoryStockEntity, {
+              bloodBankId: res.bloodBankId,
+              bloodType: bloodType,
+              component: component as any,
+              availableUnitsMl: res.quantityMl,
+            });
+            await manager.save(created);
+          } else {
+            await manager
+              .createQueryBuilder()
+              .update(InventoryStockEntity)
+              .set({
+                availableUnitsMl: () => `"available_units_ml" + ${res.quantityMl}`,
+                version: () => '"version" + 1',
+              })
+              .where('id = :id', { id: stock.id })
+              .execute();
+          }
+
+          await manager.save(
+            manager.create(ReservationAuditEntity, {
+              requestId: res.requestId,
+              bloodBankId: res.bloodBankId,
+              bloodType: bloodType,
+              quantityMl: res.quantityMl,
+              action: ReservationAuditAction.EXPIRED_RELEASED,
+              notes: `Reservation ${res.id} expired at ${res.expiresAt}`,
+            }),
+          );
+        });
 
         this.logger.log(
           `Released expired reservation ${res.id} requestId=${res.requestId}`,
