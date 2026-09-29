@@ -1,298 +1,54 @@
-extern crate std;
-
-use crate::{BloodComponent, BloodType, ContractError, RequestContract, RequestStatus, Urgency};
+use crate::{
+    BloodComponent, BloodType, ContractError, RequestContract, RequestContractClient,
+    RequestStatus, Urgency,
+};
 use soroban_sdk::{
+    contract, contractimpl,
     testutils::{Address as _, Events as _, Ledger as _},
     Address, Env, String, Vec,
 };
 
-/// #1151: Verify cancel_request requires caller authorization and must be hospital owner or admin.
-/// A third party cannot cancel a hospital's blood request.
-#[test]
-fn test_cancel_request_requires_ownership() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let hospital_a = Address::generate(&env);
-    let hospital_b = Address::generate(&env);
+/// Minimal inventory mock so cross-contract release calls succeed in tests.
+#[contract]
+struct MockInventory;
 
-    env.mock_all_auths();
-
-    RequestContract::initialize(env.clone(), admin.clone(), Address::generate(&env)).unwrap();
-    RequestContract::authorize_hospital(env.clone(), hospital_a.clone()).unwrap();
-    RequestContract::authorize_hospital(env.clone(), hospital_b.clone()).unwrap();
-
-    env.ledger().set_timestamp(1_000);
-
-    // Hospital A creates a request
-    let request_id = RequestContract::create_request(
-        env.clone(),
-        hospital_a.clone(),
-        BloodType::OPositive,
-        BloodComponent::WholeBlood,
-        500,
-        Urgency::Urgent,
-        1_600,
-    )
-    .unwrap();
-
-    // Hospital B attempts to cancel Hospital A's request
-    let result = RequestContract::cancel_request(
-        env.clone(),
-        hospital_b.clone(),
-        request_id,
-        String::from_str(&env, "unauthorized cancel"),
-    );
-
-    // Should fail: Hospital B is not the owner and not admin
-    assert_eq!(result, Err(ContractError::NotRequestOwner));
+#[contractimpl]
+impl MockInventory {
+    pub fn release_reservation(_env: Env, _caller: Address, _reservation_id: u64) {}
+    pub fn release_reservation_by_contract(
+        _env: Env,
+        _authorized_contract: Address,
+        _reservation_id: u64,
+    ) {
+    }
 }
 
-/// #1151: Verify cancel_request succeeds for hospital owner.
-#[test]
-fn test_cancel_request_by_owner_succeeds() {
+fn setup_authorized_hospital<'a>() -> (Env, RequestContractClient<'a>, Address, Address) {
     let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(RequestContract, ());
+    let client = RequestContractClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
+    let inventory_id = env.register(MockInventory, ());
+    client.initialize(&admin, &inventory_id);
     let hospital = Address::generate(&env);
-
-    env.mock_all_auths();
-
-    RequestContract::initialize(env.clone(), admin.clone(), Address::generate(&env)).unwrap();
-    RequestContract::authorize_hospital(env.clone(), hospital.clone()).unwrap();
-
+    client.authorize_hospital(&hospital);
     env.ledger().set_timestamp(1_000);
+    (env, client, admin, hospital)
+}
 
-    let request_id = RequestContract::create_request(
-        env.clone(),
-        hospital.clone(),
-        BloodType::OPositive,
-        BloodComponent::WholeBlood,
-        500,
-        Urgency::Urgent,
-        1_600,
+fn create_urgent_request(client: &RequestContractClient<'_>, hospital: &Address) -> u64 {
+    client.create_request(
+        hospital,
+        &BloodType::OPositive,
+        &BloodComponent::WholeBlood,
+        &500u32,
+        &Urgency::Urgent,
+        &1_600u64,
     )
-    .unwrap();
-
-    let result = RequestContract::cancel_request(
-        env.clone(),
-        hospital.clone(),
-        request_id,
-        String::from_str(&env, "owned cancel"),
-    );
-
-    assert!(result.is_ok());
 }
 
-/// #1151: Verify cancel_request succeeds for admin.
-#[test]
-fn test_cancel_request_by_admin_succeeds() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let hospital = Address::generate(&env);
-
-    env.mock_all_auths();
-
-    RequestContract::initialize(env.clone(), admin.clone(), Address::generate(&env)).unwrap();
-    RequestContract::authorize_hospital(env.clone(), hospital.clone()).unwrap();
-
-    env.ledger().set_timestamp(1_000);
-
-    let request_id = RequestContract::create_request(
-        env.clone(),
-        hospital.clone(),
-        BloodType::OPositive,
-        BloodComponent::WholeBlood,
-        500,
-        Urgency::Urgent,
-        1_600,
-    )
-    .unwrap();
-
-    let result = RequestContract::cancel_request(
-        env.clone(),
-        admin.clone(),
-        request_id,
-        String::from_str(&env, "admin cancel"),
-    );
-
-    assert!(result.is_ok());
-}
-
-/// #1151: Verify update_request_status requires admin authorization.
-/// Only admin can call this function.
-#[test]
-fn test_update_request_status_requires_admin() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let hospital = Address::generate(&env);
-    let non_admin = Address::generate(&env);
-
-    env.mock_all_auths();
-
-    RequestContract::initialize(env.clone(), admin.clone(), Address::generate(&env)).unwrap();
-    RequestContract::authorize_hospital(env.clone(), hospital.clone()).unwrap();
-
-    env.ledger().set_timestamp(1_000);
-
-    let request_id = RequestContract::create_request(
-        env.clone(),
-        hospital.clone(),
-        BloodType::OPositive,
-        BloodComponent::WholeBlood,
-        500,
-        Urgency::Urgent,
-        1_600,
-    )
-    .unwrap();
-
-    // Non-admin attempts to update request status
-    let result = RequestContract::update_request_status(
-        env.clone(),
-        non_admin,
-        request_id,
-        RequestStatus::Approved,
-        String::from_str(&env, "status update"),
-    );
-
-    // Should fail: caller is not admin
-    assert_eq!(result, Err(ContractError::Unauthorized));
-}
-
-/// #1151: Verify update_request_status succeeds for admin.
-#[test]
-fn test_update_request_status_by_admin_succeeds() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let hospital = Address::generate(&env);
-
-    env.mock_all_auths();
-
-    RequestContract::initialize(env.clone(), admin.clone(), Address::generate(&env)).unwrap();
-    RequestContract::authorize_hospital(env.clone(), hospital.clone()).unwrap();
-
-    env.ledger().set_timestamp(1_000);
-
-    let request_id = RequestContract::create_request(
-        env.clone(),
-        hospital.clone(),
-        BloodType::OPositive,
-        BloodComponent::WholeBlood,
-        500,
-        Urgency::Urgent,
-        1_600,
-    )
-    .unwrap();
-
-    let result = RequestContract::update_request_status(
-        env.clone(),
-        admin.clone(),
-        request_id,
-        RequestStatus::Approved,
-        String::from_str(&env, "admin status update"),
-    );
-
-    assert!(result.is_ok());
-}
-
-fn setup_authorized_hospital() -> (Env, Address, Address) {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let hospital = Address::generate(&env);
-    env.mock_all_auths();
-    RequestContract::initialize(env.clone(), admin.clone(), Address::generate(&env)).unwrap();
-    RequestContract::authorize_hospital(env.clone(), hospital.clone()).unwrap();
-    env.ledger().set_timestamp(1_000);
-    (env, admin, hospital)
-}
-
-fn create_urgent_request(env: &Env, hospital: &Address) -> u64 {
-    RequestContract::create_request(
-        env.clone(),
-        hospital.clone(),
-        BloodType::OPositive,
-        BloodComponent::WholeBlood,
-        500,
-        Urgency::Urgent,
-        1_600,
-    )
-    .unwrap()
-}
-
-/// #1302: A second set_reservation_id call must not overwrite the first ID.
-#[test]
-fn test_set_reservation_id_rejects_overwrite() {
-    let (env, admin, hospital) = setup_authorized_hospital();
-    let request_id = create_urgent_request(&env, &hospital);
-
-    RequestContract::update_request_status(
-        env.clone(),
-        admin.clone(),
-        request_id,
-        RequestStatus::Approved,
-        String::from_str(&env, "Approved"),
-    )
-    .unwrap();
-
-    RequestContract::set_reservation_id(env.clone(), admin.clone(), request_id, 11).unwrap();
-
-    let result = RequestContract::set_reservation_id(env.clone(), admin.clone(), request_id, 22);
-
-    assert_eq!(result, Err(ContractError::ReservationAlreadySet));
-
-    let request = RequestContract::get_request(env.clone(), request_id).unwrap();
-    assert_eq!(request.reservation_id, Some(11));
-}
-
-/// #1302: A legitimate first set_reservation_id call records history and emits an event.
-#[test]
-fn test_set_reservation_id_records_history_and_event() {
-    let (env, admin, hospital) = setup_authorized_hospital();
-    let request_id = create_urgent_request(&env, &hospital);
-
-    RequestContract::update_request_status(
-        env.clone(),
-        admin.clone(),
-        request_id,
-        RequestStatus::Approved,
-        String::from_str(&env, "Approved"),
-    )
-    .unwrap();
-
-    let events_before = env.events().all().len();
-
-    RequestContract::set_reservation_id(env.clone(), admin.clone(), request_id, 42).unwrap();
-
-    assert_eq!(env.events().all().len(), events_before + 1);
-
-    let request = RequestContract::get_request(env.clone(), request_id).unwrap();
-    assert_eq!(request.reservation_id, Some(42));
-
-    let history = RequestContract::get_request_history(env.clone(), request_id).unwrap();
-    let last = history.get(history.len() - 1).unwrap();
-    assert_eq!(last.actor, admin);
-    assert_eq!(last.previous_status, RequestStatus::Approved);
-    assert_eq!(last.new_status, RequestStatus::Approved);
-    assert_eq!(last.reason, String::from_str(&env, "Reservation ID set"));
-    assert_eq!(last.timestamp, 1_000);
-}
-
-/// #1302: set_reservation_id is restricted to Approved and InProgress requests.
-#[test]
-fn test_set_reservation_id_rejects_wrong_status() {
-    let (env, admin, hospital) = setup_authorized_hospital();
-    let request_id = create_urgent_request(&env, &hospital);
-
-    let result = RequestContract::set_reservation_id(env.clone(), admin.clone(), request_id, 42);
-
-    assert_eq!(result, Err(ContractError::InvalidRequestStatus));
-
-    let request = RequestContract::get_request(env.clone(), request_id).unwrap();
-    assert_eq!(request.reservation_id, None);
-}
-
-fn batch_entries(
-    env: &Env,
-    count: u32,
-) -> Vec<(BloodType, BloodComponent, u32, Urgency, u64)> {
+fn batch_entries(env: &Env, count: u32) -> Vec<(BloodType, BloodComponent, u32, Urgency, u64)> {
     let mut entries = Vec::new(env);
     for _ in 0..count {
         entries.push_back((
@@ -306,250 +62,541 @@ fn batch_entries(
     entries
 }
 
+// ── #1151: cancel_request ownership ──────────────────────────────────────────
+
+/// #1151: A third party cannot cancel a hospital's blood request.
+#[test]
+fn test_cancel_request_requires_ownership() {
+    let (env, client, _admin, hospital_a) = setup_authorized_hospital();
+    let hospital_b = Address::generate(&env);
+    client.authorize_hospital(&hospital_b);
+
+    let request_id = create_urgent_request(&client, &hospital_a);
+
+    let result = client.try_cancel_request(
+        &hospital_b,
+        &request_id,
+        &String::from_str(&env, "unauthorized cancel"),
+    );
+
+    assert_eq!(result, Err(Ok(ContractError::NotRequestOwner)));
+}
+
+/// #1151: The owning hospital can cancel its own request.
+#[test]
+fn test_cancel_request_by_owner_succeeds() {
+    let (env, client, _admin, hospital) = setup_authorized_hospital();
+    let request_id = create_urgent_request(&client, &hospital);
+
+    client.cancel_request(&hospital, &request_id, &String::from_str(&env, "owned cancel"));
+}
+
+/// #1151: Admin can cancel any request.
+#[test]
+fn test_cancel_request_by_admin_succeeds() {
+    let (env, client, admin, hospital) = setup_authorized_hospital();
+    let request_id = create_urgent_request(&client, &hospital);
+
+    client.cancel_request(&admin, &request_id, &String::from_str(&env, "admin cancel"));
+}
+
+// ── #1151: update_request_status authorization ────────────────────────────────
+
+/// #1151: A non-admin, non-rider cannot update request status.
+#[test]
+fn test_update_request_status_requires_admin() {
+    let (env, client, _admin, hospital) = setup_authorized_hospital();
+    let non_admin = Address::generate(&env);
+    let request_id = create_urgent_request(&client, &hospital);
+
+    let result = client.try_update_request_status(
+        &non_admin,
+        &request_id,
+        &RequestStatus::Approved,
+        &String::from_str(&env, "status update"),
+    );
+
+    assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
+}
+
+/// #1151: Admin can update request status.
+#[test]
+fn test_update_request_status_by_admin_succeeds() {
+    let (env, client, admin, hospital) = setup_authorized_hospital();
+    let request_id = create_urgent_request(&client, &hospital);
+
+    client.update_request_status(
+        &admin,
+        &request_id,
+        &RequestStatus::Approved,
+        &String::from_str(&env, "admin status update"),
+    );
+}
+
+// ── #1302: set_reservation_id ─────────────────────────────────────────────────
+
+/// #1302: A second set_reservation_id call must not overwrite the first ID.
+#[test]
+fn test_set_reservation_id_rejects_overwrite() {
+    let (env, client, admin, hospital) = setup_authorized_hospital();
+    let request_id = create_urgent_request(&client, &hospital);
+
+    client.update_request_status(
+        &admin,
+        &request_id,
+        &RequestStatus::Approved,
+        &String::from_str(&env, "Approved"),
+    );
+
+    client.set_reservation_id(&admin, &request_id, &11u64);
+
+    let result = client.try_set_reservation_id(&admin, &request_id, &22u64);
+    assert_eq!(result, Err(Ok(ContractError::ReservationAlreadySet)));
+
+    let request = client.get_request(&request_id);
+    assert_eq!(request.reservation_id, Some(11));
+}
+
+/// #1302: A legitimate first set_reservation_id call records history and emits an event.
+#[test]
+fn test_set_reservation_id_records_history_and_event() {
+    let (env, client, admin, hospital) = setup_authorized_hospital();
+    let request_id = create_urgent_request(&client, &hospital);
+
+    client.update_request_status(
+        &admin,
+        &request_id,
+        &RequestStatus::Approved,
+        &String::from_str(&env, "Approved"),
+    );
+
+    client.set_reservation_id(&admin, &request_id, &42u64);
+
+    // Client-mode events show last invocation only; verify exactly 1 event emitted.
+    assert_eq!(env.events().all().len(), 1);
+
+    let request = client.get_request(&request_id);
+    assert_eq!(request.reservation_id, Some(42));
+
+    let history = client.get_request_history(&request_id);
+    let last = history.get(history.len() - 1).unwrap();
+    assert_eq!(last.actor, admin);
+    assert_eq!(last.previous_status, RequestStatus::Approved);
+    assert_eq!(last.new_status, RequestStatus::Approved);
+    assert_eq!(last.reason, String::from_str(&env, "Reservation ID set"));
+    assert_eq!(last.timestamp, 1_000);
+}
+
+/// #1302: set_reservation_id is restricted to Approved and InProgress requests.
+#[test]
+fn test_set_reservation_id_rejects_wrong_status() {
+    let (_env, client, admin, hospital) = setup_authorized_hospital();
+    let request_id = create_urgent_request(&client, &hospital);
+
+    let result = client.try_set_reservation_id(&admin, &request_id, &42u64);
+    assert_eq!(result, Err(Ok(ContractError::InvalidRequestStatus)));
+
+    let request = client.get_request(&request_id);
+    assert_eq!(request.reservation_id, None);
+}
+
+// ── #1303: batch_create_requests ─────────────────────────────────────────────
+
 /// #1303: A batch larger than MAX_BATCH_SIZE (50) is rejected before any writes.
 #[test]
 fn test_batch_create_requests_rejects_over_cap() {
-    let (env, _admin, hospital) = setup_authorized_hospital();
+    let (env, client, _admin, hospital) = setup_authorized_hospital();
     let entries = batch_entries(&env, 51);
 
-    let result = RequestContract::batch_create_requests(env.clone(), hospital, entries);
-
-    assert_eq!(result, Err(ContractError::BatchTooLarge));
-    assert_eq!(RequestContract::get_request_counter(env.clone()).unwrap(), 0);
+    let result = client.try_batch_create_requests(&hospital, &entries);
+    assert_eq!(result, Err(Ok(ContractError::BatchTooLarge)));
+    assert_eq!(client.get_request_counter(), 0);
 }
 
 /// #1303: A batch at the MAX_BATCH_SIZE boundary succeeds.
 #[test]
 fn test_batch_create_requests_at_cap_succeeds() {
-    let (env, _admin, hospital) = setup_authorized_hospital();
+    let (env, client, _admin, hospital) = setup_authorized_hospital();
     let entries = batch_entries(&env, 50);
 
-    let ids = RequestContract::batch_create_requests(env.clone(), hospital, entries).unwrap();
-
+    let ids = client.batch_create_requests(&hospital, &entries);
     assert_eq!(ids.len(), 50);
-    assert_eq!(RequestContract::get_request_counter(env.clone()).unwrap(), 50);
+    assert_eq!(client.get_request_counter(), 50);
 }
 
-/// #1305: Verify set_fulfilling_org requires blood bank authorization.
-/// An unauthorized blood bank cannot mark itself as fulfilling a request.
+// ── #1305: set_fulfilling_org (pre-existing auth tests) ──────────────────────
+
+/// #1305: An unauthorized blood bank cannot mark itself as fulfilling a request.
 #[test]
 fn test_set_fulfilling_org_rejects_unauthorized_blood_bank() {
-    let (env, admin, hospital) = setup_authorized_hospital();
-    let request_id = create_urgent_request(&env, &hospital);
+    let (env, client, admin, hospital) = setup_authorized_hospital();
+    let request_id = create_urgent_request(&client, &hospital);
 
-    // Approve the request
-    RequestContract::update_request_status(
-        env.clone(),
-        admin.clone(),
-        request_id,
-        RequestStatus::Approved,
-        String::from_str(&env, "Approved"),
-    )
-    .unwrap();
-
-    // An unauthorized blood bank tries to mark itself as fulfilling
-    let unauthorized_blood_bank = Address::generate(&env);
-    let result = RequestContract::set_fulfilling_org(
-        env.clone(),
-        unauthorized_blood_bank.clone(),
-        request_id,
-        unauthorized_blood_bank.clone(),
+    client.update_request_status(
+        &admin,
+        &request_id,
+        &RequestStatus::Approved,
+        &String::from_str(&env, "Approved"),
     );
 
-    // Should fail: blood bank not authorized
-    assert_eq!(result, Err(ContractError::NotAuthorizedBloodBank));
+    let unauthorized_bb = Address::generate(&env);
+    let result = client.try_set_fulfilling_org(&unauthorized_bb, &request_id, &unauthorized_bb);
+    assert_eq!(result, Err(Ok(ContractError::NotAuthorizedBloodBank)));
 }
 
-/// #1305: Verify set_fulfilling_org allows authorized blood banks to mark themselves.
+/// #1305: An authorized blood bank can mark itself as the fulfilling org.
 #[test]
 fn test_set_fulfilling_org_authorized_blood_bank_succeeds() {
-    let (env, admin, hospital) = setup_authorized_hospital();
-    let request_id = create_urgent_request(&env, &hospital);
+    let (env, client, admin, hospital) = setup_authorized_hospital();
+    let request_id = create_urgent_request(&client, &hospital);
 
-    // Authorize a blood bank
     let blood_bank = Address::generate(&env);
-    RequestContract::authorize_blood_bank(env.clone(), blood_bank.clone()).unwrap();
+    client.authorize_blood_bank(&blood_bank);
 
-    // Approve the request
-    RequestContract::update_request_status(
-        env.clone(),
-        admin.clone(),
-        request_id,
-        RequestStatus::Approved,
-        String::from_str(&env, "Approved"),
-    )
-    .unwrap();
-
-    // Authorized blood bank marks itself as fulfilling
-    let result = RequestContract::set_fulfilling_org(
-        env.clone(),
-        blood_bank.clone(),
-        request_id,
-        blood_bank.clone(),
+    client.update_request_status(
+        &admin,
+        &request_id,
+        &RequestStatus::Approved,
+        &String::from_str(&env, "Approved"),
     );
 
-    assert!(result.is_ok());
+    client.set_fulfilling_org(&blood_bank, &request_id, &blood_bank);
 
-    let request = RequestContract::get_request(env.clone(), request_id).unwrap();
-    assert_eq!(request.fulfilled_by, Some(blood_bank.clone()));
+    let request = client.get_request(&request_id);
+    assert_eq!(request.fulfilled_by, Some(blood_bank));
 }
 
-/// #1305: Verify set_fulfilling_org admin can still mark any org as fulfilling.
+/// #1305: Admin can set any org as the fulfilling org.
 #[test]
 fn test_set_fulfilling_org_admin_can_set_any_org() {
-    let (env, admin, hospital) = setup_authorized_hospital();
-    let request_id = create_urgent_request(&env, &hospital);
+    let (env, client, admin, hospital) = setup_authorized_hospital();
+    let request_id = create_urgent_request(&client, &hospital);
 
-    // Approve the request
-    RequestContract::update_request_status(
-        env.clone(),
-        admin.clone(),
-        request_id,
-        RequestStatus::Approved,
-        String::from_str(&env, "Approved"),
-    )
-    .unwrap();
-
-    // Admin marks any org (e.g., an unauthorized one) as fulfilling
-    let any_org = Address::generate(&env);
-    let result = RequestContract::set_fulfilling_org(
-        env.clone(),
-        admin.clone(),
-        request_id,
-        any_org.clone(),
+    client.update_request_status(
+        &admin,
+        &request_id,
+        &RequestStatus::Approved,
+        &String::from_str(&env, "Approved"),
     );
 
-    assert!(result.is_ok());
+    let any_org = Address::generate(&env);
+    client.set_fulfilling_org(&admin, &request_id, &any_org);
 
-    let request = RequestContract::get_request(env.clone(), request_id).unwrap();
+    let request = client.get_request(&request_id);
     assert_eq!(request.fulfilled_by, Some(any_org));
 }
 
-/// #1304: Verify per-hospital index-based pagination scales with hospital's request count,
-/// not the global request counter.
+// ── #1304: per-hospital index pagination ─────────────────────────────────────
+
+/// #1304: Pagination uses the per-hospital index, not the global counter.
 #[test]
 fn test_get_requests_by_hospital_uses_per_hospital_index() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let hospital_a = Address::generate(&env);
+    let (env, client, _admin, hospital_a) = setup_authorized_hospital();
     let hospital_b = Address::generate(&env);
+    client.authorize_hospital(&hospital_b);
 
-    env.mock_all_auths();
+    let req_a1 = client.create_request(
+        &hospital_a,
+        &BloodType::OPositive,
+        &BloodComponent::WholeBlood,
+        &500u32,
+        &Urgency::Urgent,
+        &1_600u64,
+    );
+    let req_a2 = client.create_request(
+        &hospital_a,
+        &BloodType::APositive,
+        &BloodComponent::Plasma,
+        &300u32,
+        &Urgency::Routine,
+        &2_000u64,
+    );
+    let req_a3 = client.create_request(
+        &hospital_a,
+        &BloodType::BPositive,
+        &BloodComponent::RedCells,
+        &400u32,
+        &Urgency::Critical,
+        &1_800u64,
+    );
 
-    RequestContract::initialize(env.clone(), admin.clone(), Address::generate(&env)).unwrap();
-    RequestContract::authorize_hospital(env.clone(), hospital_a.clone()).unwrap();
-    RequestContract::authorize_hospital(env.clone(), hospital_b.clone()).unwrap();
+    let req_b1 = client.create_request(
+        &hospital_b,
+        &BloodType::ONegative,
+        &BloodComponent::Platelets,
+        &100u32,
+        &Urgency::Scheduled,
+        &2_500u64,
+    );
+    let req_b2 = client.create_request(
+        &hospital_b,
+        &BloodType::ABNegative,
+        &BloodComponent::Cryoprecipitate,
+        &50u32,
+        &Urgency::Urgent,
+        &1_700u64,
+    );
 
-    env.ledger().set_timestamp(1_000);
-
-    // Hospital A creates 3 requests
-    let req_a1 = RequestContract::create_request(
-        env.clone(),
-        hospital_a.clone(),
-        BloodType::OPositive,
-        BloodComponent::WholeBlood,
-        500,
-        Urgency::Urgent,
-        1_600,
-    )
-    .unwrap();
-    let req_a2 = RequestContract::create_request(
-        env.clone(),
-        hospital_a.clone(),
-        BloodType::APositive,
-        BloodComponent::Plasma,
-        300,
-        Urgency::Routine,
-        2_000,
-    )
-    .unwrap();
-    let req_a3 = RequestContract::create_request(
-        env.clone(),
-        hospital_a.clone(),
-        BloodType::BPositive,
-        BloodComponent::RedCells,
-        400,
-        Urgency::Critical,
-        1_800,
-    )
-    .unwrap();
-
-    // Hospital B creates 2 requests
-    let req_b1 = RequestContract::create_request(
-        env.clone(),
-        hospital_b.clone(),
-        BloodType::ONegative,
-        BloodComponent::Platelets,
-        100,
-        Urgency::Scheduled,
-        2_500,
-    )
-    .unwrap();
-    let req_b2 = RequestContract::create_request(
-        env.clone(),
-        hospital_b.clone(),
-        BloodType::ABNegative,
-        BloodComponent::Cryoprecipitate,
-        50,
-        Urgency::Urgent,
-        1_700,
-    )
-    .unwrap();
-
-    // Get all requests for hospital A (page 0, size 10)
-    let results_a = RequestContract::get_requests_by_hospital(
-        env.clone(),
-        hospital_a.clone(),
-        0,
-        10,
-    )
-    .unwrap();
-
+    let results_a = client.get_requests_by_hospital(&hospital_a, &0u32, &10u32);
     assert_eq!(results_a.len(), 3);
-    let mut ids_a = std::vec::Vec::new();
-    for i in 0..results_a.len() {
-        ids_a.push(results_a.get(i).unwrap().id);
-    }
-    assert_eq!(ids_a, std::vec![req_a1, req_a2, req_a3]);
+    assert_eq!(results_a.get(0).unwrap().id, req_a1);
+    assert_eq!(results_a.get(1).unwrap().id, req_a2);
+    assert_eq!(results_a.get(2).unwrap().id, req_a3);
 
-    // Get all requests for hospital B (page 0, size 10)
-    let results_b = RequestContract::get_requests_by_hospital(
-        env.clone(),
-        hospital_b.clone(),
-        0,
-        10,
-    )
-    .unwrap();
-
+    let results_b = client.get_requests_by_hospital(&hospital_b, &0u32, &10u32);
     assert_eq!(results_b.len(), 2);
-    let mut ids_b = std::vec::Vec::new();
-    for i in 0..results_b.len() {
-        ids_b.push(results_b.get(i).unwrap().id);
-    }
-    assert_eq!(ids_b, std::vec![req_b1, req_b2]);
+    assert_eq!(results_b.get(0).unwrap().id, req_b1);
+    assert_eq!(results_b.get(1).unwrap().id, req_b2);
 
-    // Test pagination: get first page with size 2 for hospital A
-    let page_0_a = RequestContract::get_requests_by_hospital(
-        env.clone(),
-        hospital_a.clone(),
-        0,
-        2,
-    )
-    .unwrap();
-
+    let page_0_a = client.get_requests_by_hospital(&hospital_a, &0u32, &2u32);
     assert_eq!(page_0_a.len(), 2);
     assert_eq!(page_0_a.get(0).unwrap().id, req_a1);
     assert_eq!(page_0_a.get(1).unwrap().id, req_a2);
 
-    // Get second page for hospital A
-    let page_1_a = RequestContract::get_requests_by_hospital(
-        env.clone(),
-        hospital_a.clone(),
-        1,
-        2,
-    )
-    .unwrap();
-
+    let page_1_a = client.get_requests_by_hospital(&hospital_a, &1u32, &2u32);
     assert_eq!(page_1_a.len(), 1);
     assert_eq!(page_1_a.get(0).unwrap().id, req_a3);
+}
+
+// ── #1468: set_fulfilling_org audit trail & status guard ─────────────────────
+
+/// #1468: set_fulfilling_org must reject requests in non-actionable states.
+#[test]
+fn test_set_fulfilling_org_rejects_pending_status() {
+    let (env, client, admin, hospital) = setup_authorized_hospital();
+    let request_id = create_urgent_request(&client, &hospital);
+
+    let blood_bank = Address::generate(&env);
+    client.authorize_blood_bank(&blood_bank);
+
+    // Still Pending — must reject
+    let result = client.try_set_fulfilling_org(&blood_bank, &request_id, &blood_bank);
+    assert_eq!(result, Err(Ok(ContractError::InvalidRequestStatus)));
+
+    // Cancel, then try again — still must reject
+    client.cancel_request(&admin, &request_id, &String::from_str(&env, "cancelled"));
+    let result2 = client.try_set_fulfilling_org(&admin, &request_id, &blood_bank);
+    assert_eq!(result2, Err(Ok(ContractError::InvalidRequestStatus)));
+}
+
+/// #1468: set_fulfilling_org must reject a second call that would silently overwrite.
+#[test]
+fn test_set_fulfilling_org_rejects_overwrite() {
+    let (env, client, admin, hospital) = setup_authorized_hospital();
+    let request_id = create_urgent_request(&client, &hospital);
+
+    client.update_request_status(
+        &admin,
+        &request_id,
+        &RequestStatus::Approved,
+        &String::from_str(&env, "Approved"),
+    );
+
+    let blood_bank = Address::generate(&env);
+    client.authorize_blood_bank(&blood_bank);
+    client.set_fulfilling_org(&blood_bank, &request_id, &blood_bank);
+
+    let result = client.try_set_fulfilling_org(&admin, &request_id, &blood_bank);
+    assert_eq!(result, Err(Ok(ContractError::FulfillingOrgAlreadySet)));
+}
+
+/// #1468: set_fulfilling_org must record a history entry and emit an event.
+#[test]
+fn test_set_fulfilling_org_records_history_and_event() {
+    let (env, client, admin, hospital) = setup_authorized_hospital();
+    let request_id = create_urgent_request(&client, &hospital);
+
+    client.update_request_status(
+        &admin,
+        &request_id,
+        &RequestStatus::Approved,
+        &String::from_str(&env, "Approved"),
+    );
+
+    let blood_bank = Address::generate(&env);
+    client.authorize_blood_bank(&blood_bank);
+
+    let events_before = env.events().all().len();
+    client.set_fulfilling_org(&blood_bank, &request_id, &blood_bank);
+    assert_eq!(env.events().all().len(), events_before + 1);
+
+    let history = client.get_request_history(&request_id);
+    let last = history.get(history.len() - 1).unwrap();
+    assert_eq!(last.actor, blood_bank);
+    assert_eq!(last.previous_status, RequestStatus::Approved);
+    assert_eq!(last.new_status, RequestStatus::Approved);
+    assert_eq!(last.reason, String::from_str(&env, "Fulfilling org set"));
+}
+
+// ── #1469: rider authorization wired into InProgress transition ───────────────
+
+/// #1469: An authorized rider can drive the Approved → InProgress transition.
+#[test]
+fn test_authorized_rider_can_set_inprogress() {
+    let (env, client, admin, hospital) = setup_authorized_hospital();
+    let request_id = create_urgent_request(&client, &hospital);
+
+    client.update_request_status(
+        &admin,
+        &request_id,
+        &RequestStatus::Approved,
+        &String::from_str(&env, "Approved"),
+    );
+
+    let rider = Address::generate(&env);
+    client.authorize_rider(&rider);
+
+    client.update_request_status(
+        &rider,
+        &request_id,
+        &RequestStatus::InProgress,
+        &String::from_str(&env, "Rider picked up blood"),
+    );
+
+    let request = client.get_request(&request_id);
+    assert_eq!(request.status, RequestStatus::InProgress);
+}
+
+/// #1469: An unauthorized rider cannot update any status.
+#[test]
+fn test_unauthorized_rider_cannot_update_status() {
+    let (env, client, admin, hospital) = setup_authorized_hospital();
+    let request_id = create_urgent_request(&client, &hospital);
+
+    client.update_request_status(
+        &admin,
+        &request_id,
+        &RequestStatus::Approved,
+        &String::from_str(&env, "Approved"),
+    );
+
+    let non_rider = Address::generate(&env);
+    let result = client.try_update_request_status(
+        &non_rider,
+        &request_id,
+        &RequestStatus::InProgress,
+        &String::from_str(&env, "Unauthorized pickup"),
+    );
+    assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
+}
+
+/// #1469: An authorized rider cannot drive non-InProgress transitions.
+#[test]
+fn test_authorized_rider_cannot_approve_or_reject() {
+    let (env, client, admin, hospital) = setup_authorized_hospital();
+    let request_id = create_urgent_request(&client, &hospital);
+
+    let rider = Address::generate(&env);
+    client.authorize_rider(&rider);
+
+    // Rider cannot approve
+    let result = client.try_update_request_status(
+        &rider,
+        &request_id,
+        &RequestStatus::Approved,
+        &String::from_str(&env, "Unauthorized approval"),
+    );
+    assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
+
+    // Admin approves so we can test further
+    client.update_request_status(
+        &admin,
+        &request_id,
+        &RequestStatus::Approved,
+        &String::from_str(&env, "Approved"),
+    );
+
+    // Rider cannot reject
+    let result2 = client.try_update_request_status(
+        &rider,
+        &request_id,
+        &RequestStatus::Rejected,
+        &String::from_str(&env, "Unauthorized rejection"),
+    );
+    assert_eq!(result2, Err(Ok(ContractError::Unauthorized)));
+}
+
+// ── #1470: hospital index pruned on terminal transitions ──────────────────────
+
+/// #1470: Cancelling a request removes it from the hospital's index.
+#[test]
+fn test_hospital_index_pruned_on_cancel() {
+    let (env, client, admin, hospital) = setup_authorized_hospital();
+    let req1 = create_urgent_request(&client, &hospital);
+    let req2 = client.create_request(
+        &hospital,
+        &BloodType::APositive,
+        &BloodComponent::Plasma,
+        &300u32,
+        &Urgency::Routine,
+        &2_000u64,
+    );
+
+    client.cancel_request(
+        &admin,
+        &req1,
+        &String::from_str(&env, "no longer needed"),
+    );
+
+    let results = client.get_requests_by_hospital(&hospital, &0u32, &10u32);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results.get(0).unwrap().id, req2);
+}
+
+/// #1470: Fulfilling a request removes it from the hospital's index.
+#[test]
+fn test_hospital_index_pruned_on_fulfill() {
+    let (env, client, admin, hospital) = setup_authorized_hospital();
+    let req1 = create_urgent_request(&client, &hospital);
+    let req2 = client.create_request(
+        &hospital,
+        &BloodType::BNegative,
+        &BloodComponent::RedCells,
+        &200u32,
+        &Urgency::Critical,
+        &1_800u64,
+    );
+
+    client.update_request_status(
+        &admin,
+        &req1,
+        &RequestStatus::Approved,
+        &String::from_str(&env, "Approved"),
+    );
+    client.partial_fulfill_request(
+        &admin,
+        &req1,
+        &500u32,
+        &String::from_str(&env, "fully delivered"),
+    );
+
+    let results = client.get_requests_by_hospital(&hospital, &0u32, &10u32);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results.get(0).unwrap().id, req2);
+}
+
+/// #1470: Rejecting a request removes it from the hospital's index.
+#[test]
+fn test_hospital_index_pruned_on_reject() {
+    let (env, client, admin, hospital) = setup_authorized_hospital();
+    let req1 = create_urgent_request(&client, &hospital);
+    let req2 = client.create_request(
+        &hospital,
+        &BloodType::ABPositive,
+        &BloodComponent::Platelets,
+        &150u32,
+        &Urgency::Scheduled,
+        &2_200u64,
+    );
+
+    client.update_request_status(
+        &admin,
+        &req1,
+        &RequestStatus::Rejected,
+        &String::from_str(&env, "no stock available"),
+    );
+
+    let results = client.get_requests_by_hospital(&hospital, &0u32, &10u32);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results.get(0).unwrap().id, req2);
 }

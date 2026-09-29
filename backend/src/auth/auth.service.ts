@@ -40,6 +40,7 @@ import {
   dummyVerify,
 } from './utils/password.util';
 import { MfaService } from './mfa/mfa.service';
+import { PasswordResetService } from './password-reset.service';
 
 export interface SessionMetadata {
   ipAddress?: string | null;
@@ -67,6 +68,7 @@ export class AuthService {
     private readonly userActivityService: UserActivityService,
     private readonly securityEventLogger: SecurityEventLoggerService,
     private readonly mfaService: MfaService,
+    private readonly passwordResetService: PasswordResetService,
     private readonly sessionRiskService: SessionRiskService,
   ) {
     this.circuitBreaker = new RedisCircuitBreaker();
@@ -364,6 +366,19 @@ export class AuthService {
     });
     const savedUser = await this.userRepository.save(user);
 
+    if (requireVerification) {
+      try {
+        await this.passwordResetService.sendVerificationEmail(
+          savedUser.id,
+          savedUser.email,
+        );
+      } catch (error) {
+        this.logger.warn(
+          `Failed to send verification email for ${savedUser.email}: ${(error as Error).message}`,
+        );
+      }
+    }
+
     return {
       message: 'Registration successful',
       user: {
@@ -440,16 +455,29 @@ export class AuthService {
         );
       }
 
+      const currentUser = await this.userRepository.findOne({
+        where: { id: payload.sub },
+      });
+      if (!currentUser || currentUser.deletedAt || !currentUser.isActive) {
+        await this.revokeSessionFamily(payload.sub, payload.sid, payload.email);
+        throw new UnauthorizedException(
+          JSON.stringify({
+            code: ErrorCode.AUTH_INVALID_REFRESH_TOKEN,
+            message: 'User account is no longer active',
+          }),
+        );
+      }
+
       this.logger.log(
         `Refresh token consumed for user ${payload.email}. Rotating tokens.`,
       );
 
       const newPayload: JwtPayload = {
-        sub: payload.sub,
-        email: payload.email,
-        role: payload.role,
+        sub: currentUser.id,
+        email: currentUser.email,
+        role: currentUser.role ?? payload.role ?? 'donor',
         sid: payload.sid,
-        organizationId: payload.organizationId ?? null,
+        organizationId: currentUser.organizationId ?? payload.organizationId ?? null,
       };
 
       const {
@@ -826,6 +854,15 @@ export class AuthService {
   }
 
   private async ensureAccountIsUsable(user: UserEntity) {
+    if (!user.isActive) {
+      throw new ForbiddenException(
+        JSON.stringify({
+          code: ErrorCode.AUTH_FORBIDDEN,
+          message: 'Account is inactive',
+        }),
+      );
+    }
+
     const requireVerification = this.configService.get<boolean>(
       'REQUIRE_EMAIL_VERIFICATION',
       false,

@@ -309,7 +309,7 @@ export class RequestStatusService {
       case OrderStatus.DELIVERED:
         this.eventEmitter.emit(
           'order.delivered',
-          new OrderDeliveredEvent(order.id),
+          new OrderDeliveredEvent(order.id, order.hospitalId),
         );
         break;
 

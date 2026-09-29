@@ -68,4 +68,8 @@ pub enum DataKey {
     TotalDeliveries,
     TotalPaymentsReleased,
     TotalVolume,
+    /// Ledger timestamp of the most recent metric write — persistent storage.
+    /// Kept separately from the per-period snapshots so lifetime aggregates can
+    /// report a genuine ingestion time instead of the current ledger time.
+    LastUpdated,
 }

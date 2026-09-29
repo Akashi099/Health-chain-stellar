@@ -183,6 +183,7 @@ export class BloodRequestsService {
     const reserved: Array<{
       bloodBankId: string;
       bloodType: string;
+      component: string;
       quantity: number;
     }> = [];
 
@@ -201,8 +202,10 @@ export class BloodRequestsService {
           bloodBankId,
           bloodType,
           quantity,
+          undefined,
+          item.component
         );
-        reserved.push({ bloodBankId, bloodType, quantity });
+        reserved.push({ bloodBankId, bloodType, component: item.component, quantity });
       }
 
       // 2. Submit to blockchain

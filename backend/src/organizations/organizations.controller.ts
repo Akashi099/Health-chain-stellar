@@ -317,10 +317,10 @@ export class OrganizationsController {
   @Post(':id/reapply')
   reapply(
     @Param('id', ParseUUIDPipe) id: string,
-    @Req() req: { user: { id: string } },
+    @Req() req: { user: { id: string; role?: string; organizationId?: string | null } },
     @Body() dto: ReapplyOrganizationDto,
   ) {
-    return this.lifecycleService.reapply(id, req.user.id, dto);
+    return this.lifecycleService.reapply(id, req.user, dto);
   }
 
   @RequirePermissions(Permission.ADMIN_ACCESS)

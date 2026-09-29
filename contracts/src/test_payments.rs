@@ -13,7 +13,8 @@ use crate::{
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Events, Ledger},
-    vec as soroban_vec, vec, Address, Bytes, Env, Map, String, Symbol, TryFromVal,
+    Vec,
+    vec, Address, Bytes, Env, Map, String, Symbol, TryFromVal,
 };
 
 fn default_fee_structure(env: &Env) -> FeeStructure {
@@ -626,7 +627,7 @@ fn no_refund_before_deadline() {
         ledger.timestamp += 9;
     });
 
-    let dispute_ids = vec![&env, dispute_id];
+    let dispute_ids = vec![&env, payment_id];
     assert_eq!(client.process_expired_disputes(&dispute_ids), 0);
 }
 

@@ -70,11 +70,31 @@ describe('InventoryStockRepository', () => {
   });
 
   describe('findByBankAndType', () => {
-    it('queries by bloodBankId and bloodType', async () => {
+    it('queries by bloodBankId, bloodType, and component', async () => {
+      mockTypeormRepo.findOne.mockResolvedValue(makeStock());
+      await repo.findByBankAndType('bank-1', 'O+', 'PLASMA' as any);
+      expect(mockTypeormRepo.findOne).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            bloodBankId: 'bank-1',
+            bloodType: 'O+',
+            component: 'PLASMA',
+          }),
+        }),
+      );
+    });
+
+    it('defaults component to WHOLE_BLOOD when omitted', async () => {
       mockTypeormRepo.findOne.mockResolvedValue(makeStock());
       await repo.findByBankAndType('bank-1', 'O+');
       expect(mockTypeormRepo.findOne).toHaveBeenCalledWith(
-        expect.objectContaining({ where: expect.objectContaining({ bloodBankId: 'bank-1', bloodType: 'O+' }) }),
+        expect.objectContaining({
+          where: expect.objectContaining({
+            bloodBankId: 'bank-1',
+            bloodType: 'O+',
+            component: 'WHOLE_BLOOD',
+          }),
+        }),
       );
     });
   });

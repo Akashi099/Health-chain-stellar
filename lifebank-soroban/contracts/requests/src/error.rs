@@ -25,6 +25,8 @@ pub enum ContractError {
     ReservationAlreadySet = 314,
     /// Batch exceeds the maximum number of entries allowed in one call.
     BatchTooLarge = 315,
+    /// Attempted to overwrite an already-set fulfilling org; overwrite would silently lose the prior value.
+    FulfillingOrgAlreadySet = 316,
 }
 
 #[cfg(test)]
@@ -52,6 +54,7 @@ mod tests {
             ContractError::InvalidReason,
             ContractError::ReservationAlreadySet,
             ContractError::BatchTooLarge,
+            ContractError::FulfillingOrgAlreadySet,
         ];
 
         for i in 0..all.len() {
