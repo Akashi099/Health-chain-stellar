@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
@@ -299,11 +300,19 @@ export class OrgVerificationLifecycleService {
    */
   async reapply(
     organizationId: string,
-    actorId: string,
+    actor: { id: string; role?: string; organizationId?: string | null },
     dto: ReapplyOrganizationDto,
   ): Promise<OrgVerificationHistoryEntity> {
     const org = await this.findOrThrow(organizationId);
     const fromStatus = org.status as unknown as OrgLifecycleStatus;
+    const isAdmin = (actor.role ?? '').toLowerCase() === 'admin';
+    const isOrgMember = !!actor.organizationId && actor.organizationId === organizationId;
+
+    if (!isAdmin && !isOrgMember) {
+      throw new ForbiddenException(
+        'Only an admin or a member of this organization can reapply.',
+      );
+    }
 
     this.assertTransitionAllowed(fromStatus, OrgLifecycleStatus.PENDING_VERIFICATION);
 
@@ -315,7 +324,7 @@ export class OrgVerificationLifecycleService {
       organizationId,
       fromStatus,
       toStatus: OrgLifecycleStatus.PENDING_VERIFICATION,
-      actorId,
+      actorId: actor.id,
       reason: VerificationChangeReason.REAPPLICATION,
       note: dto.note,
       inFlightOrderIds: null,
@@ -330,7 +339,7 @@ export class OrgVerificationLifecycleService {
         organizationId,
         fromStatus,
         OrgLifecycleStatus.PENDING_VERIFICATION,
-        actorId,
+        actor.id,
         VerificationChangeReason.REAPPLICATION,
         null,
         [],

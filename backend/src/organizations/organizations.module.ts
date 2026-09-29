@@ -1,8 +1,10 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 
+import { AuthModule } from '../auth/auth.module';
 import { BlockchainModule } from '../blockchain/blockchain.module';
 import { NotificationsModule } from '../notifications/notifications.module';
+import { OrderEntity } from '../orders/entities/order.entity';
 import { SorobanModule } from '../soroban/soroban.module';
 
 import { OrgGracePeriodEntity } from './entities/org-grace-period.entity';
@@ -14,6 +16,7 @@ import { OrganizationReviewReportEntity } from './entities/organization-review-r
 import { OrganizationReviewEntity } from './entities/organization-review.entity';
 import { OrganizationEntity } from './entities/organization.entity';
 import { OrgTrustScoreController } from './controllers/org-trust-score.controller';
+import { OrganizationRepository } from './organizations.repository';
 import { OrganizationsController } from './organizations.controller';
 import { OrganizationsService } from './organizations.service';
 import { OrgTrustScoringService } from './services/org-trust-scoring.service';
@@ -26,6 +29,7 @@ import { OrgStatsModule } from './stats/org-stats.module';
   imports: [
     TypeOrmModule.forFeature([
       OrganizationEntity,
+      OrderEntity,
       OrganizationReviewEntity,
       OrganizationReviewReportEntity,
       OrganizationReviewModerationLogEntity,
@@ -38,9 +42,11 @@ import { OrgStatsModule } from './stats/org-stats.module';
     SorobanModule,
     NotificationsModule,
     OrgStatsModule,
+    AuthModule,
   ],
   controllers: [OrganizationsController, OrgTrustScoreController],
   providers: [
+    OrganizationRepository,
     OrganizationsService,
     OrganizationReviewsService,
     VerificationSyncService,
@@ -48,6 +54,7 @@ import { OrgStatsModule } from './stats/org-stats.module';
     OrgVerificationLifecycleService,
   ],
   exports: [
+    OrganizationRepository,
     OrganizationsService,
     OrganizationReviewsService,
     VerificationSyncService,

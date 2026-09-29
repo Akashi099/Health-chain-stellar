@@ -111,16 +111,15 @@ export class ImportService {
   ): Promise<ImportBatchEntity> {
     const fileHash = this.sha256(csvBuffer);
 
-    // ── Idempotent file deduplication ──────────────────────────────────────
-    const existing = await this.batchRepo.findOne({ where: { fileHash } });
+    // ── Idempotent file deduplication keyed by file hash, entity type, and uploader ─
+    const existing = await this.batchRepo.findOne({
+      where: { fileHash, entityType, importedBy },
+    });
     if (existing) {
       this.logger.warn(
-        `Duplicate file submission detected (hash=${fileHash}), returning existing batch ${existing.id}`,
+        `Duplicate file submission detected (hash=${fileHash}, entityType=${entityType}, importedBy=${importedBy}), returning existing batch ${existing.id}`,
       );
-      await this.batchRepo.update(existing.id, {
-        status: ImportBatchStatus.DEDUPLICATED,
-      });
-      return this.batchRepo.findOne({ where: { id: existing.id } }) as Promise<ImportBatchEntity>;
+      return existing;
     }
 
     const rows = this.parseCsv(csvBuffer, entityType);
