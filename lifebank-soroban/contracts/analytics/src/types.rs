@@ -68,4 +68,6 @@ pub enum DataKey {
     TotalDeliveries,
     TotalPaymentsReleased,
     TotalVolume,
+    /// Timestamp of the most recent metric write - persistent storage.
+    LastUpdated,
 }
