@@ -1,6 +1,14 @@
 use crate::types::{BloodRequest, RequestCreatedEvent, RequestStatus};
 use soroban_sdk::{contractevent, Address, Env};
 
+#[contractevent(topics = ["fulfilling_org_set"], data_format = "vec")]
+pub struct FulfillingOrgSet {
+    pub request_id: u64,
+    pub actor: Address,
+    pub org_id: Address,
+    pub timestamp: u64,
+}
+
 #[contractevent(topics = ["initialized"], data_format = "vec")]
 pub struct RequestsInitialized {
     pub admin: Address,
@@ -89,6 +97,22 @@ pub fn emit_reservation_id_set(
         request_id,
         actor: actor.clone(),
         reservation_id,
+        timestamp,
+    }
+    .publish(env);
+}
+
+pub fn emit_fulfilling_org_set(
+    env: &Env,
+    request_id: u64,
+    actor: &Address,
+    org_id: &Address,
+    timestamp: u64,
+) {
+    FulfillingOrgSet {
+        request_id,
+        actor: actor.clone(),
+        org_id: org_id.clone(),
         timestamp,
     }
     .publish(env);

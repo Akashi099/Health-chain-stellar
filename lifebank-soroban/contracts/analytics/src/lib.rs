@@ -83,7 +83,19 @@ fn require_initialized(env: &Env) -> Result<AnalyticsConfig, AnalyticsError> {
     env.storage()
         .instance()
         .get(&DataKey::Config)
-        .ok_or(AnalyticsError::NotInitialized)
+        .ok_or(AnalyticsError::NotInitialized)?;
+
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_TTL_MIN, INSTANCE_TTL_MAX);
+
+    Ok(config)
+}
+
+fn extend_instance_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_TTL_MIN, INSTANCE_TTL_MAX);
 }
 
 fn require_admin(env: &Env) -> Result<AnalyticsConfig, AnalyticsError> {
@@ -220,9 +232,9 @@ impl AnalyticsContract {
         set_counter_u64(&env, &DataKey::TotalDeliveries, 0u64);
         set_counter_u64(&env, &DataKey::TotalPaymentsReleased, 0u64);
         set_counter_i128(&env, &DataKey::TotalVolume, 0i128);
+        set_last_updated(&env, 0u64);
 
         // No metric has been recorded yet; last_updated starts at 0.
-        set_last_updated(&env, 0u64);
 
         AnalyticsInitialized { admin }.publish(&env);
 

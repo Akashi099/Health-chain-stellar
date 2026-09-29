@@ -7,6 +7,7 @@ import { ReservationAuditEntity } from './entities/reservation-audit.entity';
 import { InventoryStockEntity } from './entities/inventory-stock.entity';
 import { InventoryStockRepository } from './repositories/inventory-stock.repository';
 import { InventoryService } from './inventory.service';
+import { InventoryRepository } from './repositories/inventory.repository';
 
 function makeStock(available = 1000, version = 1): InventoryStockEntity {
   return { id: 'stock-1', bloodBankId: 'bank-1', bloodType: 'A+', component: 'WHOLE_BLOOD' as any,
@@ -45,15 +46,38 @@ describe('InventoryService — reservation race conditions (#615)', () => {
       where: jest.fn().mockReturnThis(), andWhere: jest.fn().mockReturnThis(),
       execute: jest.fn(() => Promise.resolve({ affected: 1 })),
     };
+    const managerMock = {
+      createQueryBuilder: jest.fn(() => qb),
+      findOne: jest.fn(() => Promise.resolve(makeStock())),
+      create: jest.fn((entity, dto) => dto || entity),
+      save: jest.fn(() => Promise.resolve()),
+    };
+
     reservationRepo = {
       find: jest.fn(() => Promise.resolve([])),
       createQueryBuilder: jest.fn(() => qb),
+      manager: {
+        transaction: jest.fn(async (cb) => cb(managerMock)),
+      },
+    };
+
+    const rawInventoryStockRepoMock = {
+      find: jest.fn().mockResolvedValue([]),
+      findOne: jest.fn().mockResolvedValue(null),
+      save: jest.fn().mockImplementation((e: any) => Promise.resolve(e)),
+      create: jest.fn().mockImplementation((d: any) => d),
+    };
+    const inventoryRepositoryMock = {
+      getStockAggregationByBloodType: jest.fn().mockResolvedValue([]),
     };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         InventoryService,
         { provide: InventoryStockRepository, useValue: stockRepo },
+        { provide: getRepositoryToken(InventoryStockEntity), useValue: rawInventoryStockRepoMock },
+
+        { provide: InventoryRepository, useValue: inventoryRepositoryMock },
         { provide: getRepositoryToken(ReservationAuditEntity), useValue: auditRepo },
         { provide: getRepositoryToken(BloodRequestReservationEntity), useValue: reservationRepo },
       ],
@@ -98,6 +122,14 @@ describe('InventoryService — reservation race conditions (#615)', () => {
       await service.reserveStockOrThrow('bank-1', 'A+', 500, { requestId: 'req-1', urgency: 'CRITICAL' });
       expect(auditRepo.save).toHaveBeenCalled();
     });
+
+    it('queries stock specifying blood component and defaults to WHOLE_BLOOD', async () => {
+      await service.reserveStockOrThrow('bank-1', 'A+', 500, undefined, 'PLASMA' as any);
+      expect(stockRepo.findByBankAndType).toHaveBeenCalledWith('bank-1', 'A+', 'PLASMA');
+
+      await service.reserveStockOrThrow('bank-1', 'A+', 500);
+      expect(stockRepo.findByBankAndType).toHaveBeenCalledWith('bank-1', 'A+', 'WHOLE_BLOOD');
+    });
   });
 
   describe('concurrent reservation simulation', () => {
@@ -133,10 +165,23 @@ describe('InventoryService — reservation race conditions (#615)', () => {
         expiresAt: Math.floor(Date.now() / 1000) - 60,
       };
       reservationRepo.find.mockResolvedValue([expiredRes]);
+      
+      const qb = reservationRepo.createQueryBuilder();
+      const managerMockSave = jest.fn(() => Promise.resolve());
+      reservationRepo.manager.transaction.mockImplementationOnce(async (cb) => {
+        return cb({
+          createQueryBuilder: () => qb,
+          findOne: jest.fn(() => Promise.resolve(makeStock())),
+          create: jest.fn((entity, dto) => dto || entity),
+          save: managerMockSave,
+        });
+      });
+
       await service.releaseExpiredReservations();
-      expect(reservationRepo.createQueryBuilder().execute).toHaveBeenCalled();
-      expect(stockRepo.atomicIncrement).toHaveBeenCalled();
-      expect(auditRepo.save).toHaveBeenCalled();
+      
+      expect(reservationRepo.manager.transaction).toHaveBeenCalled();
+      expect(qb.execute).toHaveBeenCalled();
+      expect(managerMockSave).toHaveBeenCalled(); // audit repo save
     });
 
     it('skips reservations already handled by another worker (affected=0)', async () => {
@@ -147,9 +192,24 @@ describe('InventoryService — reservation race conditions (#615)', () => {
         expiresAt: Math.floor(Date.now() / 1000) - 60,
       };
       reservationRepo.find.mockResolvedValue([expiredRes]);
-      reservationRepo.createQueryBuilder().execute.mockResolvedValue({ affected: 0 });
+      
+      const qb = reservationRepo.createQueryBuilder();
+      qb.execute.mockResolvedValueOnce({ affected: 0 }); // Override the first execute call
+
+      const managerMockSave = jest.fn(() => Promise.resolve());
+      reservationRepo.manager.transaction.mockImplementationOnce(async (cb) => {
+        return cb({
+          createQueryBuilder: () => qb,
+          findOne: jest.fn(),
+          create: jest.fn(),
+          save: managerMockSave,
+        });
+      });
+
       await service.releaseExpiredReservations();
-      expect(stockRepo.atomicIncrement).not.toHaveBeenCalled();
+      
+      expect(reservationRepo.manager.transaction).toHaveBeenCalled();
+      expect(managerMockSave).not.toHaveBeenCalled();
     });
   });
 });
