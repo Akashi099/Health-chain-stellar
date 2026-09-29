@@ -20,6 +20,12 @@ pub const LEDGER_CLOSE_SECS: u64 = 5;
 /// a few ledgers after creation and is readable in the same ledger batch.
 pub const RESERVATION_TTL_MIN_LEDGERS: u32 = 60; // ~5 minutes
 
+pub fn extend_instance_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+}
+
 /// Maximum history entries per storage page. Keeps each page small so
 /// a single read never loads the entire history of a high-traffic unit.
 const HISTORY_PAGE_SIZE: u32 = 50;
@@ -33,14 +39,17 @@ const INDEX_PAGE_SIZE: u32 = 20;
 // ── Admin ──────────────────────────────────────────────────────────────────────
 
 pub fn get_admin(env: &Env) -> Address {
-    env.storage()
+    let admin = env.storage()
         .instance()
         .get(&DataKey::Admin)
-        .expect("Admin not initialized")
+        .expect("Admin not initialized");
+    extend_instance_ttl(env);
+    admin
 }
 
 pub fn set_admin(env: &Env, admin: &Address) {
     env.storage().instance().set(&DataKey::Admin, admin);
+    extend_instance_ttl(env);
 }
 
 // ── Authorization ──────────────────────────────────────────────────────────────
@@ -66,10 +75,12 @@ pub fn set_authorized_bank(env: &Env, bank: &Address, authorized: bool) {
 // ── Blood unit counter ─────────────────────────────────────────────────────────
 
 pub fn get_blood_unit_counter(env: &Env) -> u64 {
-    env.storage()
+    let counter = env.storage()
         .instance()
         .get(&DataKey::BloodUnitCounter)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    extend_instance_ttl(env);
+    counter
 }
 
 pub fn increment_blood_unit_id(env: &Env) -> u64 {
@@ -77,6 +88,7 @@ pub fn increment_blood_unit_id(env: &Env) -> u64 {
     env.storage()
         .instance()
         .set(&DataKey::BloodUnitCounter, &next_id);
+    extend_instance_ttl(env);
     next_id
 }
 
@@ -407,6 +419,7 @@ fn increment_status_history_counter(env: &Env) -> u64 {
     let current: u64 = env.storage().instance().get(&key).unwrap_or(0u64);
     let next_id = current + 1;
     env.storage().instance().set(&key, &next_id);
+    extend_instance_ttl(env);
     next_id
 }
 
@@ -417,6 +430,7 @@ pub fn increment_reservation_id(env: &Env) -> u64 {
     let current: u64 = env.storage().instance().get(&key).unwrap_or(0);
     let next_id = current + 1;
     env.storage().instance().set(&key, &next_id);
+    extend_instance_ttl(env);
     next_id
 }
 
