@@ -7,7 +7,7 @@ use crate::payments::{
 use crate::{
     BloodComponent, BloodRequest, BloodStatus, BloodType, BloodUnit, CustodyStatus, Error,
     HealthChainContract, HealthChainContractClient, QuarantineReason, RequestStatus, UrgencyLevel,
-    BLOOD_UNITS, ESCROW_ACCOUNTS, PAYMENTS, REQUESTS,
+    WithdrawalReason, BLOOD_UNITS, ESCROW_ACCOUNTS, PAYMENTS, REQUESTS,
 };
 
 use soroban_sdk::{
