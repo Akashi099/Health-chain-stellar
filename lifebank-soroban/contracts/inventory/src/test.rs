@@ -2320,12 +2320,10 @@ fn test_release_reservation_by_contract_releases_reservation() {
     let stored = client.get_blood_unit(&unit_id);
     assert_eq!(stored.status, BloodStatus::Reserved);
 
-    // Release via release_reservation_by_contract with the authorized contract
+    // Register the trusted requests contract address, then release via it.
     let authorized_addr = Address::generate(&env);
-    // Pass env by value and authorized_addr by value (not by reference) as the
-    // function signature requires owned Env and Address (issue #1317).
-    InventoryContract::release_reservation_by_contract(env.clone(), authorized_addr, reservation_id)
-        .unwrap();
+    client.set_requests_contract(&admin, &authorized_addr);
+    client.release_reservation_by_contract(&authorized_addr, &reservation_id);
 
     // Verify unit is Available again
     let released = client.get_blood_unit(&unit_id);
@@ -2344,8 +2342,9 @@ fn test_release_reservation_by_contract_fails_on_unknown_reservation() {
     let (env, admin, client, _) = create_test_contract();
     env.ledger().set_timestamp(1000u64);
 
-    // Try to release a non-existent reservation.
-    // Pass env and address by value, not by reference (issue #1317).
-    InventoryContract::release_reservation_by_contract(env.clone(), Address::generate(&env), 999)
-        .unwrap();
+    // Register a trusted requests contract so the allowlist check passes,
+    // then verify that a missing reservation still yields ReservationNotFound (#150).
+    let requests_contract = Address::generate(&env);
+    client.set_requests_contract(&admin, &requests_contract);
+    client.release_reservation_by_contract(&requests_contract, &999u64);
 }
