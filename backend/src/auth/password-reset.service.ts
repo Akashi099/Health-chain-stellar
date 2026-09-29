@@ -85,13 +85,18 @@ export class PasswordResetService {
   }
 
   /** Resend verification email */
-  async resendVerificationEmail(userId: string): Promise<{ message: string }> {
-    const user = await this.userRepository.findOne({ where: { id: userId } });
-    if (!user) throw new NotFoundException('User not found');
-    if (user.emailVerified) throw new BadRequestException('Email already verified');
+  async resendVerificationEmail(email: string): Promise<{ message: string }> {
+    const normalizedEmail = email.toLowerCase();
+    const user = await this.userRepository.findOne({
+      where: { email: normalizedEmail },
+    });
 
-    await this.sendVerificationEmail(userId, user.email);
-    return { message: 'Verification email sent' };
+    if (!user || user.emailVerified) {
+      return { message: 'If that email exists, a verification email was sent' };
+    }
+
+    await this.sendVerificationEmail(user.id, user.email);
+    return { message: 'If that email exists, a verification email was sent' };
   }
 
   /** Request password reset — rate limited */

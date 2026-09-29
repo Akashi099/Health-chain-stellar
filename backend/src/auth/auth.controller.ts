@@ -503,13 +503,14 @@ export class AuthController {
     return this.passwordResetService.verifyEmail(token);
   }
 
+  @Public()
   @Post('resend-verification')
   @HttpCode(HttpStatus.OK)
-  @ApiBearerAuth()
   @ApiOperation({ summary: 'Resend verification email' })
+  @ApiBody({ type: RequestPasswordResetDto })
   @ApiResponse({ status: 200, description: 'Verification email sent' })
-  async resendVerification(@Request() req: any) {
-    return this.passwordResetService.resendVerificationEmail(req.user.id);
+  async resendVerification(@Body() dto: RequestPasswordResetDto) {
+    return this.passwordResetService.resendVerificationEmail(dto.email);
   }
 
   // ── MFA token exchange ────────────────────────────────────────────────────
