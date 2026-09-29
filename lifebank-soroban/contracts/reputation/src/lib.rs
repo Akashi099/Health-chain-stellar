@@ -50,6 +50,8 @@ const CONTRACT_VERSION: u32 = 1;
 
 /// TTL for persistent Input/Score entries: 30 days at 5s/ledger
 const INPUT_TTL_LEDGERS: u32 = 535_680;
+const INSTANCE_TTL_THRESHOLD: u32 = 518_400;
+const INSTANCE_TTL_EXTEND_TO: u32 = 1_036_800;
 
 /// Violation types for penalties
 #[contracttype]
@@ -235,6 +237,7 @@ impl ReputationContract {
                 min_interactions_for_badge: DEFAULT_BADGE_MIN_INTERACTIONS,
             },
         );
+        Self::extend_instance_ttl(&env);
 
         ReputationInitialized { admin }.publish(&env);
 
@@ -257,6 +260,7 @@ impl ReputationContract {
             return Err(Error::NotAuthorized);
         }
         env.storage().instance().set(&DataKey::Paused, &true);
+        Self::extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -272,6 +276,7 @@ impl ReputationContract {
             return Err(Error::NotAuthorized);
         }
         env.storage().instance().set(&DataKey::Paused, &false);
+        Self::extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -321,6 +326,12 @@ impl ReputationContract {
             return Err(Error::InvalidInput);
         }
         Ok(())
+    }
+
+    fn extend_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
     }
 
     /// Backward-compatible initializer wrapper.
@@ -460,12 +471,12 @@ impl ReputationContract {
                 next_penalty_id: 0,
             });
 
-        input.total_assigned += 1;
+        input.total_assigned = input.total_assigned.saturating_add(1);
         if completed {
-            input.total_completed += 1;
+            input.total_completed = input.total_completed.saturating_add(1);
         }
-        input.total_response_secs += response_secs;
-        input.response_count += 1;
+        input.total_response_secs = input.total_response_secs.saturating_add(response_secs);
+        input.response_count = input.response_count.saturating_add(1);
         input.last_active_at = timestamp;
 
         env.storage()

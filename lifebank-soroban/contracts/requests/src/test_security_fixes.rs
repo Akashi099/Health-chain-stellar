@@ -1,11 +1,9 @@
+extern crate std;
+
 use crate::{BloodComponent, BloodType, ContractError, RequestContract, RequestStatus, Urgency};
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger as _},
     Address, Env, String, Vec,
-};
-use soroban_sdk::{
-    testutils::{Address as _, Events as _, Ledger as _},
-    Address, Env, String,
 };
 
 /// #1151: Verify cancel_request requires caller authorization and must be hospital owner or admin.
@@ -508,10 +506,11 @@ fn test_get_requests_by_hospital_uses_per_hospital_index() {
     .unwrap();
 
     assert_eq!(results_a.len(), 3);
-    let ids_a: Vec<u64> = (0..results_a.len())
-        .map(|i| results_a.get(i).unwrap().id)
-        .collect();
-    assert_eq!(ids_a, vec![req_a1, req_a2, req_a3]);
+    let mut ids_a = std::vec::Vec::new();
+    for i in 0..results_a.len() {
+        ids_a.push(results_a.get(i).unwrap().id);
+    }
+    assert_eq!(ids_a, std::vec![req_a1, req_a2, req_a3]);
 
     // Get all requests for hospital B (page 0, size 10)
     let results_b = RequestContract::get_requests_by_hospital(
@@ -523,10 +522,11 @@ fn test_get_requests_by_hospital_uses_per_hospital_index() {
     .unwrap();
 
     assert_eq!(results_b.len(), 2);
-    let ids_b: Vec<u64> = (0..results_b.len())
-        .map(|i| results_b.get(i).unwrap().id)
-        .collect();
-    assert_eq!(ids_b, vec![req_b1, req_b2]);
+    let mut ids_b = std::vec::Vec::new();
+    for i in 0..results_b.len() {
+        ids_b.push(results_b.get(i).unwrap().id);
+    }
+    assert_eq!(ids_b, std::vec![req_b1, req_b2]);
 
     // Test pagination: get first page with size 2 for hospital A
     let page_0_a = RequestContract::get_requests_by_hospital(

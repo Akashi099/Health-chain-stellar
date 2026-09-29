@@ -618,18 +618,16 @@ impl RequestContract {
         page_size: u32,
     ) -> Result<soroban_sdk::Vec<BloodRequest>, ContractError> {
         storage::require_initialized(&env)?;
-        let page_size = page_size.min(50) as usize;
+        let page_size = page_size.min(50);
         let request_ids = storage::get_hospital_request_ids(&env, &hospital_id);
-        let start = (page as usize).saturating_mul(page_size);
-        let end = (start + page_size).min(request_ids.len());
+        let start = page.saturating_mul(page_size);
+        let end = start.saturating_add(page_size).min(request_ids.len());
 
         let mut results: soroban_sdk::Vec<BloodRequest> = soroban_sdk::Vec::new(&env);
-        if start < request_ids.len() {
-            for i in start..end {
-                let id = request_ids.get(i).unwrap();
-                if let Some(req) = storage::get_request(&env, id) {
-                    results.push_back(req);
-                }
+        for i in start..end {
+            let id = request_ids.get(i).unwrap();
+            if let Some(req) = storage::get_request(&env, id) {
+                results.push_back(req);
             }
         }
         Ok(results)
