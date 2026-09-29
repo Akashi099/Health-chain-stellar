@@ -179,12 +179,15 @@ describe('ImportService', () => {
             expect(result).toBeDefined();
         });
 
-        it('returns existing batch for duplicate file submission', async () => {
+        it('returns the original batch for duplicate file submission without mutating it', async () => {
             const batchRepo = service['batchRepo'];
-            const existing = makeBatch({ status: ImportBatchStatus.COMMITTED });
-            batchRepo.findOne
-                .mockResolvedValueOnce(existing)   // file hash match
-                .mockResolvedValueOnce({ ...existing, status: ImportBatchStatus.DEDUPLICATED });
+            const existing = makeBatch({
+                status: ImportBatchStatus.STAGED,
+                entityType: ImportEntityType.INVENTORY,
+                importedBy: 'admin',
+                fileHash: 'abc123',
+            });
+            batchRepo.findOne.mockResolvedValue(existing);
             batchRepo.update.mockResolvedValue(undefined);
 
             const result = await service.stageImport(
@@ -194,8 +197,15 @@ describe('ImportService', () => {
                 'test.csv',
             );
 
-            expect(result.status).toBe(ImportBatchStatus.DEDUPLICATED);
-            expect(mockDataSource.transaction).not.toHaveBeenCalled();
+            expect(batchRepo.findOne).toHaveBeenCalledWith({
+                where: {
+                    fileHash: expect.any(String),
+                    entityType: ImportEntityType.INVENTORY,
+                    importedBy: 'admin',
+                },
+            });
+            expect(batchRepo.update).not.toHaveBeenCalled();
+            expect(result).toBe(existing);
         });
 
         it('marks cross-batch duplicate rows as DUPLICATE with reason code', async () => {
