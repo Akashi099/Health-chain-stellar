@@ -152,9 +152,8 @@ fn test_get_compliance_attestation_not_found() {
 }
 
 #[test]
-fn test_record_compliance_attestation_requires_admin_auth() {
+fn test_record_compliance_attestation_rejects_non_admin() {
     let (env, client, _contract_id, _admin, _request_contract) = create_initialized_contract();
-    env.mock_all_auths_allow_last_error();
 
     let unauthorized_caller = Address::generate(&env);
     let delivery_id = 55u64;
