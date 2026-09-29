@@ -59,15 +59,28 @@ const THIRTY_DAY_WINDOW_SECS: u64 = 2_592_000; // 30 days
 const SNAPSHOT_TTL_MIN: u32 = 290_000;
 const SNAPSHOT_TTL_MAX: u32 = 6_307_200;
 
-// Instance storage TTL bounds (~30 days threshold, ~60 days maximum).
-const INSTANCE_TTL_MIN: u32 = 518_400;
-const INSTANCE_TTL_MAX: u32 = 1_036_800;
+// TTL constants for the instance-storage entry that holds AnalyticsConfig
+// (in ledgers; ~5 s each). Mirrors the PERSISTENT_BUMP_THRESHOLD /
+// PERSISTENT_BUMP_TO pair used by the payments contract so both contracts
+// share one bump policy.
+const INSTANCE_BUMP_THRESHOLD: u32 = 518_400; // ~30 days
+const INSTANCE_BUMP_TO: u32 = 1_036_800; // ~60 days
 
 // ── Storage helpers ───────────────────────────────────────────────────────────
 
+/// Extend instance-storage TTL using the same threshold/extend-to as persistent
+/// writes. Instance storage holds the config key; without an explicit bump the
+/// entire contract instance can be archived, which makes every function that
+/// reads config fail even though the contract was correctly initialized.
+fn extend_instance_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_TO);
+}
+
 fn require_initialized(env: &Env) -> Result<AnalyticsConfig, AnalyticsError> {
-    let config = env
-        .storage()
+    extend_instance_ttl(env);
+    env.storage()
         .instance()
         .get(&DataKey::Config)
         .ok_or(AnalyticsError::NotInitialized)?;
@@ -344,10 +357,10 @@ impl AnalyticsContract {
 
         let total_payments = get_counter_u64(&env, &DataKey::TotalPaymentsReleased) + 1;
         set_counter_u64(&env, &DataKey::TotalPaymentsReleased, total_payments);
+        set_last_updated(&env, snap.last_updated);
 
         let total_volume = get_counter_i128(&env, &DataKey::TotalVolume).saturating_add(amount);
         set_counter_i128(&env, &DataKey::TotalVolume, total_volume);
-        set_last_updated(&env, snap.last_updated);
 
         PaymentReleaseRecorded {
             amount,
@@ -401,10 +414,7 @@ impl AnalyticsContract {
     }
 
     pub fn is_initialized(env: Env) -> bool {
-        let initialized = env.storage().instance().has(&DataKey::Config);
-        if initialized {
-            extend_instance_ttl(&env);
-        }
-        initialized
+        extend_instance_ttl(&env);
+        env.storage().instance().has(&DataKey::Config)
     }
 }
